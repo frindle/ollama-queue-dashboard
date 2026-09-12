@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  HTTP API + frontend for ollama-queue.py, exposed the same way as Claude Code/
+  Goose/qwen (com.penn.ttyd-*.plist): bound to 10.0.15.20, NOT 0.0.0.0, since the
+  only intended route in is the Cloudflare tunnel (ollama-queue.penndalton.com),
+  which puts it behind the same "Penn Only" Access policy as the others.
+
+  Unlike the ttyd jobs this isn't a terminal -- it's a plain HTTP server
+  (~/bin/ollama-queue-api.py) that reads/writes ollama-queue.py's own state file
+  under its own flock, so it and the queue daemon (a separate launchd job /
+  manually-run `ollama-queue.py run`) never race over the same state.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.penn.ollama-queue-api</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/penn/bin/ollama-queue-api.py</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/ollama-queue-api.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/ollama-queue-api.log</string>
+</dict>
+</plist>

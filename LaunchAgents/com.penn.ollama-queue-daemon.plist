@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The ollama-queue RUNNER daemon (`ollama-queue.py run`) -- the process that actually
+  launches jobs. Distinct from com.penn.ollama-queue-api, which is only the HTTP
+  dashboard; the two coordinate through ollama-queue.py's state file under its own
+  flock and never race.
+
+  WHY THIS EXISTS (2026-09-02): until now the runner had no launchd job at all and had
+  to be started by hand after every reboot. The failure mode was silent and expensive:
+  the API LaunchAgent comes back on its own, so the dashboard answers normally and the
+  queue LOOKS healthy while every enqueued job sits `pending` forever with no error
+  anywhere. Penn's call to make it a service.
+
+  THE TRADEOFF THIS ACCEPTS: the runner evicts models from Studio's native Ollama and
+  starts/stops the llama-server bypass on port 8091. Starting it automatically at login
+  means it can claim GPU memory before a human has confirmed host state. That is the
+  known cost of RunAtLoad here; if a session needs the GPU uncontested, stop the job
+  first (see below) rather than fighting it.
+
+  PATH IS LOAD-BEARING, DO NOT DROP IT. launchd hands a job a minimal
+  /usr/bin:/bin:/usr/sbin:/sbin. The runner shells out to bare `python3` (gate-on-complete.py
+  at ollama-queue.py:262 and the worker/runner argv in _build_cmd) and runs each job's
+  verify command with shell=True -- verify scripts routinely call python3/node/npm/tsc.
+  Without the login PATH pinned here those resolve to the wrong interpreter or not at
+  all, and the failure surfaces as "the model couldn't do it" rather than as a PATH bug.
+  That confusion has a track record on this box; keep this in sync with `zsh -lc 'echo $PATH'`.
+
+  Stop it:    launchctl bootout gui/501/com.penn.ollama-queue-daemon
+  Start it:   launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.penn.ollama-queue-daemon.plist
+  Check it:   launchctl print gui/501/com.penn.ollama-queue-daemon
+  Log:        ~/bin/ollama-queue-daemon.log   (shared with the hand-run history, deliberately)
+
+  SIGTERM is handled -- the daemon logs "received signal 15" and running jobs are
+  recovered on next start. Never SIGKILL it.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.penn.ollama-queue-daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/penn/bin/ollama-queue.py</string>
+    <string>run</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/penn/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/pivy/bin</string>
+    <key>HOME</key>
+    <string>/Users/penn</string>
+    <key>USER</key>
+    <string>penn</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/penn/bin</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Don't hot-loop if it dies on startup (e.g. a syntax error after an edit). -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <!-- Give the graceful SIGTERM shutdown room to finish before launchd escalates. -->
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/penn/bin/ollama-queue-daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/penn/bin/ollama-queue-daemon.log</string>
+</dict>
+</plist>

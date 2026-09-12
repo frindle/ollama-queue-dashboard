@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+config/servers.json
+*-state.json
+ollama-queue-logs/
+ollama-queue-livelogs/
+.venv/
