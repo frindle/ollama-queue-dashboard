@@ -115,6 +115,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -1395,10 +1396,94 @@ def _count_real_dirty(porcelain_text: str) -> int:
     return max(0, count)
 
 
+# Fields whose enqueue meaning is CLIENT-LOCAL only: worktree/baseline/preflight
+# all run on the SERVER for a remote enqueue, so these never travel. task_file is
+# sent as CONTENT (key "task"), not as a path. remote/remote_token are transport.
+_REMOTE_SKIP_FIELDS = {
+    "remote", "remote_token", "task_file", "func",
+    "auto_ctx",  # server defaults this True; only forward when explicitly turned off
+}
+# Every other _ENQUEUE_SPEC_DEFAULTS key already matches the server's JSON field
+# name 1:1 (see ollama-queue-api.py _enqueue), so no attr->field renaming is needed.
+
+
+def _remote_enqueue(args):
+    """CLIENT half of the Unraid cutover: POST this job to a remote containerized
+    queue's /api/jobs instead of touching local state. Reads the --task-file
+    CONTENT locally and maps the enqueue CLI flags to the server's field names
+    (see ollama-queue-api.py _enqueue / make_enqueue_spec). The SERVER runs the
+    full-fidelity enqueue (worktree isolation, gates, VRAM-fit sizing), so we do
+    NOT create a worktree or compute a launch_baseline here."""
+    url = args.remote.rstrip("/")
+    task_file = Path(args.task_file)
+    if not task_file.is_file():
+        sys.exit(f"task file does not exist: {task_file}")
+    task_text = task_file.read_text()
+
+    # Build the JSON body from the enqueue args, mapping flag -> server field. Send
+    # task as CONTENT; drop client-local-only fields and None/False-default noise.
+    body = {"model": args.model, "task": task_text}
+    defaults = _ENQUEUE_SPEC_DEFAULTS
+    for attr, default in defaults.items():
+        if attr in _REMOTE_SKIP_FIELDS or attr == "model":
+            continue
+        val = getattr(args, attr, default)
+        if val is None or val == default:
+            continue  # let the server apply its own default
+        body[attr] = val
+    # auto_ctx is True by default on both sides; only forward an explicit opt-OUT.
+    if getattr(args, "auto_ctx", True) is False:
+        body["auto_ctx"] = False
+
+    data = json.dumps(body).encode("utf-8")
+    endpoint = f"{url}/api/jobs"
+    req = urllib.request.Request(endpoint, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    token = args.remote_token or os.environ.get("QUEUE_API_TOKEN")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx: surface the server's error text and exit non-zero.
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        sys.exit(f"remote enqueue failed: HTTP {e.code} {e.reason}"
+                 + (f": {detail.strip()}" if detail.strip() else ""))
+    except urllib.error.URLError as e:
+        sys.exit(f"remote enqueue failed: could not reach {endpoint}: {e.reason}")
+
+    try:
+        result = json.loads(payload)
+    except ValueError:
+        sys.exit(f"remote enqueue: unexpected non-JSON response: {payload[:400]}")
+
+    job_id = result.get("id")
+    if not job_id:
+        sys.exit(f"remote enqueue: response had no job id: {payload[:400]}")
+    label = result.get("label")
+    print(f"enqueued {job_id}" + (f" ({label})" if label else ""))
+    if result.get("split"):
+        slice_ids = result.get("slice_ids") or []
+        print(f"split: {len(slice_ids)} slices {slice_ids}")
+    print(f"remote: {url}")
+    return result
+
+
 def cmd_enqueue(args):
     """CLI entry point: build the job(s) via the shared enqueue_job() and keep
     the local behaviour byte-for-byte -- a validation failure surfaces exactly as
-    before (message on stderr, exit code 1) instead of an EnqueueError traceback."""
+    before (message on stderr, exit code 1) instead of an EnqueueError traceback.
+    With --remote (or env OLLAMA_QUEUE_REMOTE) it instead POSTs the job to a
+    remote containerized queue and never touches local state."""
+    if getattr(args, "remote", None):
+        _remote_enqueue(args)
+        return
     try:
         enqueue_job(args)
     except EnqueueError as e:
@@ -3090,6 +3175,20 @@ def main():
     e.add_argument("--front", action="store_true",
                    help="Insert this job ahead of all currently-pending jobs so it launches next; "
                         "does not preempt a running job.")
+    e.add_argument("--remote", default=os.environ.get("OLLAMA_QUEUE_REMOTE") or None,
+                   help="Enqueue onto a REMOTE containerized queue over HTTP instead of writing "
+                        "local state. Give the queue base URL (e.g. http://queue-host:7684). "
+                        "In this mode enqueue does NOT touch local state, create a worktree, or "
+                        "compute launch_baseline; it reads --task-file CONTENT locally, POSTs the "
+                        "job to <URL>/api/jobs, and the SERVER runs the full enqueue (worktree "
+                        "isolation, gates, VRAM-fit sizing). An explicit --repo/--cwd is sent "
+                        "as-is; a remote --repo must name a repo under the container's "
+                        "QUEUE_REPOS_ROOT, NOT a local/Studio path. Defaults from env "
+                        "OLLAMA_QUEUE_REMOTE.")
+    e.add_argument("--remote-token", default=None,
+                   help="Bearer token for the remote queue's POST /api/jobs (only used with "
+                        "--remote). Falls back to env QUEUE_API_TOKEN. Sent as "
+                        "'Authorization: Bearer <token>'.")
     e.set_defaults(func=cmd_enqueue)
 
     s = sub.add_parser("status")
