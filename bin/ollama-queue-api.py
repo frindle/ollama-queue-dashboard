@@ -34,6 +34,15 @@ QUEUE_PATH = Path(__file__).resolve().parent / "ollama-queue.py"
 TASKS_DIR = Path.home() / "bin" / "ollama-queue-logs" / "web-tasks"
 PORT = int(os.environ.get("QUEUE_API_PORT", "7684"))
 
+# VERIFY-LOCALITY: the worker runs verify/gates WHERE IT RUNS (this box / the
+# container), so a coding-dispatch job's repo path must resolve HERE, not on the
+# client. A remote caller therefore passes a repo RELATIVE to this root (e.g.
+# "myproj" -> $QUEUE_REPOS_ROOT/myproj) instead of an absolute client path. An
+# absolute path is still honoured as-is (local CLI parity). Unset => a relative
+# repo/cwd is refused (there is no root to resolve it against). Env-driven so the
+# public repo carries no host-specific path (matches ollama-worker.py's pattern).
+REPOS_ROOT = os.environ.get("QUEUE_REPOS_ROOT") or None
+
 # Optional shared-secret gate. Historically this process trusted every request
 # (Cloudflare Access sat in front). For a standalone/Docker deployment without
 # Access, set QUEUE_API_TOKEN and every request must carry it as
@@ -1178,48 +1187,155 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text("not found", 404)
 
     def _enqueue(self):
+        """Full-fidelity HTTP enqueue: accept the same spec the CLI does and run it
+        through the SHARED q.enqueue_job(), so a remote coding dispatch gets worktree
+        isolation, launch_baseline, the no-verify/preflight/completeness gates,
+        VRAM-fit auto num-ctx sizing, auto-split and --after chaining -- all executed
+        server-side (in-container, where the worker also runs). See q.enqueue_job /
+        q.make_enqueue_spec for the field contract."""
         try:
             data = self._read_json_body()
-            model = data.get("model", "").strip()
-            cwd = data.get("cwd", "").strip()
-            task = data.get("task", "").strip()
-            if not model or not cwd or not task:
-                return self._text("model, cwd, and task are required", 400)
-            cwd_path = Path(cwd).expanduser()
-            if not cwd_path.is_dir():
-                return self._text(f"cwd does not exist: {cwd_path}", 400)
-            TASKS_DIR.mkdir(parents=True, exist_ok=True)
-            task_id = uuid.uuid4().hex[:12]
-            task_file = TASKS_DIR / f"{task_id}.txt"
-            task_file.write_text(task)
-            with q._Locked() as lock:
-                state = lock.load()
-                job_id = uuid.uuid4().hex[:12]
-                job = {
-                    "id": job_id,
-                    "label": data.get("label") or cwd_path.name,
-                    "model": model,
-                    "host_pref": data.get("host") or "auto",
-                    "cwd": str(cwd_path.resolve()),
-                    "task_file": str(task_file),
-                    "task_kind": data.get("task_kind") or None,
-                    "manual_tools": bool(data.get("manual_tools")),
-                    "api": data.get("api") or "ollama",
-                    "verify": data.get("verify") or None,
-                    "runner": (str(__import__("pathlib").Path(data["runner"]).expanduser().resolve()) if data.get("runner") else None),
-                    "num_ctx": int(data.get("num_ctx") or 65536),
-                    "max_iters": int(data.get("max_iters") or 20),
-                    "temperature": float(data.get("temperature") or 0),
-                    "chat_timeout": int(data["chat_timeout"]) if data.get("chat_timeout") else None,
-                    "status": "pending",
-                    "enqueued_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
-                    "pid": None, "lane": None, "log_path": None, "exit_code": None,
-                }
-                state["jobs"].append(job)
-                lock.save(state)
-            self._json({"id": job_id})
         except Exception as e:
-            self._text(f"error: {e}", 500)
+            return self._text(f"bad JSON body: {e}", 400)
+        if not isinstance(data, dict):
+            return self._text("body must be a JSON object", 400)
+
+        model = str(data.get("model") or "").strip()
+        if not model:
+            return self._text("model is required", 400)
+
+        # Task text arrives as CONTENT over HTTP (there is no shared filesystem with
+        # the client). Persist it to a task file HERE so enqueue_job -- and later the
+        # worker -- read it in-container. Accept "task" (preferred) or "task_file"
+        # (treated as content too, for callers that named it that way).
+        task = data.get("task")
+        if task is None:
+            task = data.get("task_file")
+        task = str(task or "").strip()
+
+        # A --backend job carries a JSON payload, not free text; everything else is a
+        # real task. Require task text unless this is a backend job (which still needs
+        # its payload but validates it downstream).
+        backend = data.get("backend") or None
+        if not task and not backend:
+            return self._text("task (the task text) is required", 400)
+
+        # Scope: exactly one of repo (preferred, isolated worktree) or cwd (legacy).
+        repo_in = (data.get("repo") or "").strip() or None
+        cwd_in = (data.get("cwd") or "").strip() or None
+        if repo_in and cwd_in:
+            return self._text("pass EITHER repo (auto-isolated worktree) OR cwd, not both", 400)
+        if not repo_in and not cwd_in and not backend:
+            return self._text("repo (preferred) or cwd is required", 400)
+
+        def _resolve(p):
+            """Resolve a caller path against REPOS_ROOT for verify-locality: an
+            absolute path is honoured as-is; a relative one is joined onto
+            QUEUE_REPOS_ROOT (or refused if that is unset)."""
+            pp = Path(p).expanduser()
+            if pp.is_absolute():
+                return pp
+            if REPOS_ROOT:
+                return (Path(REPOS_ROOT).expanduser() / pp).resolve()
+            raise ValueError(
+                f"relative path {p!r} but QUEUE_REPOS_ROOT is not set -- pass an "
+                f"absolute container path or configure a repos root")
+
+        try:
+            repo = str(_resolve(repo_in)) if repo_in else None
+            cwd = str(_resolve(cwd_in)) if cwd_in else None
+        except ValueError as e:
+            return self._text(str(e), 400)
+
+        # A bare cwd to a primary checkout is a real isolation hazard; keep the CLI's
+        # posture -- require the caller to acknowledge it (enqueue_job still WARNS).
+        allow_unisolated = bool(data.get("allow_unisolated"))
+
+        def _as_int(k):
+            v = data.get(k)
+            return int(v) if v not in (None, "") else None
+
+        def _as_float(k, default=0):
+            v = data.get(k)
+            return float(v) if v not in (None, "") else default
+
+        try:
+            TASKS_DIR.mkdir(parents=True, exist_ok=True)
+            task_file = TASKS_DIR / f"{uuid.uuid4().hex[:12]}.txt"
+            task_file.write_text(task)
+
+            spec = q.make_enqueue_spec(
+                model=model,
+                host=(data.get("host") or "auto"),
+                repo=repo,
+                cwd=cwd,
+                base_ref=(data.get("base_ref") or None),
+                subdir=(data.get("subdir") or None),
+                setup=(data.get("setup") or None),
+                allow_unisolated=allow_unisolated,
+                task_file=str(task_file),
+                runner=(data.get("runner") or None),
+                backend=backend,
+                task_kind=(data.get("task_kind") or None),
+                manual_tools=bool(data.get("manual_tools")),
+                api=(data.get("api") or "ollama"),
+                verify=(data.get("verify") or None),
+                allow_no_verify=bool(data.get("allow_no_verify")),
+                num_ctx=_as_int("num_ctx"),
+                auto_ctx=bool(data.get("auto_ctx", True)),
+                auto_split=bool(data.get("auto_split")),
+                no_split=bool(data.get("no_split")),
+                max_iters=_as_int("max_iters"),
+                temperature=_as_float("temperature"),
+                chat_timeout=_as_int("chat_timeout"),
+                max_tokens=_as_int("max_tokens"),
+                capture_final_as=(data.get("capture_final_as") or None),
+                no_preflight=bool(data.get("no_preflight")),
+                label=(data.get("label") or None),
+                scored_arm=bool(data.get("scored_arm")),
+                after=(data.get("after") or None),
+                chain=(data.get("chain") or None),
+                chain_final=bool(data.get("chain_final")),
+                front=bool(data.get("front")),
+                no_live_log=bool(data.get("no_live_log")),
+                # Provenance that can't come over a routable socket for a remote
+                # enqueue: no local messaging socket, so launched_by degrades to a
+                # no-op; stamp a stable, non-routable marker for the audit trail.
+                launched_by=(data.get("launched_by") or None),
+                launched_by_session=(data.get("launched_by_session") or "remote-http"),
+            )
+        except q.EnqueueError as e:
+            return self._text(str(e), 400)
+        except Exception as e:
+            return self._text(f"error building job spec: {e}", 400)
+
+        try:
+            result = q.enqueue_job(spec)
+        except q.EnqueueError as e:
+            # A validation/precondition failure (bad host, missing repo, verify can't
+            # run, no-verify refusal, ...) -- the caller's fault, not a server crash.
+            return self._text(str(e), 400)
+        except Exception as e:
+            return self._text(f"error: {e}", 500)
+
+        primary = result["primary"]
+        resp = {
+            "id": primary["id"],
+            "label": primary.get("label"),
+            "model": primary.get("model"),
+            "host_pref": primary.get("host_pref"),
+            "cwd": primary.get("cwd"),
+            "num_ctx": primary.get("num_ctx"),
+            "status": primary.get("status"),
+            "worktree": primary.get("worktree"),
+            "branch": primary.get("worktree_branch"),
+            "repo": primary.get("repo"),
+            "split": result["split"],
+        }
+        if result["split"]:
+            resp["group"] = result.get("group")
+            resp["slice_ids"] = [j["id"] for j in result["jobs"]]
+        self._json(resp)
 
     def _move(self):
         try:

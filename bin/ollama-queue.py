@@ -154,6 +154,14 @@ ALLOWED_RUNNERS = {
 STATE_PATH = Path.home() / "bin" / "ollama-queue-state.json"
 LOCK_PATH = Path.home() / "bin" / "ollama-queue-state.lock"
 
+
+class EnqueueError(Exception):
+    """A validation/precondition failure raised by the shared enqueue path
+    (enqueue_job and its helpers). The CLI wrapper (cmd_enqueue) translates it
+    to sys.exit(<msg>) so the local CLI behaves byte-for-byte as before; the
+    HTTP path (ollama-queue-api.py) catches it and returns a structured 4xx
+    instead of taking the server process down with a bare sys.exit."""
+
 # --- Dashboard-as-worklist retention (Penn 2026-09-07) -------------------------
 # The dashboard is a worklist of what still needs handling, not a log. A finished
 # job clears only when it is genuinely handled:
@@ -1216,7 +1224,7 @@ def _validate_host(host):
         return
     if host.startswith("http://") or host.startswith("https://"):
         return
-    sys.exit(f"invalid --host {host!r}: must be auto, studio, unraid, or an explicit http(s) URL")
+    raise EnqueueError(f"invalid --host {host!r}: must be auto, studio, unraid, or an explicit http(s) URL")
 
 
 VERIFY_TIMEOUT_S = 300   # mirrors ollama-worker.py's verify subprocess timeout
@@ -1246,16 +1254,16 @@ def _preflight_verify(verify: str, cwd: Path) -> bool:
         r = subprocess.run(verify, shell=True, cwd=str(cwd), capture_output=True,
                            text=True, timeout=PREFLIGHT_SLOW_S)
     except subprocess.TimeoutExpired:
-        sys.exit(f"[queue] REFUSING enqueue: --verify did not finish within {PREFLIGHT_SLOW_S}s -- "
+        raise EnqueueError(f"[queue] REFUSING enqueue: --verify did not finish within {PREFLIGHT_SLOW_S}s -- "
                  f"it would TIME OUT in the worker's {VERIFY_TIMEOUT_S}s verify gate and fail the "
                  f"job regardless of the model's work. Narrow the verify's scope, or pass "
                  f"--no-preflight if you know it's only warm-up-slow.")
     except Exception as e:
-        sys.exit(f"[queue] REFUSING enqueue: could not run --verify: {e} (pass --no-preflight to skip)")
+        raise EnqueueError(f"[queue] REFUSING enqueue: could not run --verify: {e} (pass --no-preflight to skip)")
     dt = _t.time() - t0
     if r.returncode in (126, 127):
         tail = "\n  ".join((r.stderr or r.stdout or "").strip().splitlines()[-3:])
-        sys.exit(f"[queue] REFUSING enqueue: --verify cannot execute (exit {r.returncode} = command "
+        raise EnqueueError(f"[queue] REFUSING enqueue: --verify cannot execute (exit {r.returncode} = command "
                  f"not found / not executable) -- this gate would fail EVERY run. Fix the verify "
                  f"command. Last output:\n  {tail}\n(override with --no-preflight)")
     _failed_at_baseline = r.returncode != 0
@@ -1298,14 +1306,14 @@ def _create_dispatch_worktree(repo_arg: str, base_ref, subdir, label):
     repo = Path(repo_arg).resolve()
     top = _repo_toplevel(repo)
     if top is None:
-        sys.exit(f"[queue] --repo is not a git repository: {repo}")
+        raise EnqueueError(f"[queue] --repo is not a git repository: {repo}")
     if base_ref:
         base = base_ref
     else:
         h = subprocess.run(["git", "-C", str(top), "rev-parse", "HEAD"],
                            capture_output=True, text=True, timeout=15)
         if h.returncode != 0:
-            sys.exit(f"[queue] could not resolve HEAD of {top} for a base ref")
+            raise EnqueueError(f"[queue] could not resolve HEAD of {top} for a base ref")
         base = h.stdout.strip()
     slug = safe_label(label or "dispatch")
     wid = uuid.uuid4().hex[:8]
@@ -1315,12 +1323,12 @@ def _create_dispatch_worktree(repo_arg: str, base_ref, subdir, label):
     r = subprocess.run(["git", "-C", str(top), "worktree", "add", "-b", branch, str(wt), base],
                        capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
-        sys.exit(f"[queue] worktree add failed: {r.stderr.strip() or r.stdout.strip()}")
+        raise EnqueueError(f"[queue] worktree add failed: {r.stderr.strip() or r.stdout.strip()}")
     print(f"[queue] isolated worktree: {wt}\n"
           f"[queue]   branch {branch} off {base[:12]} (repo {top.name})", file=sys.stderr)
     cwd = (wt / subdir).resolve() if subdir else wt
     if not cwd.is_dir():
-        sys.exit(f"[queue] --subdir {subdir!r} does not exist in the worktree: {cwd}")
+        raise EnqueueError(f"[queue] --subdir {subdir!r} does not exist in the worktree: {cwd}")
     return wt, branch, str(top), cwd
 
 
@@ -1331,7 +1339,7 @@ def _run_setup(setup_cmd: str, cwd: Path):
     print(f"[queue] setup: running {setup_cmd!r} in {cwd} ...", file=sys.stderr)
     r = subprocess.run(setup_cmd, shell=True, cwd=str(cwd), capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
-        sys.exit(f"[queue] setup command failed (exit {r.returncode}); refusing to enqueue a "
+        raise EnqueueError(f"[queue] setup command failed (exit {r.returncode}); refusing to enqueue a "
                  f"dep-starved job.\n--- stderr tail ---\n{r.stderr[-1500:]}")
     print(f"[queue] setup OK", file=sys.stderr)
 
@@ -1388,18 +1396,96 @@ def _count_real_dirty(porcelain_text: str) -> int:
 
 
 def cmd_enqueue(args):
+    """CLI entry point: build the job(s) via the shared enqueue_job() and keep
+    the local behaviour byte-for-byte -- a validation failure surfaces exactly as
+    before (message on stderr, exit code 1) instead of an EnqueueError traceback."""
+    try:
+        enqueue_job(args)
+    except EnqueueError as e:
+        sys.exit(str(e))
+
+
+# Every field enqueue_job() reads off its `args`, with the SAME defaults the CLI
+# argparse applies. Non-CLI callers (the HTTP API, tests) build a spec through
+# make_enqueue_spec(**overrides) so they can never trip over a missing attribute,
+# and the enqueue contract lives in exactly one place.
+_ENQUEUE_SPEC_DEFAULTS = {
+    "model": None,          # required
+    "host": "auto",
+    "cwd": None,
+    "repo": None,
+    "base_ref": None,
+    "subdir": None,
+    "setup": None,
+    "allow_unisolated": False,
+    "task_file": None,      # required (path to the task text on the box that runs enqueue_job)
+    "runner": None,
+    "backend": None,
+    "task_kind": None,
+    "manual_tools": False,
+    "api": "ollama",
+    "verify": None,
+    "allow_no_verify": False,
+    "num_ctx": None,
+    "auto_ctx": True,
+    "auto_split": False,
+    "no_split": False,
+    "max_iters": None,
+    "temperature": 0,
+    "chat_timeout": None,
+    "max_tokens": None,
+    "capture_final_as": None,
+    "no_preflight": False,
+    "label": None,
+    "scored_arm": False,
+    "after": None,
+    "chain": None,
+    "chain_final": False,
+    "front": False,
+    "no_live_log": False,
+    # Provenance that can't come over a routable socket for a remote/HTTP enqueue.
+    # launched_by is the (pid-keyed, routable) messaging socket; degrade to None so
+    # the gate treats it as an unknown launcher rather than crashing. launched_by_session
+    # is a stable, NON-routable marker -- an HTTP caller passes e.g. "remote-http".
+    "launched_by": None,
+    "launched_by_session": None,
+}
+
+
+def make_enqueue_spec(**overrides):
+    """Return a SimpleNamespace carrying every field enqueue_job() reads, defaulted
+    to the CLI's own defaults, with `overrides` applied on top. Unknown keys raise
+    so a typo'd field is caught at the call site, not silently ignored."""
+    import types as _types
+    unknown = set(overrides) - set(_ENQUEUE_SPEC_DEFAULTS)
+    if unknown:
+        raise EnqueueError(f"unknown enqueue field(s): {sorted(unknown)}")
+    spec = dict(_ENQUEUE_SPEC_DEFAULTS)
+    spec.update(overrides)
+    return _types.SimpleNamespace(**spec)
+
+
+def enqueue_job(args):
+    """Shared, TTY-independent enqueue path with the SAME fidelity as the CLI:
+    worktree isolation (--repo), env-parity --setup, the no-verify / preflight /
+    completeness gates, VRAM-fit auto num-ctx sizing, auto-split, and --after
+    chaining. Called by both the CLI (cmd_enqueue) and the HTTP API. Returns a
+    result dict: {"split": bool, "jobs": [<job>...], "primary": <job>} (for a
+    split, `primary` is the first slice). Raises EnqueueError on any validation
+    or precondition failure -- never sys.exit -- so it is safe to call in-process
+    from a long-lived server."""
     # A --backend job may pass --host <backend-name> (a registry key, not a
     # routing keyword or URL); it is resolved to the service URL below, so skip
     # the Ollama-host keyword/URL validation here.
     if not getattr(args, "backend", None):
         _validate_host(args.host)
     if args.api == "openai" and args.host == "auto":
-        sys.exit("--api openai requires an explicit --host (studio/unraid/URL) -- "
+        raise EnqueueError("--api openai requires an explicit --host (studio/unraid/URL) -- "
                  "pick_host() only knows the two native-Ollama endpoints, not an ad-hoc "
                  "llama-server port. Pass e.g. --host http://127.0.0.1:8091.")
     task_file = Path(args.task_file).resolve()
     if not task_file.is_file():
-        sys.exit(f"task file does not exist: {task_file}")
+        raise EnqueueError(f"task file does not exist: {task_file}")
 
     # BACKEND (non-Ollama) DISPATCH (2026-09-11). A --backend job is not an LLM
     # coding/research run: it carries no verify, no worktree, no VRAM-fit sizing.
@@ -1415,7 +1501,7 @@ def cmd_enqueue(args):
         _bname, _burl = _sc.select_backend(backend, name=_pin)
         if not _burl:
             _avail = sorted(_sc.backends_of_type(backend).keys())
-            sys.exit(f"[queue] REFUSING enqueue: no '{backend}' backend registered"
+            raise EnqueueError(f"[queue] REFUSING enqueue: no '{backend}' backend registered"
                      + (f" named {_pin!r}" if _pin else "")
                      + f". Add one on the Settings page (type={backend}, a URL). "
                      + (f"Registered {backend} backends: {_avail}." if _avail
@@ -1444,7 +1530,7 @@ def cmd_enqueue(args):
             _tt_gate = ""
         if (not _dispatch_is_investigation(_tt_gate, args.verify, args.task_kind)
                 and not getattr(args, "allow_no_verify", False)):
-            sys.exit(
+            raise EnqueueError(
                 "[queue] REFUSING enqueue: coding dispatch with NO --verify.\n"
                 "  Without a verify the completeness and verify-RELEVANCE gates cannot run,\n"
                 "  and -- as job d31d96d23b29 (shipped-flip) showed -- the model has no goal\n"
@@ -1456,23 +1542,23 @@ def cmd_enqueue(args):
     if getattr(args, "runner", None):
         runner = str(Path(args.runner).resolve())
         if runner not in ALLOWED_RUNNERS:
-            sys.exit(f"[queue] REFUSING enqueue: --runner {runner} is not allowlisted. "
+            raise EnqueueError(f"[queue] REFUSING enqueue: --runner {runner} is not allowlisted. "
                      f"This queue guards a shared GPU; only exact-path runners in ALLOWED_RUNNERS "
                      f"may be launched. Allowed: {sorted(ALLOWED_RUNNERS)}. Add it there first.")
         if not Path(runner).is_file():
-            sys.exit(f"[queue] REFUSING enqueue: --runner {runner} is allowlisted but does not exist.")
+            raise EnqueueError(f"[queue] REFUSING enqueue: --runner {runner} is allowlisted but does not exist.")
     # Scoping/worktree isolation. Either auto-create a fresh worktree (--repo,
     # enforced isolation) or accept a caller-supplied --cwd (legacy; warned if
     # it isn't an isolated worktree). Exactly one is required.
     wt_path = wt_branch = wt_repo = None
     if getattr(args, "repo", None):
         if args.cwd:
-            sys.exit("[queue] pass EITHER --repo (auto-isolated worktree) OR --cwd, not both.")
+            raise EnqueueError("[queue] pass EITHER --repo (auto-isolated worktree) OR --cwd, not both.")
         wt_path, wt_branch, wt_repo, cwd = _create_dispatch_worktree(
             args.repo, getattr(args, "base_ref", None), getattr(args, "subdir", None), args.label)
     else:
         if not args.cwd:
-            sys.exit("[queue] need --repo (auto-isolated worktree) or --cwd.")
+            raise EnqueueError("[queue] need --repo (auto-isolated worktree) or --cwd.")
         cwd = Path(args.cwd).resolve()
         if not cwd.is_dir():
             print(f"[queue] WARNING: --cwd does not exist yet: {cwd} (job will fail to launch until it does)",
@@ -1616,14 +1702,16 @@ def cmd_enqueue(args):
             if not _m:
                 _m = [j for j in state["jobs"] if str(j.get("id", "")).startswith(args.after)]
             if len(_m) == 0:
-                sys.exit(f"[queue] --after {args.after!r}: no such job in the queue")
+                raise EnqueueError(f"[queue] --after {args.after!r}: no such job in the queue")
             if len(_m) > 1:
-                sys.exit(f"[queue] --after {args.after!r} is ambiguous ({len(_m)} matches: "
+                raise EnqueueError(f"[queue] --after {args.after!r} is ambiguous ({len(_m)} matches: "
                          f"{', '.join(j['id'] for j in _m)})")
             after_id = _m[0]["id"]
         job = {
             "id": job_id,
-            "label": args.label or Path(args.cwd).name,
+            # Use the resolved `cwd` (a worktree path in --repo mode, where args.cwd
+            # is None) so a --repo enqueue without --label doesn't crash on Path(None).
+            "label": args.label or Path(cwd).name,
             "model": args.model,
             "host_pref": args.host,
             "cwd": str(cwd),
@@ -1695,10 +1783,20 @@ def cmd_enqueue(args):
                 job["launch_baseline"] = {"head": _head.stdout.strip(), "dirty": int(_dirty)}
         except Exception:
             pass  # not a repo / git unavailable -> key omitted = never measured
-        _sock = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
+        # Provenance. A LOCAL CLI enqueue back-routes to the enqueuing session via
+        # its messaging socket (read from env), exactly as before. A REMOTE enqueue
+        # (the HTTP API passes a launched_by_session marker) must NOT inherit the
+        # API server process's ambient socket -- it belongs to no interactive
+        # session -- so the env fallback is suppressed there and launched_by is only
+        # what the caller explicitly supplied (usually nothing => omitted = unknown
+        # launcher, which the gate handles). A missing routable socket never crashes.
+        _is_remote = bool(getattr(args, "launched_by_session", None))
+        _sock = getattr(args, "launched_by", None)
+        if not _sock and not _is_remote:
+            _sock = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
         if _sock:
             job["launched_by"] = _sock
-        _sess = os.environ.get("CLAUDE_CODE_BRIDGE_SESSION_ID")
+        _sess = getattr(args, "launched_by_session", None) or os.environ.get("CLAUDE_CODE_BRIDGE_SESSION_ID")
         if _sess:
             job["launched_by_session"] = _sess
         if _split_subspecs:
@@ -1716,6 +1814,7 @@ def cmd_enqueue(args):
             split_dir.mkdir(parents=True, exist_ok=True)
             slice_ids = [uuid.uuid4().hex[:12] for _ in _split_subspecs]
             base_label = job["label"]
+            _appended_slices = []
             for i, sub in enumerate(_split_subspecs):
                 sid = slice_ids[i]
                 is_final = (i == len(_split_subspecs) - 1)
@@ -1748,13 +1847,15 @@ def cmd_enqueue(args):
                     slice_job["live_log_path"] = str(
                         LIVE_LOG_DIR / f"{sid}-{safe_label(slice_job['label'])}.livelog")
                 state["jobs"].append(slice_job)
+                _appended_slices.append(slice_job)
             lock.save(state)
             print(f"enqueued SPLIT {split_group}  {base_label}  "
                   f"{len(_split_subspecs)} slices  model={args.model}  host={args.host}")
             for i, sid in enumerate(slice_ids):
                 print(f"  slice {i + 1}/{len(slice_ids)}: {sid}"
                       + ("  (final: runs --verify + gate)" if i == len(slice_ids) - 1 else ""))
-            return
+            return {"split": True, "group": split_group,
+                    "jobs": _appended_slices, "primary": _appended_slices[0]}
         if getattr(args, "front", False):
             # --front: same ordering rule as `promote` without --preempt -- insert AHEAD of every
             # pending job so the launch loop picks this one up next time a lane frees. Running/
@@ -1773,6 +1874,7 @@ def cmd_enqueue(args):
     print(f"enqueued {job_id}  {job['label']}  model={args.model}  host={args.host}")
     if job["live_log_path"]:
         print(f"  live log: tail -f {job['live_log_path']}")
+    return {"split": False, "jobs": [job], "primary": job}
 
 
 def cmd_status(_args):
