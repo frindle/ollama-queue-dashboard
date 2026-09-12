@@ -144,7 +144,11 @@ _servers_config_spec = importlib.util.spec_from_file_location(
 servers_config = importlib.util.module_from_spec(_servers_config_spec)
 _servers_config_spec.loader.exec_module(servers_config)
 
-KNOWN_OLLAMA_HOSTS = servers_config.load_servers()
+# ollama_hosts() filters out non-Ollama backends (comfyui/img2vid/image), so a
+# servers.json that also registers HTTP backends never leaks a non-LLM URL into
+# the Ollama routing / VRAM-fit / model-size path here. Legacy entries with no
+# "type" key are still treated as Ollama, so a pre-migration file is unchanged.
+KNOWN_OLLAMA_HOSTS = servers_config.ollama_hosts()
 
 
 def reload_known_hosts():
@@ -152,7 +156,7 @@ def reload_known_hosts():
     long-lived processes pick up edits made via the settings UI without a
     restart). Returns the refreshed dict."""
     global KNOWN_OLLAMA_HOSTS
-    KNOWN_OLLAMA_HOSTS = servers_config.load_servers()
+    KNOWN_OLLAMA_HOSTS = servers_config.ollama_hosts()
     return KNOWN_OLLAMA_HOSTS
 
 # Confirmed live 2026-08-28 (measured via /api/ps: size == size_vram, zero

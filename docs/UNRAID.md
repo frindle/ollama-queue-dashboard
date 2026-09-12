@@ -1,8 +1,12 @@
 # Running on Unraid
 
-The queue container runs happily on Unraid's Docker. Ollama itself stays on
-whatever host has your GPU (your Mac, a separate GPU box, or even Unraid's own
-Ollama container) — this container just reaches those over HTTP.
+The queue container runs happily on Unraid's Docker. It is a **universal
+dispatcher**: LLM (Ollama), image, and video work all run on their own
+hosts/services, and this container just reaches those over HTTP. The one thing
+that runs *in* the container is the coding feedback loop (verify/gate/review) —
+see "Coding feedback loop: mounting target repos" below. Register each backend
+(type + URL) on the Settings page; see `docs/BACKENDS.md` for the non-Ollama
+backend HTTP contract.
 
 ## Option A — Add a Container (Docker tab)
 
@@ -85,12 +89,32 @@ docker run -d --name ollama-queue \
   ghcr.io/YOURNAME/ollama-queue-dashboard:latest
 ```
 
+## Coding feedback loop: mounting target repos
+
+The coding-dispatch loop (scaffolding / gates / reviews / verify) runs **inside**
+this container, so any repo it verifies must be mounted:
+
+- **Add Path (volume):** `/repos` → `/mnt/user/appdata/dispatch-repos` (**rw** —
+  the queue creates a throwaway git worktree per job and writes install
+  artifacts). Then enqueue with `--repo /repos/<name>` (or `--cwd`).
+- The image ships the toolchain the loop itself needs: `git`, `python3`,
+  `nodejs`, `npm`. A repo's **own** dependencies are **not** baked in — they
+  install at verify time (`npm ci`, `prisma generate`, `pip install ...`) via the
+  existing env-parity bootstrap, against the mounted repo. Give the container
+  outbound network access so those installs can reach npm / PyPI.
+
+## Backend services (image / video / ComfyUI)
+
+Non-Ollama jobs are dispatched to HTTP services over the network — nothing extra
+is mounted or installed in this container for them. Register each on the Settings
+page (name, type `comfyui|img2vid|image`, URL). The queue POSTs the job and polls
+for a result URL; the service (e.g. the Studio pet-portrait backend) does the GPU
+work. Contract: `docs/BACKENDS.md`.
+
 ## Notes
 
-- **Persistence:** everything durable is under `/config` (your host list) and
-  `/data` (queue state + logs). Back those two paths up; the image is disposable.
+- **Persistence:** everything durable is under `/config` (your backend registry)
+  and `/data` (queue state + logs). Back those two paths up; the image is
+  disposable.
 - **Updates:** pull a new image and recreate the container — state/config survive
   in the mounted paths.
-- **Coding dispatch:** if you intend to run in-container *coding* dispatches (not
-  just LLM proxying / routing), also mount the target repos into the container so
-  the per-job verify can run there — see "Known limitations" in the main README.

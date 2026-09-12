@@ -94,7 +94,9 @@ def _pick_v1_host(preferred=None):
         url = _servers_file_url(preferred)
         if url and _host_reachable(url):
             return url
-    servers = servers_config.load_servers()
+    # Ollama-only: /v1 proxies to an LLM host, never to a comfyui/img2vid/image
+    # backend (those don't speak /api/tags), so filter them out here.
+    servers = servers_config.ollama_hosts()
     urls = [spec["url"].rstrip("/") for spec in servers.values() if spec.get("url")]
     for url in urls:
         if _host_reachable(url):
@@ -228,20 +230,28 @@ FRONTEND_HTML = r"""<!doctype html>
 <h2>Loaded right now</h2>
 <div id="hosts"></div>
 
-<h2>Settings — Ollama servers</h2>
-<p style="font-size:.85rem; color:#8888;">These are the remote Ollama hosts the queue routes to. Edits are saved to
-<code>config/servers.json</code> and picked up by new dispatches immediately.
-<code>usable_bytes</code> is the VRAM/memory budget used for model-fit routing
-(0 = unknown).</p>
+<h2>Settings — backends</h2>
+<p style="font-size:.85rem; color:#8888;">The backend services the queue dispatches to. <b>ollama</b> hosts run LLM jobs
+(routed by model-fit); <b>comfyui / img2vid / image</b> are HTTP services the
+queue POSTs image/video jobs to (see <code>docs/BACKENDS.md</code>). Edits are
+saved to <code>config/servers.json</code> and picked up by new dispatches
+immediately. <code>usable_bytes</code> is the VRAM/memory budget used for Ollama
+model-fit routing (0 = unknown; not needed for non-Ollama backends).</p>
 <table id="serversTbl">
-  <thead><tr><th>Name</th><th>URL</th><th>usable_bytes</th><th></th></tr></thead>
+  <thead><tr><th>Name</th><th>Type</th><th>URL</th><th>usable_bytes</th><th></th></tr></thead>
   <tbody id="serversBody"></tbody>
 </table>
-<form id="serverForm" style="max-width:640px;">
+<form id="serverForm" style="max-width:760px;">
   <div style="display:flex; gap:.5rem; flex-wrap:wrap;">
     <input id="srvName" placeholder="name (e.g. gpu-box)" style="flex:1; min-width:120px;">
+    <select id="srvType" style="flex:1; min-width:110px;">
+      <option value="ollama">ollama</option>
+      <option value="comfyui">comfyui</option>
+      <option value="img2vid">img2vid</option>
+      <option value="image">image</option>
+    </select>
     <input id="srvUrl" placeholder="http://192.0.2.10:11434" style="flex:2; min-width:200px;">
-    <input id="srvBytes" placeholder="usable_bytes (optional)" style="flex:1; min-width:120px;">
+    <input id="srvBytes" placeholder="usable_bytes (ollama only)" style="flex:1; min-width:120px;">
     <button type="submit">Add / update</button>
   </div>
   <div id="srvErr" style="color:#c0392b;"></div>
@@ -760,6 +770,7 @@ async function refreshServers() {
     body.innerHTML = (data.servers || []).map(s => `
       <tr>
         <td>${escapeHtml(s.name)}</td>
+        <td>${escapeHtml(s.type || 'ollama')}</td>
         <td><code>${escapeHtml(s.url)}</code></td>
         <td>${s.usable_bytes || 0}</td>
         <td><button class="iconbtn" data-edit='${escapeHtml(JSON.stringify(s))}'>edit</button>
@@ -774,6 +785,7 @@ async function refreshServers() {
     body.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => {
       const s = JSON.parse(b.getAttribute('data-edit'));
       document.getElementById('srvName').value = s.name;
+      document.getElementById('srvType').value = s.type || 'ollama';
       document.getElementById('srvUrl').value = s.url;
       document.getElementById('srvBytes').value = s.usable_bytes || '';
     }));
@@ -784,13 +796,15 @@ document.getElementById('serverForm').addEventListener('submit', async (ev) => {
   const err = document.getElementById('srvErr');
   err.textContent = '';
   const name = document.getElementById('srvName').value.trim();
+  const type = document.getElementById('srvType').value;
   const url = document.getElementById('srvUrl').value.trim();
   const bytesRaw = document.getElementById('srvBytes').value.trim();
-  const payload = {name, url, usable_bytes: bytesRaw ? parseInt(bytesRaw, 10) : 0};
+  const payload = {name, type, url, usable_bytes: bytesRaw ? parseInt(bytesRaw, 10) : 0};
   const res = await fetch('/api/hosts', {method: 'POST',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
   if (!res.ok) { err.textContent = await res.text(); return; }
   document.getElementById('srvName').value = '';
+  document.getElementById('srvType').value = 'ollama';
   document.getElementById('srvUrl').value = '';
   document.getElementById('srvBytes').value = '';
   refreshServers();
@@ -1080,11 +1094,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/hosts":
             self._json(_hosts_summary())
         elif self.path == "/api/servers":
-            # Config-driven registry for the settings UI: [{name, url, usable_bytes}]
+            # Config-driven registry for the settings UI: [{name, type, url, usable_bytes}].
+            # type defaults to "ollama" for legacy entries with no type key.
             servers = servers_config.load_servers()
             self._json({"servers": [
-                {"name": n, "url": s.get("url", ""), "usable_bytes": s.get("usable_bytes", 0)}
-                for n, s in servers.items()]})
+                {"name": n, "type": servers_config.entry_type(s),
+                 "url": s.get("url", ""), "usable_bytes": s.get("usable_bytes", 0)}
+                for n, s in servers.items()],
+                "backend_types": list(servers_config.BACKEND_TYPES)})
         elif self.path == "/v1/models" or self.path.startswith("/v1/models?"):
             self._v1_models()
         elif self.path == "/api/web-search-usage":
@@ -1341,25 +1358,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ---- Settings: server registry CRUD -------------------------------------
 
     def _add_or_update_host(self):
-        """POST /api/hosts -- add or update one server. Body:
-        {name, url, usable_bytes?}. Persists via servers_config.save_servers and
-        refreshes the worker's cached table."""
+        """POST /api/hosts -- add or update one backend. Body:
+        {name, url, type?, usable_bytes?}. type defaults to "ollama" (backward
+        compatible with the Ollama-only registry); a non-Ollama backend
+        (comfyui/img2vid/image) registers its type + url and needs no
+        usable_bytes. Persists via servers_config.save_servers and refreshes the
+        worker's cached table."""
         try:
             data = self._read_json_body()
         except Exception as e:
             return self._text(f"bad JSON: {e}", 400)
         name = (data.get("name") or "").strip()
         url = (data.get("url") or "").strip()
+        btype = (data.get("type") or servers_config.OLLAMA_TYPE).strip()
         if not name:
             return self._text("name is required", 400)
         if "://" not in url:
             return self._text("url must be a full http(s) URL", 400)
+        if btype not in servers_config.BACKEND_TYPES:
+            return self._text(f"type must be one of {list(servers_config.BACKEND_TYPES)}", 400)
         try:
             usable_bytes = int(data.get("usable_bytes") or 0)
         except (TypeError, ValueError):
             return self._text("usable_bytes must be an integer", 400)
         servers = servers_config.load_servers()
-        servers[name] = {"url": url.rstrip("/"), "usable_bytes": usable_bytes}
+        if btype == servers_config.OLLAMA_TYPE:
+            # Keep the exact legacy shape for Ollama hosts (no "type" key) so a
+            # downgrade / older reader still parses the file identically.
+            servers[name] = {"url": url.rstrip("/"), "usable_bytes": usable_bytes}
+        else:
+            entry = {"type": btype, "url": url.rstrip("/")}
+            if usable_bytes:
+                entry["usable_bytes"] = usable_bytes
+            servers[name] = entry
         try:
             servers_config.save_servers(servers)
         except OSError as e:
@@ -1406,7 +1437,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """GET /v1/models -- aggregate models across reachable configured hosts,
         deduped by id, in OpenAI list shape. ?host=<name|url> restricts to one."""
         preferred = self._v1_host_from_query()
-        servers = servers_config.load_servers()
+        # Ollama-only: /v1/models aggregates LLM hosts. Non-Ollama backends
+        # (comfyui/img2vid/image) don't serve /v1/models, so exclude them.
+        servers = servers_config.ollama_hosts()
         if preferred:
             url = _servers_file_url(preferred)
             urls = [url] if url else []

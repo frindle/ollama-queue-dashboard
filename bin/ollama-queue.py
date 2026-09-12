@@ -124,6 +124,16 @@ from pathlib import Path
 # deployed (e.g. /app/bin in the Docker image), independent of $HOME. State and
 # logs below stay under $HOME so they can be mounted as a data volume.
 WORKER_PATH = Path(__file__).resolve().parent / "ollama-worker.py"
+# HTTP-backend dispatcher (2026-09-11). For non-Ollama job types (comfyui/img2vid/
+# image) the queue launches THIS instead of ollama-worker.py: it POSTs the job to
+# the configured backend SERVICE over HTTP and polls for the result, the same
+# "launch a subprocess that speaks HTTP to the assigned host" shape used for
+# Ollama. It replaces the old local --runner scripts (img2vid-render.py etc.),
+# which re-exec'd into a Mac MPS venv and cannot run inside a Linux container.
+# Baked into the image next to this file (like WORKER_PATH) -- NOT an allowlisted
+# ~/bin runner path -- so it works at /app/bin in the container. The remote
+# service it calls is what actually runs the GPU work (see docs/BACKENDS.md).
+BACKEND_DISPATCH_PATH = Path(__file__).resolve().parent / "backend-dispatch.py"
 # Alternate runners a job may name via --runner instead of ollama-worker.py (added 2026-08-30
 # for the Autonomous Research session: its 6-stage orchestrator makes 30-60 dynamic model calls
 # per run, so queuing each call is wrong -- instead the queue runs the WHOLE run as one job on
@@ -1378,7 +1388,11 @@ def _count_real_dirty(porcelain_text: str) -> int:
 
 
 def cmd_enqueue(args):
-    _validate_host(args.host)
+    # A --backend job may pass --host <backend-name> (a registry key, not a
+    # routing keyword or URL); it is resolved to the service URL below, so skip
+    # the Ollama-host keyword/URL validation here.
+    if not getattr(args, "backend", None):
+        _validate_host(args.host)
     if args.api == "openai" and args.host == "auto":
         sys.exit("--api openai requires an explicit --host (studio/unraid/URL) -- "
                  "pick_host() only knows the two native-Ollama endpoints, not an ad-hoc "
@@ -1386,6 +1400,32 @@ def cmd_enqueue(args):
     task_file = Path(args.task_file).resolve()
     if not task_file.is_file():
         sys.exit(f"task file does not exist: {task_file}")
+
+    # BACKEND (non-Ollama) DISPATCH (2026-09-11). A --backend job is not an LLM
+    # coding/research run: it carries no verify, no worktree, no VRAM-fit sizing.
+    # Resolve the backend SERVICE url from the registry NOW (by --host name, or
+    # the first backend of this type when --host is auto), and rewrite host_pref
+    # to that explicit URL so the scheduler's existing "explicit URL => single
+    # lane" path routes it -- the backend URL becomes its lane, serialised like
+    # any host. backend-dispatch.py (launched by _build_cmd) does the HTTP POST.
+    backend = getattr(args, "backend", None)
+    if backend:
+        _sc = worker().servers_config
+        _pin = None if args.host in ("auto", None) else args.host
+        _bname, _burl = _sc.select_backend(backend, name=_pin)
+        if not _burl:
+            _avail = sorted(_sc.backends_of_type(backend).keys())
+            sys.exit(f"[queue] REFUSING enqueue: no '{backend}' backend registered"
+                     + (f" named {_pin!r}" if _pin else "")
+                     + f". Add one on the Settings page (type={backend}, a URL). "
+                     + (f"Registered {backend} backends: {_avail}." if _avail
+                        else f"None registered yet."))
+        args.host = _burl  # explicit URL => single-lane routing in _candidate_lanes
+        # A backend job has no code verify and no auto-ctx sizing; give num_ctx a
+        # concrete value so the auto-ctx / diagnosis-floor blocks below are skipped
+        # (the value is forwarded but ignored by the HTTP service).
+        if args.num_ctx is None:
+            args.num_ctx = 0
 
     # NO-VERIFY GATE (2026-09-10). Was a soft stderr warning (D5); hardened to a
     # gate after shipped-flip job d31d96d23b29 wandered all 55 iterations with a
@@ -1395,8 +1435,9 @@ def cmd_enqueue(args):
     # --allow-no-verify explicitly acknowledges it as scope-only/advisory. Done
     # HERE, before worktree creation, so a refusal leaves nothing behind. An
     # investigation/diagnosis shape legitimately has no code verify (it gates on
-    # DIAGNOSIS.md), so it is exempt.
-    if not args.verify and args.task_kind != "research":
+    # DIAGNOSIS.md), so it is exempt. A --backend (image/video) job is not code
+    # at all -- it has no repo/diff to verify -- so it is exempt too.
+    if not args.verify and args.task_kind != "research" and not backend:
         try:
             _tt_gate = task_file.read_text()
         except Exception:
@@ -1554,7 +1595,7 @@ def cmd_enqueue(args):
     # it never was. A diagnosis/investigation shape legitimately has no code
     # verify (it gates on DIAGNOSIS.md), so exclude it; only warn for a real
     # code-fix shape (task_kind coding, or unset -- the default coding path).
-    if not args.verify and args.task_kind != "research" and not _is_investigation:
+    if not args.verify and args.task_kind != "research" and not _is_investigation and not backend:
         _b = "[queue] " + "=" * 68
         print(_b, file=sys.stderr)
         print("[queue] WARNING: coding dispatch enqueued with NO --verify.", file=sys.stderr)
@@ -1588,6 +1629,7 @@ def cmd_enqueue(args):
             "cwd": str(cwd),
             "task_file": str(task_file),
             "runner": runner,  # None = default ollama-worker.py; else an allowlisted alternate exe
+            "backend": backend,  # None = LLM job; else "comfyui"/"img2vid"/"image" -> backend-dispatch.py
             "task_kind": args.task_kind,
             "manual_tools": args.manual_tools,
             "api": args.api,
@@ -1751,6 +1793,22 @@ def cmd_status(_args):
 
 
 def _build_cmd(job, host_url):
+    backend = job.get("backend")
+    if backend:
+        # HTTP-BACKEND job (2026-09-11): the HTTP call to the backend SERVICE
+        # replaces the old local runner exec. host_url is the backend service URL
+        # (resolved from the registry; it IS the job's lane). backend-dispatch.py
+        # POSTs the payload (task_file) and polls for the result -- see
+        # docs/BACKENDS.md for the contract. Baked into the image, so no allowlist.
+        cmd = ["python3", str(BACKEND_DISPATCH_PATH),
+               "--backend", backend,
+               "--url", host_url,
+               "--cwd", job["cwd"],
+               "--task-file", job["task_file"],
+               "--job-id", job["id"]]
+        if job.get("model"):
+            cmd += ["--model", job["model"]]
+        return cmd
     runner = job.get("runner")
     if runner:
         # Alternate runner (allowlisted at enqueue -- re-checked here as defense in depth against a
@@ -2529,6 +2587,14 @@ def cmd_run(args):
                     if not running_here:
                         chosen = lane_url  # normal first claim on a free lane
                         break
+                    # HTTP-backend jobs (comfyui/img2vid/image) run on a REMOTE
+                    # service, not this queue's Ollama lanes: the second-slot
+                    # exception (same-model + research, VRAM headroom) is meaningless
+                    # for them and probing a non-Ollama URL for /props would just
+                    # hang. Keep them strictly one-per-backend-lane -- leave the job
+                    # pending and let the lane free on a later tick.
+                    if job.get("backend"):
+                        continue
                     # Occupied -> the guarded second-slot exception (see slot_decision).
                     # Positively confirm the server's slot capacity, and only then its
                     # VRAM fit, from the LIVE server; both fail toward serial when any
@@ -2576,7 +2642,7 @@ def cmd_run(args):
                 # livelog viewer would show nothing. Point their stdout straight at
                 # the livelog file so research runs stream on the dashboard exactly
                 # like coding jobs. (studio-research prints progress via log().)
-                if job.get("runner") and job.get("live_log_path"):
+                if (job.get("runner") or job.get("backend")) and job.get("live_log_path"):
                     log_path = Path(job["live_log_path"])
                 logf = None
                 try:
@@ -2845,6 +2911,15 @@ def main():
                          "--model/--host/--num-ctx/--cwd/--task-file; the runner owns everything "
                          "else. For a multi-call orchestrator that must run as ONE queue job so it "
                          "stays visible in queue state and under the VRAM-collision guards.")
+    e.add_argument("--backend", default=None,
+                    choices=["comfyui", "img2vid", "image"],
+                    help="Dispatch this job to a non-Ollama HTTP BACKEND SERVICE of this type "
+                         "(instead of running an LLM worker). The queue resolves the backend URL "
+                         "from the servers registry -- pass --host <backend-name> to pin one, or "
+                         "--host auto to take the first registered backend of this type -- and "
+                         "launches backend-dispatch.py to POST the job and poll for the result "
+                         "(see docs/BACKENDS.md). Replaces the old local --runner image/video "
+                         "scripts. --task-file must be the JSON job payload for the service.")
     e.add_argument("--task-kind", default=None, choices=["coding", "research"])
     e.add_argument("--manual-tools", action="store_true")
     e.add_argument("--api", default="ollama", choices=["ollama", "openai"])

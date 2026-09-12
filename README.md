@@ -28,6 +28,21 @@ the models stay on their existing hosts** — your Mac, a GPU box, another serve
 and the container reaches them as **remote hosts over HTTP**. Nothing pulls models
 into the container; it never needs a GPU itself.
 
+### Universal dispatcher — beyond Ollama
+
+The queue also dispatches **non-Ollama** job types (image generation, ComfyUI,
+image-to-video) to **backend services over HTTP**, using the same shape it uses
+for Ollama: it POSTs the job to the backend and polls for a result URL — the
+backend service does the GPU work. Register each backend's `type` + `url` in the
+registry (Settings page). See **[docs/BACKENDS.md](docs/BACKENDS.md)** for the
+HTTP contract and how a job selects its backend.
+
+The **one** thing that runs *in* the container is the **coding feedback loop**
+(scaffolding / gates / reviews / verify): it needs `git` + `python3` + `node`
+(all baked into the image) and the target repos mounted as a volume — a repo's
+own deps install at verify time. See "Coding feedback loop" in
+[docs/UNRAID.md](docs/UNRAID.md).
+
 ## What you get
 
 - **Job queue + dashboard** (`:7684`) — enqueue jobs, watch progress, reorder,
@@ -68,26 +83,33 @@ docker run -d --name ollama-queue \
 
 ## Configuring servers
 
-A server entry is `name → {url, usable_bytes}`:
+A registry entry is `name → {type, url, usable_bytes?}`. `type` defaults to
+`ollama` if omitted, so a pre-existing Ollama-only file keeps working unchanged:
 
 ```json
 {
-  "studio":  { "url": "http://host.docker.internal:11434", "usable_bytes": 47244640256 },
-  "gpu-box": { "url": "http://192.0.2.10:11434",            "usable_bytes": 10307921510 }
+  "studio":         { "type": "ollama",  "url": "http://host.docker.internal:11434", "usable_bytes": 47244640256 },
+  "gpu-box":        { "type": "ollama",  "url": "http://192.0.2.10:11434",           "usable_bytes": 10307921510 },
+  "studio-img2vid": { "type": "img2vid", "url": "http://192.0.2.20:8199" },
+  "studio-image":   { "type": "image",   "url": "http://192.0.2.20:8198" }
 }
 ```
 
-- **`url`** — the Ollama base URL the container calls (`/api/*`, `/v1/*`).
-- **`usable_bytes`** — memory budget for VRAM-fit routing (`0` = unknown).
+- **`type`** — `ollama` (LLM host) or a backend type (`comfyui` | `img2vid` |
+  `image`). Missing = `ollama`.
+- **`url`** — the base URL the container calls. For Ollama: `/api/*`, `/v1/*`.
+  For a backend: the `docs/BACKENDS.md` dispatch contract.
+- **`usable_bytes`** — memory budget for Ollama VRAM-fit routing (`0`/omitted =
+  unknown; not used for non-Ollama backends).
 
 Resolution order (first that exists wins):
 `$OLLAMA_QUEUE_SERVERS` → `config/servers.json` → built-in placeholder defaults.
 `config/servers.json` is gitignored so your real hosts never get committed.
 
-**Edit from the UI:** the dashboard's **Settings — Ollama servers** panel lists
-every server with add / edit / delete. Changes are saved to `servers.json`
-(`POST /api/hosts`, `DELETE /api/hosts/<name>`) and picked up by new dispatches
-immediately.
+**Edit from the UI:** the dashboard's **Settings — backends** panel lists every
+backend with a type selector and add / edit / delete. Changes are saved to
+`servers.json` (`POST /api/hosts`, `DELETE /api/hosts/<name>`) and picked up by
+new dispatches immediately.
 
 ### Reaching your Ollama hosts from the container
 
@@ -148,16 +170,22 @@ and step-by-step notes.
 |---|---|
 | `/config` | `servers.json` (edited via Settings). |
 | `/data` | Queue state, job logs, live logs. |
+| `/repos` *(optional)* | Target repos for the in-container coding feedback loop (rw). |
 
 ## Known limitations
 
-- **Coding-dispatch verify-locality.** The full *coding dispatch* pipeline runs
-  each job's **verify command where the worker runs** — i.e. inside this
-  container. So dispatching a code fix that must check out and test a repo
-  requires that **repo to be mounted into the container** and its toolchain
-  present. Out of the box, **LLM access (`/v1`) and job routing across your Ollama
-  hosts work with no extra setup**; in-container coding-dispatch is the piece that
-  needs the target repos (and their build tools) mounted.
+- **Coding-dispatch verify-locality.** The *coding dispatch* pipeline runs each
+  job's **verify command where the worker runs** — i.e. inside this container. So
+  dispatching a code fix that must check out and test a repo requires that
+  **repo to be mounted into the container** (e.g. `/repos`). The image ships the
+  loop's own toolchain (`git`, `python3`, `nodejs`, `npm`); a repo's own deps
+  install at verify time (`npm ci` / `prisma generate` / `pip install`) via the
+  env-parity bootstrap. Out of the box, **LLM access (`/v1`), job routing, and
+  HTTP-backend dispatch (image/video/ComfyUI) work with no extra setup**;
+  in-container coding-dispatch is the piece that needs the target repos mounted.
+- **Backend services are external.** `comfyui` / `img2vid` / `image` jobs are
+  dispatched over HTTP to services you run elsewhere (see `docs/BACKENDS.md`).
+  The queue does not run or proxy their compute; it forwards a result URL.
 - **The container runs the queue, not Ollama.** It has no GPU and pulls no
   models; it only orchestrates and proxies to the hosts you configure.
 - **`LaunchAgents/`** are the author's macOS service definitions, included for
