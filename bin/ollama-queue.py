@@ -120,7 +120,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-WORKER_PATH = Path.home() / "bin" / "ollama-worker.py"
+# Code path -- resolve next to this file so the queue works wherever bin/ is
+# deployed (e.g. /app/bin in the Docker image), independent of $HOME. State and
+# logs below stay under $HOME so they can be mounted as a data volume.
+WORKER_PATH = Path(__file__).resolve().parent / "ollama-worker.py"
 # Alternate runners a job may name via --runner instead of ollama-worker.py (added 2026-08-30
 # for the Autonomous Research session: its 6-stage orchestrator makes 30-60 dynamic model calls
 # per run, so queuing each call is wrong -- instead the queue runs the WHOLE run as one job on

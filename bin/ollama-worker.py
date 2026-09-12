@@ -133,22 +133,27 @@ UNRAID_OLLAMA_HOSTS = ("10.0.7.143",)  # substrings matched against --host to de
 # the Mac Studio has 64GB of unified memory (no VRAM/RAM split, Metal treats
 # it as one pool). Picking the host should be driven by whether the model
 # actually fits the GPU, not by a single hardcoded default.
-KNOWN_OLLAMA_HOSTS = {
-    "unraid": {
-        "url": "http://10.0.7.143:11434",
-        # 3080, 12GB VRAM (confirmed 2026-08-27). Reserve ~20% for KV
-        # cache/context overhead so a model that just barely fits the raw
-        # VRAM figure doesn't still spill once a real context is loaded.
-        "usable_bytes": int(12 * 1024**3 * 0.8),
-    },
-    "studio": {
-        "url": "http://127.0.0.1:11434",
-        # 64GB unified memory (confirmed live via `sysctl hw.memsize` on
-        # pennsmacstudio). Reserve ~20GB for the OS and whatever else is
-        # running rather than the full 64GB.
-        "usable_bytes": 44 * 1024**3,
-    },
-}
+# Server registry is config-driven (was a hardcoded literal here). It is
+# loaded from servers_config.py -- resolution order: $OLLAMA_QUEUE_SERVERS >
+# <repo>/config/servers.json > built-in DEFAULT_SERVERS -- preserving the exact
+# {name: {"url": str, "usable_bytes": int}} shape every consumer below relies
+# on. servers_config.py lives next to this file; load it the same way
+# ollama-queue.py loads this module (works whether or not bin/ is on sys.path).
+_servers_config_spec = importlib.util.spec_from_file_location(
+    "servers_config", str(Path(__file__).resolve().parent / "servers_config.py"))
+servers_config = importlib.util.module_from_spec(_servers_config_spec)
+_servers_config_spec.loader.exec_module(servers_config)
+
+KNOWN_OLLAMA_HOSTS = servers_config.load_servers()
+
+
+def reload_known_hosts():
+    """Re-read the servers file and refresh KNOWN_OLLAMA_HOSTS in place (so
+    long-lived processes pick up edits made via the settings UI without a
+    restart). Returns the refreshed dict."""
+    global KNOWN_OLLAMA_HOSTS
+    KNOWN_OLLAMA_HOSTS = servers_config.load_servers()
+    return KNOWN_OLLAMA_HOSTS
 
 # Confirmed live 2026-08-28 (measured via /api/ps: size == size_vram, zero
 # spillover) -- see Agent-Dispatch-Log.md "Unraid VRAM math now fully

@@ -11,6 +11,8 @@ Resolution order for the servers file (load_servers):
   2. <repo>/config/servers.json (this file's parent's parent / "config").
   3. built-in DEFAULT_SERVERS (no file present).
 """
+import json
+import os
 from pathlib import Path
 
 # Built-in fallback used only when no servers file exists. PLACEHOLDER hosts
@@ -33,12 +35,30 @@ def default_servers_path() -> Path:
     return Path(__file__).resolve().parent.parent / "config" / "servers.json"
 
 
+def _resolve_path(path=None):
+    if path:
+        return Path(path)
+    env = os.environ.get("OLLAMA_QUEUE_SERVERS")
+    if env:
+        return Path(env)
+    return default_servers_path()
+
+
 def load_servers(path=None) -> dict:
-    """STUB -- not implemented. Always returns the built-in defaults,
-    ignoring $OLLAMA_QUEUE_SERVERS and any config/servers.json on disk."""
+    """Resolve the servers file (explicit path > $OLLAMA_QUEUE_SERVERS >
+    <repo>/config/servers.json) and return its parsed JSON dict. Falls back to
+    the built-in DEFAULT_SERVERS when no file exists or it cannot be read."""
+    p = _resolve_path(path)
+    try:
+        if p.exists():
+            return json.loads(p.read_text())
+    except (OSError, ValueError):
+        pass
     return dict(DEFAULT_SERVERS)
 
 
 def save_servers(servers, path=None) -> None:
-    """STUB -- not implemented."""
-    raise NotImplementedError("save_servers is not implemented yet")
+    """Write `servers` as JSON to the resolved path, creating parent dirs."""
+    p = _resolve_path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(servers, indent=2))
