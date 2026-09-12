@@ -139,6 +139,10 @@ and step-by-step notes.
 | `OLLAMA_QUEUE_SERVERS` | `/config/servers.json` | Path to the servers file. |
 | `QUEUE_API_PORT` | `7684` | API/dashboard port. |
 | `HOME` | `/data` | Base for queue **state + logs** (mount as a volume). |
+| `OLLAMA_DEFAULT_HOST` | `http://127.0.0.1:11434` | Fallback Ollama host when a job pins none. Point at one of your configured servers (e.g. `http://host.docker.internal:11434`). |
+| `OLLAMA_UNRAID_HOSTS` | *(unset)* | Comma-separated host substrings that are VRAM-limited / spillover-prone, used only to bias model-fit auto-selection. Optional. |
+| `SEARXNG_HOST` | `http://127.0.0.1:8080` | SearXNG base URL for the optional web-search/research feature. Ignore if unused. |
+| `OBSIDIAN_URL` | *(unset = off)* | Optional Obsidian Local-REST base URL for dispatch logging; empty disables it. Token via `OBSIDIAN_TOKEN`. |
 
 | Volume | Purpose |
 |---|---|

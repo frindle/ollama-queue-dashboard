@@ -10,6 +10,16 @@ services:
       # Set a token to require Authorization: Bearer <token> (or X-Api-Token)
       # on every request. Leave unset only on a trusted network / behind a proxy.
       QUEUE_API_TOKEN: "${QUEUE_API_TOKEN:-}"
+      # Fallback Ollama host for jobs that pin none. Set to one of your servers,
+      # e.g. http://host.docker.internal:11434 (Ollama on the Docker host).
+      OLLAMA_DEFAULT_HOST: "${OLLAMA_DEFAULT_HOST:-}"
+      # Optional. Comma-separated host substrings that are VRAM-limited, used
+      # only to bias model-fit auto-selection.
+      # OLLAMA_UNRAID_HOSTS: "10.0.0.5,gpu-box"
+      # Optional web-search/research + Obsidian dispatch logging (leave unset if unused).
+      # SEARXNG_HOST: "http://searxng:8080"
+      # OBSIDIAN_URL: "http://obsidian:27123"
+      # OBSIDIAN_TOKEN: "${OBSIDIAN_TOKEN:-}"
     volumes:
       - ./config:/config            # servers.json (edited via the Settings page)
       - queue-data:/data            # queue state, logs, live logs (persisted)

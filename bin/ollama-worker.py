@@ -52,7 +52,7 @@ except ImportError:
     pdfplumber = None
 
 DEFAULT_MODEL = "qwen3-14b-agentic"
-DEFAULT_HOST = "http://10.0.7.143:11434"
+DEFAULT_HOST = os.environ.get("OLLAMA_DEFAULT_HOST", "http://127.0.0.1:11434")
 # --api openai's default when --host is omitted (start-llama-server-qwen3.8.sh's
 # fixed port; it must already be running, this script does not start it) --
 # pick_host() only knows the two native-Ollama hosts, so this is separate.
@@ -120,9 +120,9 @@ CONTEXT_REVIEW_THRESHOLD = 0.90  # added 2026-08-28 (Penn's request, "can we do 
 # CONVERGE while it still has room, each firing at most once per run. Kept strictly below
 # CONTEXT_REVIEW_THRESHOLD so the pause always supersedes the top nudge.
 CONTEXT_NUDGE_THRESHOLDS = (0.60, 0.78)
-DEFAULT_SEARXNG_HOST = "http://10.0.12.41:8080"
+DEFAULT_SEARXNG_HOST = os.environ.get("SEARXNG_HOST", "http://127.0.0.1:8080")
 LOG_DIR = Path.home() / "bin" / "ollama-worker-logs"
-UNRAID_OLLAMA_HOSTS = ("10.0.7.143",)  # substrings matched against --host to detect "this dispatch targets Unraid"
+UNRAID_OLLAMA_HOSTS = tuple(h.strip() for h in os.environ.get("OLLAMA_UNRAID_HOSTS", "").split(",") if h.strip())  # substrings matched against --host to detect "this dispatch targets a spillover-prone host"
 
 # Host auto-selection -- added 2026-08-28 after dispatching qwen3.8:27b-q8_0
 # (~30.7GB) to Unraid by relying on DEFAULT_HOST above without checking fit:
@@ -243,7 +243,7 @@ COPY_HELPER = str(Path.home() / "bin" / "copy-ollama-model-from-unraid.py")
 LOCAL_MODEL_CACHE = Path.home() / ".ollama" / "models"
 SMB_MODEL_SOURCE = Path("/Volumes/data/ollama-models")
 MODEL_PULL_LOG = Path.home() / "bin" / "ollama-model-pulls.log"
-OBSIDIAN_URL = "http://10.0.6.230:27123"
+OBSIDIAN_URL = os.environ.get("OBSIDIAN_URL", "")  # e.g. http://<obsidian-host>:27123; empty disables vault logging
 OBSIDIAN_TOKEN_FILE = Path.home() / ".config" / "ollama-worker" / "obsidian-token"
 # Env var first (if a caller's shell happens to have it), else the local
 # file -- launchctl setenv only affects processes launched AFTER the

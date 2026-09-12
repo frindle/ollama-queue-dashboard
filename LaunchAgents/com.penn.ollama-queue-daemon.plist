@@ -42,22 +42,22 @@
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/python3</string>
-    <string>/Users/penn/bin/ollama-queue.py</string>
+    <string>/opt/ollama-queue/bin/ollama-queue.py</string>
     <string>run</string>
   </array>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/penn/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/pivy/bin</string>
+    <string>/opt/ollama-queue/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/pivy/bin</string>
     <key>HOME</key>
-    <string>/Users/penn</string>
+    <string>/opt/ollama-queue</string>
     <key>USER</key>
     <string>penn</string>
   </dict>
 
   <key>WorkingDirectory</key>
-  <string>/Users/penn/bin</string>
+  <string>/opt/ollama-queue/bin</string>
 
   <key>RunAtLoad</key>
   <true/>
@@ -73,8 +73,8 @@
   <integer>60</integer>
 
   <key>StandardOutPath</key>
-  <string>/Users/penn/bin/ollama-queue-daemon.log</string>
+  <string>/opt/ollama-queue/bin/ollama-queue-daemon.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/penn/bin/ollama-queue-daemon.log</string>
+  <string>/opt/ollama-queue/bin/ollama-queue-daemon.log</string>
 </dict>
 </plist>

@@ -103,6 +103,7 @@ def _pick_v1_host(preferred=None):
 
 FRONTEND_HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Ollama Queue</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20128%20128%22%20width%3D%22128%22%20height%3D%22128%22%20role%3D%22img%22%20aria-label%3D%22Ollama%20Queue%22%3E%0A%20%20%3Cdefs%3E%0A%20%20%20%20%3ClinearGradient%20id%3D%22g%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%221%22%20y2%3D%221%22%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%220%22%20stop-color%3D%22%235b8def%22/%3E%0A%20%20%20%20%20%20%3Cstop%20offset%3D%221%22%20stop-color%3D%22%237c4dff%22/%3E%0A%20%20%20%20%3C/linearGradient%3E%0A%20%20%3C/defs%3E%0A%20%20%3Crect%20x%3D%224%22%20y%3D%224%22%20width%3D%22120%22%20height%3D%22120%22%20rx%3D%2228%22%20fill%3D%22url%28%23g%29%22/%3E%0A%20%20%3C%21--%20queue%20stack%20--%3E%0A%20%20%3Crect%20x%3D%2228%22%20y%3D%2234%22%20width%3D%2252%22%20height%3D%2212%22%20rx%3D%226%22%20fill%3D%22%23ffffff%22%20opacity%3D%220.95%22/%3E%0A%20%20%3Crect%20x%3D%2228%22%20y%3D%2258%22%20width%3D%2252%22%20height%3D%2212%22%20rx%3D%226%22%20fill%3D%22%23ffffff%22%20opacity%3D%220.80%22/%3E%0A%20%20%3Crect%20x%3D%2228%22%20y%3D%2282%22%20width%3D%2252%22%20height%3D%2212%22%20rx%3D%226%22%20fill%3D%22%23ffffff%22%20opacity%3D%220.60%22/%3E%0A%20%20%3C%21--%20dispatch%20spark%20--%3E%0A%20%20%3Cpath%20d%3D%22M92%2030%20L74%2068%20H88%20L82%20100%20L104%2058%20H90%20Z%22%20fill%3D%22%23ffd54a%22%20stroke%3D%22%23ffffff%22%20stroke-width%3D%222%22%20stroke-linejoin%3D%22round%22/%3E%0A%3C/svg%3E%0A">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { color-scheme: light dark; }
@@ -1496,7 +1497,7 @@ class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 # other route in" besides the Cloudflare tunnel connector -- that reasoning was
 # wrong (github-projects-bf caught it live 2026-08-29): binding to a specific
 # interface address restricts by INTERFACE, not by caller identity. Any device
-# on the LAN could already reach 10.0.15.20:7684 directly, tunnel or not, so
+# on the LAN could already reach <queue-host>:7684 directly, tunnel or not, so
 # the single-IP bind provided no actual isolation -- it just also excluded
 # 127.0.0.1/localhost, breaking every local CLI/tooling probe from the SAME
 # machine (confirmed: bf spent real time believing this API was down based on
