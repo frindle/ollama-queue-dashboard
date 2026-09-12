@@ -5,3 +5,4 @@ config/servers.json
 ollama-queue-logs/
 ollama-queue-livelogs/
 .venv/
+bin/__pycache__/

@@ -220,7 +220,7 @@ def clamp_unraid_ctx(host: str, model: str, num_ctx: int) -> int:
             f"down instead of wasting a warmup-then-abort cycle finding this out the hard way.")
         return safe
     return num_ctx
-LAN_MOUNT_ROOT = "/Volumes/data"  # Unraid's SMB share, mounted here when available
+LAN_MOUNT_ROOT = os.environ.get("LAN_MOUNT_ROOT", "/mnt/lan-share")  # Unraid's SMB share, mounted here when available
 COPY_HELPER = str(Path.home() / "bin" / "copy-ollama-model-from-unraid.py")
 
 # Local hot cache: OLLAMA_MODELS normally points here (fast NVMe). The
@@ -245,7 +245,7 @@ COPY_HELPER = str(Path.home() / "bin" / "copy-ollama-model-from-unraid.py")
 # manifest land where Ollama reads, so the model is visible immediately and the
 # helper's per-blob "SKIP (already at destination)" makes the second pass free.
 LOCAL_MODEL_CACHE = Path.home() / ".ollama" / "models"
-SMB_MODEL_SOURCE = Path("/Volumes/data/ollama-models")
+SMB_MODEL_SOURCE = Path(LAN_MOUNT_ROOT) / "ollama-models"
 MODEL_PULL_LOG = Path.home() / "bin" / "ollama-model-pulls.log"
 OBSIDIAN_URL = os.environ.get("OBSIDIAN_URL", "")  # e.g. http://<obsidian-host>:27123; empty disables vault logging
 OBSIDIAN_TOKEN_FILE = Path.home() / ".config" / "ollama-worker" / "obsidian-token"
@@ -2390,7 +2390,7 @@ def _live_find_new_checkpoints(text, seen, margin=20):
 
 class LiveLog:
     """Appends tagged, colored status lines to a file a human can `tail -f`
-    (the qwen.penndalton.com ttyd terminal already does exactly this for
+    (a remote ttyd terminal already does exactly this for
     qwen-dispatch.sh's log). Every line is prefixed with [tag] because
     multiple concurrent dispatches commonly share one --live-log file. The
     log path is whatever the caller passed -- this file stays host-agnostic

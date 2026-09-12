@@ -1,0 +1,2739 @@
+#!/usr/bin/env python3
+"""ollama-dispatch-preflight -- one GO / NO-GO gate for an ollama dispatch.
+
+WHY THIS EXISTS
+---------------
+Steps 1-4 of the ollama-dispatch skill (worktree -> spec-complete TASK.md ->
+both-ways-proven verify.sh -> meta-checks) were run BY HAND before every
+dispatch. That is the bulk of the per-dispatch effort, and a hand-run checklist
+has exactly one failure mode: a step gets skipped, and the resulting failure is
+then misread for rounds as *model incapacity*. Every failure this project has
+attributed to the model turned out to be spec/harness/human.
+
+So the checklist becomes a program. Given a worktree containing TASK.md +
+verify.sh (+ a reference implementation), this runs the whole scaffold and
+prints ONE verdict with the exact failing reason.
+
+DIVISION OF LABOUR -- this tool does NOT judge verify QUALITY
+------------------------------------------------------------
+`~/bin/verify-quality.py` already decides whether a verify is sound (fails at
+baseline; asserts whole spec literals rather than a negation-matching wildcard).
+This tool SHELLS OUT to it rather than carrying a second copy of that logic --
+the same rule verify-quality.py itself follows by importing completeness.py for
+literal extraction. Two records of one fact drift; they always have.
+
+What this tool owns is the MECHANICS: sequencing the proof, running it in the
+right tree state, and refusing to emit GO when a step was skipped.
+
+THE CHECKS, and the specific failure each one is scar tissue from
+-----------------------------------------------------------------
+  worktree          scaffold present and is a real git worktree
+  baseline-clean    tree has no tracked modifications -- a both-ways proof run
+                    against a dirty tree proves nothing, and a reference impl
+                    left applied hands the model the answer
+  task-shape        TASK.md carries the sections a spec-complete task needs
+  task-unchanged    TASK.md is byte-identical to the last NO-GO run. THE BIG
+                    ONE. An edit you believe landed but did not gets read as
+                    model failure for as many rounds as you allow; the entire
+                    5-round automerge arc was one requirement whose edit never
+                    reached the file. Costs nothing and catches it every time.
+  required-literals every --require literal is actually IN TASK.md
+  heredoc-escaping  an unquoted heredoc delimiter feeding an interpreter lets
+                    the shell eat `$` and backticks in the source -- hit 3x in
+                    one session, each time it read as the model writing bad code
+  env-parity        the baseline run did not die on ImportError / missing tool.
+                    A verify that cannot import the target fails for a reason
+                    that has nothing to do with the task, on every iteration.
+  spec-gap          every env var a fixture READS is NAMED in TASK.md. A var the
+                    fixture sets but the task never names makes the model
+                    hardcode a path and every check dies pre-logic.
+  target-parses     the file the model is told to edit parses right now
+  verify-shape      verify.sh uses the counting idiom and can report a FAIL
+                    (not `set -e`, which aborts before printing anything)
+  baseline-fails    BOTH-WAYS, half 1: verify MUST fail on the untouched tree,
+                    else it certifies a run that changed nothing
+  refimpl-passes    BOTH-WAYS, half 2: a reference impl MUST make it print
+                    VERIFY_OK, else the task is unsatisfiable as specified
+  refimpl-satisfies with the refimpl applied, every "Must contain" literal is in
+                    the CHANGED/TARGET files -- scanning the whole tree makes
+                    this inert in any real repo. If verify goes green WITHOUT
+                    them, the verify does
+                    not enforce the spec -- that is a benign/vacuous verify
+                    caught mechanically, before it passes broken work.
+  verify-relevance  MUTATION RELEVANCE. With the refimpl applied, perturb the
+                    lines it added (flip a comparison, negate a branch, drop a
+                    statement, nudge a constant) and ask whether the verify
+                    goes red. A verify that tests a PROXY -- a grep, an AST
+                    shape, a benign case -- lets the mutants pass while the
+                    property is broken. Delegated to verify-relevance.py.
+                    A HARD NO-GO on `low`: a verify that lets property-breaking
+                    mutants of the reference impl survive cannot certify a fix,
+                    so a low score STOPS the dispatch outright (it is not merely
+                    human-gated -- signoff.py also reads it from the preflight
+                    ledger and refuses to auto-approve). UNPROVEN -- never a
+                    pass -- when it could not measure; a --no-relevance waiver
+                    keeps the dispatch human-gated but cannot auto-approve.
+  refimpl-reverted  the tree is back at baseline, so the model does not start
+                    from the answer
+  verify-quality    delegated to verify-quality.py
+  verify-speed      verify is fast enough to run every iteration
+
+Exit codes: 0 = GO, 1 = NO-GO, 2 = usage/environment error.
+
+  ollama-dispatch-preflight <worktree> --refimpl fix.patch
+  ollama-dispatch-preflight <worktree> --refimpl-cmd 'python3 apply_fix.py' --json
+  ollama-dispatch-preflight <worktree> --no-refimpl   # explicit, logged waiver
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+
+# TS/JS syntax check -- the ast.parse analogue for a .ts/.tsx/.js target. Without
+# it a TS syntax error slips past target-parses (which only knew ast.parse).
+TS_PARSE = BIN / "ts-mutator" / "ts-parse.mjs"
+TS_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+# Suffixes a backticked scope-line token must carry to be inferred as a
+# CREATION target that does not exist at baseline (papercut #5). Kept to real
+# source extensions so prose like `is_safe()` or `THRESHOLD * 2` is never taken
+# for a filename.
+SRC_SUFFIXES = (".py", ".pyi", ".mts", ".cts", ".swift", ".go", ".rs",
+                ".rb", ".java", ".kt", ".c", ".h", ".cpp", ".hpp",
+                ".sh", ".sql") + TS_SUFFIXES
+# The gate's OWN vendored tsx (bin/ts-mutator, `npm install -D tsx`). The gate
+# already trusts and installs bin/ts-mutator for the TS AST mutator; tsx rides
+# the same install so a fresh checkout re-obtains it with `npm ci`.
+TSX_VENDOR = BIN / "ts-mutator" / "node_modules" / ".bin" / "tsx"
+
+
+def resolve_tsx(wt):
+    """Resolve a runnable `tsx` command WITHOUT a silent network fetch.
+
+    Returns (cmd_prefix_list, source) when tsx is resolvable, else (None, why).
+    The old toolchain floor only checked the worktree's node_modules/.bin/tsx
+    and, missing that, told the user verify would fall back to `npx --yes tsx`
+    -- a network call that HANGS/FAILS on the offline queue host. Resolution
+    order, all local:
+      1. worktree node_modules/.bin/tsx  (the repo's own dev dep)
+      2. the gate's vendored bin/ts-mutator/node_modules/.bin/tsx
+      3. a `tsx` already on PATH
+      4. `npx --offline tsx` ONLY when a cached tsx makes an offline run
+         plausible (`--offline` forbids any fetch, so it fails fast instead of
+         hanging); never a bare networked `npx --yes tsx`.
+    When none resolve, return None + an honest cause so the caller NO-GOs with a
+    named reason rather than promising a network fallback that cannot succeed.
+    """
+    if wt is not None:
+        local = Path(wt) / "node_modules" / ".bin" / "tsx"
+        if local.exists():
+            return [str(local)], "worktree node_modules/.bin/tsx"
+    if TSX_VENDOR.exists():
+        return [str(TSX_VENDOR)], "gate vendored bin/ts-mutator/node_modules/.bin/tsx"
+    onpath = shutil.which("tsx")
+    if onpath:
+        return [onpath], "tsx on PATH"
+    if shutil.which("npx"):
+        import glob as _glob
+        cache = Path.home() / ".npm" / "_npx"
+        if _glob.glob(str(cache / "*" / "node_modules" / ".bin" / "tsx")):
+            return ["npx", "--offline", "tsx"], "npx --offline tsx (cached)"
+    return None, ("tsx not resolvable locally and no network -- install tsx "
+                  "(npm install -D tsx in the repo, or `cd ~/bin/ts-mutator && "
+                  "npm install` for the gate's vendored copy)")
+STATE_FILE = ".preflight-state.json"
+# Overridable so the self-check can point at a fixture queue rather than
+# the live one -- a test that mutates the real queue state is not a test.
+QUEUE_STATE = Path(os.environ.get(
+    "OLLAMA_QUEUE_STATE", Path.home() / "bin" / "ollama-queue-state.json"))
+# A job in any of these states may touch its worktree at any moment.
+ACTIVE_JOB_STATUSES = {"running", "pending", "paused"}
+# ...and every state that certainly cannot. This second list is what makes the
+# first one safe: it is a POLICY enumeration, not a proxy for something
+# computable, so the failure mode to avoid is silent exclusion. A status the
+# queue gains later belongs to neither set, and an unknown status must be
+# reported rather than quietly treated as inactive -- "unrecognised status X"
+# is recoverable, a collision the gate did not look for is not.
+INACTIVE_JOB_STATUSES = {"done", "failed", "cancelled"}
+
+# Blockers a TASK.md edit can plausibly clear. `task-unchanged` fires only when
+# the previous NO-GO named one of these: a NO-GO for a dirty tree or a broken
+# verify is CORRECTLY followed by an unchanged task, and firing there put a
+# false "your edit did not land" at the top of the verdict -- above the real
+# reason -- which trains you to ignore the one check that must never be ignored.
+# NOT "task-unchanged" itself. Including it made the check SELF-SUSTAINING:
+# once it fired, its own id was the prior blocker, so it fired again, and the
+# only escape was editing TASK.md even when TASK.md was never the problem.
+# A genuinely unfixed task blocker persists on its own -- required-literals
+# stays red until the literal is there -- so nothing is lost by dropping it.
+TASK_FIXABLE_BLOCKERS = {
+    "task-shape", "required-literals", "spec-gap",
+    "refimpl-passes", "refimpl-satisfies",
+}
+# Marker printed by a scaffold from `ollama-dispatch-scaffold` whose
+# adversarial cases have not been authored yet. One-way, documented
+# coupling: it lets the NO-GO name the real cause instead of the
+# downstream verify-quality symptom.
+SCAFFOLD_MARK = "SCAFFOLD_INCOMPLETE"
+# Written into a fixture by `ollama-dispatch-draft` and removed only by its
+# --confirm. A DRAFTED case is not an AUTHORED one: the gate can prove a
+# verify discriminates, but not that it tests the RIGHT property, so the
+# human read stays mandatory and is enforced here rather than trusted.
+DRAFT_MARK = "DRAFT_UNCONFIRMED = True"
+# The JS/TS analogue, written by `ollama-dispatch-draft` into a .mjs/.mts/.js
+# fixture as `const DRAFT_UNCONFIRMED = true` (bare, or `;`-suffixed in the .mts
+# symbol harness) and stripped only by its --confirm. Matched with a
+# whitespace-tolerant regex so both emitted forms count -- without this the
+# draft-confirmed gate was Python-only and an unconfirmed JS/TS draft reached GO
+# without the human relevance review.
+DRAFT_MARK_JS_RE = re.compile(r"const\s+DRAFT_UNCONFIRMED\s*=\s*true")
+SLOW_VERIFY_S = 300          # skill: a verify runs every iteration; keep it fast
+VERIFY_TIMEOUT_S = 900
+
+# Ambient vars every process has. Not obligations on the spec.
+AMBIENT = {
+    "PATH", "HOME", "PWD", "OLDPWD", "SHELL", "USER", "LOGNAME", "TMPDIR",
+    "LANG", "LC_ALL", "TERM", "PYTHONPATH", "PYTHONHASHSEED", "VIRTUAL_ENV",
+    "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "CI", "TZ",
+}
+
+# The PREFLIGHT LEDGER: a copy of the gate's evidence written OUTSIDE the
+# worktree. .preflight-state.json lives inside the tree the model edits, so
+# anything downstream that trusts it for an autonomous decision is trusting a
+# file the job could have rewritten. signoff.py reads relevance evidence from
+# here only, keyed by the worktree path, and never from the in-tree copy.
+PREFLIGHT_LEDGER = Path(os.environ.get(
+    "OLLAMA_PREFLIGHT_LEDGER",
+    Path.home() / "bin" / "ollama-queue-logs" / "preflight-ledger"))
+
+PASS, FAIL, WARN, SKIP, UNPROVEN = "PASS", "FAIL", "WARN", "SKIP", "UNPR"
+# UNPROVEN is NOT a pass and NOT an N/A. It means "this property was never
+# established" -- the tool was missing, the evidence was absent, the step was
+# waived. It exists because of a failure the Research session hit the same day
+# this was written: a safety condition that read a key which did not exist
+# evaluated to None, None is falsy, and a gameable verify rendered as a
+# condition SATISFIED. An inert check is worse than no check, because it looks
+# like a check that passed. So missing evidence gets its own loud outcome and
+# is named individually on the GO line.
+
+
+def _norm_rel(rel):
+    """Normalise a relative token WITHOUT eating a hidden file's leading dot.
+
+    `str.lstrip("./")` strips every leading char in the set {'.', '/'}, so
+    `./.hidden.py` collapsed to `hidden.py` and the wrong file was hashed /
+    parsed. Strip a leading `./` prefix (repeatedly) and any leading slash --
+    but leave `.hidden.py` intact.
+    """
+    rel = (rel or "").strip()
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return rel.lstrip("/")
+
+
+class Result:
+    def __init__(self, cid, status, msg, detail="", fix=""):
+        self.id, self.status, self.msg, self.detail, self.fix = (
+            cid, status, msg, detail, fix)
+
+    def as_dict(self):
+        return {"check": self.id, "status": self.status, "message": self.msg,
+                "detail": self.detail, "fix": self.fix}
+
+
+class Preflight:
+    def __init__(self, args):
+        self.a = args
+        self.wt = Path(args.worktree).expanduser().resolve()
+        self.results: list[Result] = []
+        self.task_text = ""
+        self.verify_text = ""
+        self.baseline_out = ""
+        self.baseline_rc = None
+        self.verify_secs = None
+        self.follower = ""
+        self.untracked_before: set[str] = set()
+        self._state: dict = {}
+
+    # ---- plumbing ------------------------------------------------------
+    def add(self, cid, status, msg, detail="", fix=""):
+        self.results.append(Result(cid, status, msg, detail, fix))
+        return status
+
+    def skipped(self, cid, why):
+        """Genuinely not applicable -- there was nothing here to check."""
+        return self.add(cid, SKIP, why)
+
+    def unproven(self, cid, why, fix=""):
+        """Applicable, but never established. Named loudly on the verdict line."""
+        return self.add(cid, UNPROVEN, why, fix=fix)
+
+    def load_state(self, path, require_scope=False):
+        """Parse a preflight state / ledger JSON file into a dict.
+
+        Shared by check_task_unchanged and run_review so the acceptance rule is
+        applied in ONE place. Returns {} when the file is absent, unreadable,
+        or not a JSON object; and, when require_scope is set, also {} unless it
+        carries a `declared_scope`. That last rule is what stops a non-empty but
+        contract-less in-tree .preflight-state.json from SHADOWING a real
+        contract in --review -- the integrator (resolve_contract) already
+        requires declared_scope before it will trust a state file, and this
+        matches it.
+        """
+        try:
+            d = json.loads(Path(path).read_text())
+        except Exception:
+            return {}
+        if not isinstance(d, dict):
+            return {}
+        if require_scope and d.get("declared_scope") is None:
+            return {}
+        return d
+
+    def _rel_to_wt(self, f):
+        """Best-effort worktree-relative path. `relative_to` raises on an
+        absolute --target outside the worktree; relpath does not, so one bad
+        --target no longer takes declared_scope / scaffold_sha256 down with it
+        (LOW8)."""
+        try:
+            return str(Path(f).relative_to(self.wt))
+        except ValueError:
+            return os.path.relpath(str(f), str(self.wt))
+
+    def _prior_contract(self):
+        """The last recorded scope contract (baseline_commit / declared_scope /
+        scaffold_sha256), from the ledger (authoritative, outside the tree) or
+        the in-tree state, whichever carries one.
+
+        Consulted by report() to CARRY THE CONTRACT FORWARD on a run that did
+        not reach a clean baseline, so a NO-GO on a tampered tree never rewrites
+        the good contract with hashes of the already-modified files (HIGH1).
+        """
+        for src in (self.ledger_path_for(self.wt), self.wt / STATE_FILE):
+            d = self.load_state(src)
+            if d.get("declared_scope") is not None or d.get("scaffold_sha256"):
+                return d
+        return {}
+
+    def git(self, *a, check=False):
+        p = subprocess.run(["git", "-C", str(self.wt), *a],
+                           capture_output=True, text=True)
+        if check and p.returncode != 0:
+            raise RuntimeError(f"git {' '.join(a)}: {p.stderr.strip()}")
+        return p.returncode, p.stdout, p.stderr
+
+    def sh(self, cmd, timeout=VERIFY_TIMEOUT_S, env=None):
+        """Run a shell command in the worktree. Returns (rc, combined output).
+
+        Deliberately NOT inheriting this process's env wholesale beyond os.environ:
+        the verify is supposed to set what it needs, and a var leaking in from the
+        coordinator's shell is precisely how a spec gap hides.
+        """
+        e = dict(os.environ)
+        if env:
+            e.update(env)
+        try:
+            p = subprocess.run(cmd, shell=True, cwd=str(self.wt), env=e,
+                               capture_output=True, text=True, timeout=timeout)
+            return p.returncode, (p.stdout or "") + (p.stderr or "")
+        except subprocess.TimeoutExpired:
+            return 124, f"TIMEOUT after {timeout}s"
+
+    # ---- transitive verify text (delegated, not reimplemented) ---------
+    def _load_verify_quality(self):
+        f = BIN / "verify-quality.py"
+        if not f.exists():
+            return None
+        try:
+            sp = importlib.util.spec_from_file_location("verify_quality", str(f))
+            m = importlib.util.module_from_spec(sp)
+            sp.loader.exec_module(m)
+            return m
+        except Exception:
+            return None
+
+    def collect_verify_text(self):
+        """The verify command PLUS every script it transitively runs.
+
+        Reuses verify-quality.py's follower. Scanning only the `bash verify.sh`
+        string is the wrong-artifact bug that made every text check in
+        verify-quality.py fire spuriously until it was fixed there; inheriting
+        the fix is the whole point of delegating.
+        """
+        vq = self._load_verify_quality()
+        if vq and hasattr(vq, "verify_text"):
+            try:
+                self.follower = "verify-quality.py (transitive)"
+                return vq.verify_text(self.a.verify, self.wt)
+            except Exception:
+                pass
+        self.follower = ("built-in fallback (one hop) -- verify-quality.py's "
+                         "follower was unavailable, so the text checks below "
+                         "see less than they should")
+        # Fallback: verify.sh plus one hop of obvious python it runs.
+        text = self.a.verify
+        vf = self.wt / "verify.sh"
+        if vf.exists():
+            text += "\n" + vf.read_text(errors="replace")
+        for m in re.finditer(r"[\w./-]+\.py", text):
+            f = self.wt / m.group(0)
+            if f.is_file() and f.stat().st_size < 400_000:
+                text += "\n" + f.read_text(errors="replace")
+        return text
+
+    def followed_py_files(self):
+        """The .py files the verify actually runs -- the fixtures."""
+        out, seen = [], set()
+        text = self.a.verify
+        vf = self.wt / "verify.sh"
+        if vf.exists():
+            text += "\n" + vf.read_text(errors="replace")
+        for m in re.finditer(r"([\w./-]+\.py)\b", text):
+            rel = m.group(1)
+            if rel in seen:
+                continue
+            seen.add(rel)
+            f = self.wt / _norm_rel(rel)
+            if f.is_file() and f.stat().st_size < 400_000:
+                out.append(f)
+        return out
+
+    # ---- static checks -------------------------------------------------
+    def check_worktree(self):
+        if not self.wt.is_dir():
+            return self.add("worktree", FAIL, f"{self.wt} is not a directory")
+        missing = [n for n in ("TASK.md", "verify.sh") if not (self.wt / n).exists()]
+        # honour a non-default --task-file
+        tf = self.wt / self.a.task_file
+        if self.a.task_file != "TASK.md":
+            missing = [m for m in missing if m != "TASK.md"]
+            if not tf.exists():
+                missing.append(self.a.task_file)
+        if missing:
+            return self.add("worktree", FAIL,
+                            f"missing scaffold: {', '.join(missing)}",
+                            fix="see ollama-dispatch skill steps 2-3")
+        rc, out, _ = self.git("rev-parse", "--git-dir")
+        if rc != 0:
+            return self.add("worktree", FAIL, f"{self.wt} is not a git repo",
+                            fix="git worktree add <scratch>/<label> -b fix/<label>")
+        is_wt = "worktrees" in out
+        self.is_wt = is_wt  # a linked `git worktree` (dispatch flow), not a clone
+        rc, br, _ = self.git("rev-parse", "--abbrev-ref", "HEAD")
+        self.task_text = tf.read_text(errors="replace")
+        self.verify_text = self.collect_verify_text()
+        if self.follower.startswith("built-in"):
+            # Say so out loud. A text check running against a smaller haystack
+            # than it thinks it has produces confident nonsense -- the exact
+            # wrong-artifact bug verify-quality.py had to fix in itself.
+            self.add("verify-follower", WARN,
+                     "using the built-in one-hop script follower",
+                     detail=self.follower)
+        return self.add("worktree", PASS,
+                        f"scaffold present on branch {br.strip() or '?'}"
+                        + ("" if is_wt else " (a clone, not a `git worktree` -- "
+                                            "fine, but isolation is on you)"))
+
+    def check_cwd_exclusive(self):
+        """No other job may already own this worktree.
+
+        Two separate hazards, and the second is the one that bites silently.
+
+        (a) The obvious one: a second job starting in a tree that already
+            carries a first job's edits verifies against a baseline that is not
+            a baseline. Its verify can pass vacuously, and on two hosts they
+            race on the same files mid-write.
+
+        (b) THIS GATE IS DESTRUCTIVE. It runs the verify, APPLIES A REFERENCE
+            IMPL, and then `git checkout -- .` to revert. `baseline-clean`
+            protects a job that has already edited something -- a dirty tree
+            short-circuits before any of that. But a job in its first iteration
+            has not written yet, so the tree is clean, the gate proceeds, and
+            for the length of the refimpl run that job is looking at A TREE
+            CONTAINING THE ANSWER. It can read the reference impl, "solve" the
+            task, and produce a green verify that proves nothing about the
+            model. That is worse than corruption, because it looks like success.
+
+        So this runs BEFORE baseline-clean and hard-stops. An unreachable queue
+        state file is UNPROVEN, not PASS -- the collision is unmeasured, not
+        absent.
+        """
+        try:
+            raw = QUEUE_STATE.read_text()
+        except Exception as e:
+            return self.unproven(
+                "cwd-exclusive",
+                f"queue state unreadable ({type(e).__name__}) -- cannot tell "
+                "whether another job already owns this tree",
+                fix=f"check {QUEUE_STATE}; a second job in one worktree "
+                    "verifies against a tree that is not at baseline")
+        try:
+            jobs = json.loads(raw).get("jobs") or []
+            if isinstance(jobs, dict):
+                jobs = list(jobs.values())
+        except Exception:
+            return self.unproven("cwd-exclusive",
+                                 "queue state is not readable JSON")
+        mine = self.wt.resolve()
+        clash = []
+        unknown = set()
+        for j in jobs:
+            if not isinstance(j, dict):
+                # A malformed queue entry (a bare string, null) must not crash
+                # the gate -- `j.get` on a non-dict raises. Skip it; a job we
+                # cannot read cannot be shown to own this tree.
+                continue
+            st = j.get("status")
+            if st in INACTIVE_JOB_STATUSES:
+                continue
+            if st not in ACTIVE_JOB_STATUSES:
+                # Neither known-active nor known-inactive: treat as active AND
+                # say so, rather than silently skipping a job that may hold
+                # this tree.
+                unknown.add(str(st))
+            raw_cwd = j.get("cwd")
+            if not raw_cwd:
+                continue
+            try:
+                other = Path(raw_cwd).resolve()
+            except Exception:
+                continue
+            # Equal, or one nested inside the other -- a worktree inside another
+            # job's worktree collides just as hard as sharing the path.
+            if other == mine or other in mine.parents or mine in other.parents:
+                clash.append(f"{str(j.get('id') or '?')[:12]} [{j.get('status')}] "
+                             f"{j.get('label') or ''} -> {other}")
+        if clash:
+            return self.add(
+                "cwd-exclusive", FAIL,
+                f"{len(clash)} active job(s) already own this worktree",
+                detail="; ".join(clash),
+                fix="give this dispatch its OWN worktree ("
+                    "`git worktree add <new> HEAD`). Do not run this gate "
+                    "against a tree an active job holds -- it applies a "
+                    "reference impl, which that job could read as the answer.")
+        if unknown:
+            return self.add(
+                "cwd-exclusive", WARN,
+                f"no active job owns this worktree, but {len(unknown)} job(s) "
+                "carry a status this gate does not recognise",
+                detail=", ".join(sorted(unknown)),
+                fix="add the status to ACTIVE_JOB_STATUSES or "
+                    "INACTIVE_JOB_STATUSES in ollama-dispatch-preflight -- an "
+                    "unclassified status was counted as active for this run")
+        return self.add("cwd-exclusive", PASS,
+                        "no active job owns this worktree")
+
+    def check_baseline_clean(self):
+        rc, out, _ = self.git("status", "--porcelain")
+        dirty = []
+        self.untracked_before = set()
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            code, path = line[:2], line[3:].strip()
+            if code == "??":
+                self.untracked_before.add(path)
+            else:
+                dirty.append(f"{code.strip()} {path}")
+        if dirty:
+            return self.add(
+                "baseline-clean", FAIL,
+                f"{len(dirty)} tracked file(s) already modified: "
+                + ", ".join(dirty[:5]),
+                detail="The both-ways proof is meaningless on a dirty tree, and a "
+                       "reference impl left applied hands the model the answer.",
+                fix="git -C %s checkout -- ." % self.wt)
+        return self.add("baseline-clean", PASS,
+                        f"no tracked modifications ({len(self.untracked_before)} "
+                        f"untracked scaffold file(s))")
+
+    # Harness files `--seal-baseline` commits into the launch baseline. Kept in
+    # sync with seal_baseline() in ollama-dispatch-scaffold. refimpl.py / fix.patch
+    # are the reference impl -- NOT the harness -- and must stay out.
+    HARNESS_FILES = ("TASK.md", "verify.sh", "verify_impl.mts", "verify_impl.mjs",
+                     "verify_impl.js", "test_fixture.py", "check_literals.py",
+                     "refimpl.py", "Package.swift")
+
+    def check_harness_sealed(self):
+        """Fold `--seal-baseline` into the GO decision (gap #2).
+
+        The authored harness (TASK.md, verify.sh, the fixture, check_literals.py)
+        must be TRACKED and UNMODIFIED at launch, or the queue records a DIRTY
+        launch baseline and the scope gate flags the harness riding into the
+        model's diff -- the exact frictions `--seal-baseline` exists to remove.
+        Sealing was a separate step a human had to remember to run last; this
+        check makes forgetting it a loud NO-GO (with the exact seal command), or
+        seals it here when `--auto-seal` is passed.
+
+        Scoped to a real linked `git worktree` -- the dispatch flow. A plain
+        clone or `git init` tree ("isolation is on you", and the shape the gate's
+        own self-test builds) is NOT subject to it: there is no queue launch
+        baseline to keep clean, and forcing a commit there would be surprising.
+        """
+        if not getattr(self, "is_wt", False):
+            return  # not the dispatch worktree flow; nothing to seal
+        # A harness file is un-sealed if it is untracked (??) or tracked but
+        # modified vs HEAD. Either way it would dirty the launch baseline.
+        present = [h for h in self.HARNESS_FILES if (self.wt / h).is_file()]
+        untracked = [h for h in present if h in self.untracked_before]
+        rc, out, _ = self.git("status", "--porcelain", "--", *present) if present else (0, "", "")
+        modified = []
+        for line in out.splitlines():
+            code, path = line[:2], line[3:].strip()
+            if code != "??" and path in present:
+                modified.append(path)
+        unsealed = sorted(set(untracked) | set(modified))
+        if not unsealed:
+            return self.add("harness-sealed", PASS,
+                            "authored harness is tracked and unmodified")
+        seal_cmd = f"ollama-dispatch-scaffold --seal-baseline {self.wt}"
+        if getattr(self.a, "auto_seal", False):
+            rc, out, err = self.git("add", "--", *unsealed)
+            if rc == 0:
+                rc, out, err = self.git(
+                    "commit", "-qm", "seal dispatch harness (clean launch baseline)")
+            if rc == 0:
+                # refresh the untracked set so downstream checks see the tree as
+                # it now stands.
+                self.untracked_before -= set(unsealed)
+                return self.add("harness-sealed", PASS,
+                                "auto-sealed the harness into the baseline: "
+                                + ", ".join(unsealed),
+                                detail="launch tree is now clean; the harness is "
+                                       "tracked and will not ride into the diff")
+            return self.add("harness-sealed", FAIL,
+                            "--auto-seal could not commit the harness",
+                            detail=(err or out).strip()[-300:], fix=seal_cmd)
+        return self.add(
+            "harness-sealed", FAIL,
+            f"{len(unsealed)} harness file(s) not sealed into the baseline: "
+            + ", ".join(unsealed),
+            detail="An un-sealed harness makes the queue record a DIRTY launch "
+                   "baseline (the diff is not attributable to the job) and the "
+                   "scope gate flag the fixture riding into `git diff HEAD`. "
+                   "Seal it (or re-run this gate with --auto-seal).",
+            fix=seal_cmd)
+
+    def check_toolchain(self):
+        """Assert the toolchain a TS/JS dispatch actually needs (gap #3).
+
+        Two soft floors bit real dispatches: `tsx` missing from a repo's
+        node_modules/.bin (only tsc present) fell back to a network `npx` that
+        fails on the offline queue host; and bin/ts-mutator having no installed
+        `typescript` silently degraded the ts-parse floor AND left
+        verify-relevance unable to make TS AST-span mutants (so a one-hunk TS fix
+        -- the norm -- comes back UNPROVEN, which reads as a mystery). This turns
+        the floors a given mode REQUIRES into a NO-GO with the fix command, while
+        still WARNing on a tool that is genuinely optional for that mode.
+
+        Python / Swift targets need none of this -- no result is added for them.
+        """
+        targets = [t for t in self.target_files() if t.suffix in TS_SUFFIXES]
+        if not targets:
+            return  # not a TS/JS dispatch; nothing to assert
+        verify_src = (self.wt / "verify.sh").read_text(errors="replace") \
+            if (self.wt / "verify.sh").is_file() else ""
+        nm_bin = self.wt / "node_modules" / ".bin"
+        problems, notes = [], []
+
+        # node: required for every TS/JS mode (fixture runner AND the mutator).
+        if not shutil.which("node"):
+            problems.append("node is not on PATH (needed to run the TS fixture "
+                            "and the relevance mutator)")
+
+        # tsc: the authoritative type gate -- required whenever the verify runs it.
+        if "tsc" in verify_src:
+            if not (nm_bin / "tsc").exists() and not shutil.which("npx"):
+                problems.append("tsc is not resolvable: no node_modules/.bin/tsc "
+                                "and no npx to fall back to")
+
+        # tsx: only the SYMBOL harness imports a typed module under tsx. The
+        # expression harness runs plain node, so tsx is genuinely optional there.
+        # Match tsx as an INVOCATION (assignment / $TSX / a bin path / npx tsx),
+        # never a bare mention in a comment ("no tsx needed" must not trip this).
+        verify_uses_tsx = bool(re.search(
+            r"TSX=|\$TSX|\.bin/tsx|npx\s+(?:--yes\s+)?tsx", verify_src))
+        if verify_uses_tsx:
+            tsx_cmd, tsx_src = resolve_tsx(self.wt)
+            if tsx_cmd is None:
+                # HONEST NO-GO: do not promise a network `npx --yes tsx` that
+                # hangs/fails on the offline queue host. tsx is genuinely
+                # unresolvable here; name the cause and the fix.
+                problems.append(
+                    "tsx is required by verify.sh but " + tsx_src
+                    + " (fix: npm install -D tsx in the repo, or `cd "
+                    + str(BIN / "ts-mutator") + " && npm install` for the "
+                    "gate's vendored copy)")
+            elif tsx_src.startswith("npx"):
+                # Resolvable only via an offline-capable npx cache -- usable,
+                # but flag it: not the repo's own dep.
+                notes.append("tsx resolved via " + tsx_src + " (offline cache "
+                             "hit, no network); prefer `npm install -D tsx` in "
+                             "the repo.")
+            # else: resolved to a concrete local binary -> no caveat.
+
+        # ts-mutator typescript: REQUIRED, because verify-relevance (a hard gate)
+        # needs it to make AST-span mutants for a TS target, and a one-hunk TS fix
+        # yields no hunk-revert evidence -- so without it relevance is UNPROVEN
+        # and the dispatch cannot pass. The ts-parse floor in verify.sh shares the
+        # install and degrades to WARN on its own; this NO-GO is about relevance.
+        tsm_ts = BIN / "ts-mutator" / "node_modules" / "typescript"
+        if not tsm_ts.exists():
+            problems.append(
+                "bin/ts-mutator has no installed `typescript`, so verify-relevance "
+                "cannot generate TS mutants and a single-hunk TS fix comes back "
+                "UNPROVEN (fix: (cd " + str(BIN / "ts-mutator") + " && npm install))")
+
+        if problems:
+            return self.add(
+                "toolchain", FAIL,
+                f"{len(problems)} required TS/JS tool(s) missing",
+                detail="; ".join(problems + notes),
+                fix=problems[0].split("(fix: ")[-1].rstrip(")")
+                    if "(fix: " in problems[0] else "install the missing tool")
+        if notes:
+            return self.add("toolchain", WARN,
+                            "TS/JS toolchain usable with a caveat",
+                            detail="; ".join(notes))
+        return self.add("toolchain", PASS,
+                        "TS/JS toolchain present (node, tsc, ts-mutator typescript)")
+
+    def check_task_shape(self):
+        """Mechanical presence of the sections a spec-complete task needs.
+
+        Presence is decidable; adequacy is not. Reported as WARN rather than a
+        blocker for everything except an empty spec -- a gate that cries wolf
+        gets ignored, and then every check it makes stops counting.
+        """
+        t = self.task_text
+        if len(t.strip()) < 200:
+            return self.add("task-shape", FAIL,
+                            f"{self.a.task_file} is {len(t.strip())} chars -- "
+                            "not a spec")
+        missing = []
+        if not re.search(r"confirmed|reproduc|observed", t, re.I):
+            missing.append("a CONFIRMED defect (symptom + how you verified it, "
+                           "not a suspected mechanism)")
+        if not re.search(r"[\w/.-]+\.\w+:\d+|line\s+~?\d+", t):
+            missing.append("an entry point as file:line")
+        if not re.search(r"must contain", t, re.I):
+            missing.append('a "Must contain" list of literal tokens')
+        if not re.search(r"verify\.sh", t):
+            missing.append("the loop instruction (run `bash verify.sh` after "
+                           "every edit until VERIFY_OK)")
+        if not re.search(r"only edit|do not edit|don't edit", t, re.I):
+            missing.append('a scope line ("Only edit `<file>`; do not edit '
+                           'verify.sh")')
+        if missing:
+            return self.add("task-shape", WARN,
+                            f"{len(missing)} spec element(s) not found",
+                            detail="; ".join(missing),
+                            fix="ollama-dispatch skill step 2")
+        return self.add("task-shape", PASS, "carries all 5 spec-complete elements")
+
+    def check_task_unchanged(self):
+        """Did your last edit to TASK.md actually land?
+
+        This outranks every other check. An edit you believe landed but did not
+        is indistinguishable, from the outside, from a model that cannot do the
+        task -- and it stays indistinguishable for as many rounds as you allow.
+        """
+        sf = self.wt / STATE_FILE
+        digest = hashlib.sha256(self.task_text.encode()).hexdigest()
+        # No require_scope here: task-unchanged must still read task_sha256 from
+        # a prior NO-GO that never recorded a contract (a dirty-baseline run).
+        prev = self.load_state(sf)
+        self._state.update({"task_sha256": digest, "task_file": self.a.task_file,
+                            "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        prev_blockers = set(prev.get("blockers") or []) if prev else set()
+        task_fixable = prev_blockers & TASK_FIXABLE_BLOCKERS
+        # ...but if any OTHER scaffold file changed since the last run, an
+        # unchanged TASK.md is exactly right. The verify, the fixture and the
+        # frozen literal list are all legitimate places to fix a NO-GO that
+        # TASK_FIXABLE_BLOCKERS attributes to the task -- e.g. verify-quality,
+        # cleared by re-freezing check_literals.py. Firing there reproduces the
+        # false "your edit did not land" this check was already narrowed once
+        # to avoid.
+        scaffold_moved = False
+        try:
+            prev_sc = prev.get("scaffold_sha256") if prev else None
+            if prev_sc:
+                now_sc = self.scaffold_digests()
+                tf = self.a.task_file
+                scaffold_moved = ({k: v for k, v in now_sc.items() if k != tf}
+                                  != {k: v for k, v in prev_sc.items()
+                                      if k != tf})
+        except Exception:
+            scaffold_moved = False
+        if (prev and prev.get("task_sha256") == digest
+                and prev.get("verdict") == "NO-GO" and task_fixable
+                and not scaffold_moved):
+            return self.add(
+                "task-unchanged", FAIL,
+                f"{self.a.task_file} is BYTE-IDENTICAL to the last run, which "
+                "was a NO-GO",
+                detail="You edited the task and re-ran; the file did not change. "
+                       "The edit did NOT land. Do not enqueue -- the next round "
+                       "would fail for the same reason and read as model "
+                       "incapacity.",
+                fix=f"re-apply the edit, then: grep -c '<your literal>' "
+                    f"{self.wt / self.a.task_file}")
+        if prev and prev.get("task_sha256") == digest:
+            if prev.get("verdict") == "NO-GO":
+                why = ("the scaffold changed instead" if scaffold_moved else
+                       "the last NO-GO was not the task's fault "
+                       f"({', '.join(sorted(prev_blockers)) or 'no blockers'})")
+                return self.add("task-unchanged", PASS,
+                                f"unchanged, and {why}")
+            return self.add("task-unchanged", PASS,
+                            "unchanged since the last run (which was a GO)")
+        return self.add("task-unchanged", PASS,
+                        "changed since the last run"
+                        if prev else "first run on this task")
+
+    def check_required_literals(self):
+        reqs = list(self.a.require or [])
+        if self.a.require_file:
+            p = Path(self.a.require_file).expanduser()
+            if not p.exists():
+                return self.add("required-literals", FAIL,
+                                f"--require-file {p} does not exist")
+            reqs += [l.rstrip("\n") for l in p.read_text().splitlines()
+                     if l.strip() and not l.lstrip().startswith("#")]
+        if not reqs:
+            return self.unproven(
+                "required-literals",
+                "no --require given -- the edit-landed guard is OFF",
+                fix="pass the literal your last edit added: "
+                    "--require 'def should_hard_delete_on_upgrade(' . An edit "
+                    "you believe landed but did not is read as model failure "
+                    "for as many rounds as you allow.")
+        absent = [r for r in reqs if r not in self.task_text]
+        if absent:
+            return self.add("required-literals", FAIL,
+                            f"{len(absent)} required literal(s) NOT in "
+                            f"{self.a.task_file}",
+                            detail="; ".join(repr(r) for r in absent[:5]),
+                            fix="EDIT DID NOT LAND -- re-apply it")
+        return self.add("required-literals", PASS,
+                        f"all {len(reqs)} required literal(s) present")
+
+    def check_heredoc_escaping(self):
+        """An UNQUOTED heredoc delimiter lets the shell expand the body.
+
+        `python3 - <<PY` runs the body through shell expansion first, so a `$` or
+        a backtick in the python source is eaten before python ever sees it --
+        and the resulting SyntaxError reads as the model writing broken code.
+        `<<'PY'` disables expansion; chr() codes avoid the problem entirely for
+        content that must contain shell-special characters.
+        """
+        vf = self.wt / "verify.sh"
+        files = [vf] if vf.exists() else []
+        files += [p for p in self.wt.glob("*.sh") if p != vf]
+        if not files:
+            return self.unproven("heredoc-escaping",
+                                 "no shell script found to scan")
+        problems, checked = [], 0
+        for f in files:
+            try:
+                lines = f.read_text(errors="replace").splitlines()
+            except Exception:
+                continue
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                m = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", line)
+                if not m:
+                    i += 1
+                    continue
+                quoted, delim = bool(m.group(1)), m.group(2)
+                interp = re.search(r"\b(python3?|node|deno|ruby|perl)\b", line)
+                body, j = [], i + 1
+                while j < len(lines) and lines[j].strip() != delim:
+                    body.append(lines[j])
+                    j += 1
+                checked += 1
+                if not quoted and interp:
+                    btext = "\n".join(body)
+                    hits = []
+                    if re.search(r"(?<!\\)\$", btext):
+                        hits.append("$")
+                    if "`" in btext:
+                        hits.append("`")
+                    if hits:
+                        problems.append(
+                            f"{f.name}:{i+1} `<<{delim}` is UNQUOTED and feeds "
+                            f"{interp.group(1)}; the shell will expand "
+                            f"{' and '.join(hits)} in the body")
+                i = max(j, i + 1)
+        # The eval'd-single-quoted-check idiom: `chk 'python3 - <<PY ...'`
+        if vf.exists():
+            vtext = vf.read_text(errors="replace")
+            if re.search(r"\beval\s+[\"']?\$", vtext):
+                for m in re.finditer(r"'([^']*<<[^']*)'", vtext, re.S):
+                    frag = m.group(1)
+                    bad = [c for c in ('\\"', "$") if c in frag]
+                    if bad:
+                        problems.append(
+                            f"verify.sh: a single-quoted check body containing a "
+                            f"heredoc is eval'd and contains "
+                            f"{' and '.join(repr(b) for b in bad)} -- these break "
+                            f"under eval (SyntaxError / shell expansion)")
+        if problems:
+            return self.add(
+                "heredoc-escaping", FAIL,
+                f"{len(problems)} heredoc/escaping hazard(s)",
+                detail=" | ".join(problems[:4]),
+                fix="quote the delimiter (<<'PY'), or build shell-special "
+                    "content from chr() codes: chr(34)=\" chr(39)=' chr(36)=$ "
+                    "chr(92)=backslash chr(10)=newline")
+        return self.add("heredoc-escaping", PASS,
+                        f"{checked} heredoc(s) safe in {len(files)} script(s)"
+                        if checked
+                        else f"no heredocs in {len(files)} script(s)")
+
+    def task_names(self, var):
+        """Does TASK.md name this env var AS ITS OWN TOKEN?
+
+        A bare `var in self.task_text` passes on any SUPERSTRING: a task that
+        mentions OLLAMA_QUEUE_LOG_DIR was read as naming LOG_DIR, so the model
+        was never told about LOG_DIR and every iteration would die on a KeyError
+        before reaching the logic. That is precisely the OLLAMA_QUEUE_LOGS-class
+        miss this check exists to catch, and the check was passing it.
+
+        Same shape as the whole-tree scan in refimpl-satisfies: a substring test
+        looks discriminating on a fixture that happens to contain no confusable
+        superstring, and fixtures never do by accident.
+        """
+        return re.search(r"(?<![A-Za-z0-9_])" + re.escape(var)
+                         + r"(?![A-Za-z0-9_])", self.task_text) is not None
+
+    def fixture_py_files(self):
+        """followed_py_files() MINUS the declared target(s).
+
+        verify.sh legitimately names the target -- a parse check
+        (`ast.parse(open('thing.py'))`) is the standard first section, and the
+        generator emits one. Counting it as a fixture makes the TARGET's own
+        module-scope config look like a fixture dependency: on a config-heavy
+        module that is 45 vars of pure noise.
+        """
+        targets = set()
+        for f in self.target_files():
+            try:
+                targets.add(f.resolve())
+            except Exception:
+                pass
+        return [f for f in self.followed_py_files()
+                if f.resolve() not in targets]
+
+    def followed_js_files(self):
+        """The .mjs/.mts/.js/.ts fixtures the verify actually runs -- the JS/TS
+        analogue of followed_py_files(). A JS/TS dispatch runs a verify_impl.mjs
+        / verify_impl.mts (or .js/.ts) fixture, and those are exactly where a
+        DRAFT_UNCONFIRMED marker lands, so draft-confirmed must be able to see
+        them."""
+        out, seen = [], set()
+        text = self.a.verify
+        vf = self.wt / "verify.sh"
+        if vf.exists():
+            text += "\n" + vf.read_text(errors="replace")
+        for m in re.finditer(r"([\w./-]+\.(?:mjs|mts|js|ts|jsx|cjs))\b", text):
+            rel = m.group(1)
+            if rel in seen:
+                continue
+            seen.add(rel)
+            f = self.wt / _norm_rel(rel)
+            if f.is_file() and f.stat().st_size < 400_000:
+                out.append(f)
+        return out
+
+    def fixture_js_files(self):
+        """followed_js_files() MINUS the declared target(s) -- same exclusion as
+        fixture_py_files(): the file the model EDITS is not one of its own
+        fixtures."""
+        targets = set()
+        for f in self.target_files():
+            try:
+                targets.add(f.resolve())
+            except Exception:
+                pass
+        return [f for f in self.followed_js_files()
+                if f.resolve() not in targets]
+
+    @staticmethod
+    def _is_environ(node):
+        """`os.environ` (or a bare `environ`)."""
+        if isinstance(node, ast.Attribute) and node.attr == "environ":
+            return True
+        return isinstance(node, ast.Name) and node.id == "environ"
+
+    def env_vars_in(self, src):
+        """(required_reads, sets) -- decided from SYNTAX, not from a pattern.
+
+        `os.environ.get(X, default)` CANNOT FAIL. Flagging it was a containment
+        test standing in for the property: "appears in an environ expression" is
+        not "is a dependency the model must be told about". The property is
+        REQUIRED-ness, and it is decidable:
+
+            os.environ[X]                     required   -> block
+            os.environ.get(X) / getenv(X)     required   -> block
+            os.environ.get(X, d) / getenv(X,d) defaulted -> ignore entirely
+            os.environ[X] = ...               SET        -> block (this is the
+                                                           OLLAMA_QUEUE_LOGS
+                                                           miss: a var the
+                                                           fixture establishes
+                                                           and the task never
+                                                           names)
+        """
+        required, sets = {}, {}
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return required, sets
+
+        def name_of(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            return None
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Subscript) and self._is_environ(node.value):
+                v = name_of(node.slice)
+                if not v:
+                    continue
+                (sets if isinstance(node.ctx, ast.Store) else required)[v] = True
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                v = name_of(node.args[0]) if node.args else None
+                if not v:
+                    continue
+                if (isinstance(fn, ast.Attribute) and fn.attr == "get"
+                        and self._is_environ(fn.value)):
+                    if len(node.args) == 1:      # no default -> can KeyError
+                        required[v] = True
+                elif isinstance(fn, ast.Attribute) and fn.attr == "getenv":
+                    if len(node.args) == 1:
+                        required[v] = True
+                elif isinstance(fn, ast.Name) and fn.id == "getenv":
+                    if len(node.args) == 1:
+                        required[v] = True
+                elif (isinstance(fn, ast.Attribute) and fn.attr == "setdefault"
+                        and self._is_environ(fn.value)):
+                    sets[v] = True
+        return required, sets
+
+    def check_spec_gap(self):
+        """Every env var a FIXTURE READS must be NAMED in the task.
+
+        Split deliberately: a var a fixture *reads* is a contract the model has
+        to honour and its absence from the spec kills every check pre-logic
+        (BLOCK). A var verify.sh merely *exports* is usually import-time
+        scaffolding the model never touches (WARN) -- blocking on those trains
+        the coordinator to ignore the check, which costs more than it saves.
+        """
+        read_vars: dict[str, str] = {}
+        fixtures = self.fixture_py_files()
+        for f in fixtures:
+            try:
+                src = f.read_text(errors="replace")
+            except Exception:
+                continue
+            required, sets = self.env_vars_in(src)
+            for v in required:
+                read_vars.setdefault(v, f"required in {f.name}")
+            for v in sets:
+                read_vars.setdefault(v, f"SET by {f.name}")
+        exported = set()
+        vf = self.wt / "verify.sh"
+        if vf.exists():
+            for m in re.finditer(r"^\s*export\s+([A-Z][A-Z0-9_]{2,})=",
+                                 vf.read_text(errors="replace"), re.M):
+                exported.add(m.group(1))
+        gap_read = {v: src for v, src in read_vars.items()
+                    if v not in AMBIENT and not self.task_names(v)}
+        gap_exp = {v for v in exported
+                   if v not in AMBIENT and not self.task_names(v)
+                   and v not in read_vars}
+        if gap_read:
+            return self.add(
+                "spec-gap", FAIL,
+                f"{len(gap_read)} env var(s) a fixture REQUIRES or SETS but "
+                f"{self.a.task_file} never names",
+                detail="; ".join(f"${v} ({s})"
+                                 for v, s in list(gap_read.items())[:5]),
+                fix="name each var, and what it points at, in the task")
+        if gap_exp:
+            return self.add(
+                "spec-gap", WARN,
+                f"{len(gap_exp)} env var(s) exported by verify.sh and not named "
+                f"in {self.a.task_file}",
+                detail=", ".join(f"${v}" for v in sorted(gap_exp)[:8])
+                       + " -- harmless if they are only import-time dummies",
+                fix="name them in the task if the model's code must consult them")
+        if not (read_vars or exported):
+            # Distinguish "the fixtures read no env vars" from "I never found
+            # the fixtures". The second is the wrong-artifact bug that made
+            # every text check in verify-quality.py fire on an empty haystack.
+            mentions_py = bool(re.search(r"[\w./-]+\.py\b", self.verify_text))
+            if mentions_py and not self.followed_py_files():
+                return self.unproven(
+                    "spec-gap",
+                    "the verify names .py files but none were found in the "
+                    "worktree -- env vars were scanned in an EMPTY haystack",
+                    fix="check the fixture paths in verify.sh resolve from "
+                        f"{self.wt}")
+            return self.add("spec-gap", PASS,
+                            f"no REQUIRED env vars in "
+                            f"{len(fixtures)} fixture file(s) "
+                            "(defaulted reads cannot fail, so they are not "
+                            "obligations on the spec)")
+        return self.add("spec-gap", PASS,
+                        f"all {len(read_vars) + len(exported)} fixture env "
+                        f"var(s) named in the task")
+
+    def target_files(self):
+        """Files the task says to edit. Explicit --target wins."""
+        if self.a.target:
+            return [self.wt / t for t in self.a.target]
+        out, seen = [], set()
+        # Every backticked token on an "Only edit" line, not just the first.
+        # `Only edit `a.py`, `b.py`` names TWO files; capturing only the first
+        # backtick group made a legit edit to `b.py` a false scope FAIL. Also
+        # split the comma-separated-in-one-backtick form (`a.py, b.py`).
+        for m in re.finditer(r"[Oo]nly edit\b([^\n]*)", self.task_text):
+            tail = m.group(1)
+            # A scope line commonly reads "Only edit `x`; do not edit `verify.sh`,
+            # `<fixture>` or `TASK.md`." -- and the REAL scaffold emits exactly
+            # that. Everything after a "do not edit"/"don't edit" clause NAMES
+            # FILES THE MODEL MUST NOT TOUCH; capturing their backticked tokens as
+            # TARGETS mis-classified the fixture as a target, which emptied
+            # fixture_py_files()/fixture_js_files() and silently made spec-gap and
+            # draft-confirmed inert on the standard scaffold shape. Truncate the
+            # tail at the first negated-edit clause so only the edit-ME tokens
+            # count.
+            tail = re.split(r"(?i)\bdo\s*n(?:['’]t|ot)\s+edit\b",
+                            tail, maxsplit=1)[0]
+            for group in re.findall(r"`([^`\n]+)`", tail):
+                for tok in re.split(r"[,\s]+(?:and\s+)?", group):
+                    tok = tok.strip("`,.; ")
+                    if not tok or tok in seen:
+                        continue
+                    p = self.wt / tok
+                    # An existing file always counts. For a CREATION task the
+                    # target does not exist at baseline, so also accept a token
+                    # that LOOKS like a source filename (a real code extension,
+                    # no call-parens or operators) even when absent -- otherwise
+                    # a create dispatch reaches "no target inferred" and the
+                    # operator must pass --target by hand (papercut #5).
+                    looks_like_src = (
+                        bool(re.fullmatch(r"[\w./-]+\.[A-Za-z]\w*", tok))
+                        and Path(tok).suffix in SRC_SUFFIXES)
+                    if p.is_file() or looks_like_src:
+                        seen.add(tok)
+                        out.append(p)
+        return out
+
+    def check_target_parses(self):
+        targets = self.target_files()
+        if not targets:
+            return self.unproven(
+                "target-parses",
+                "no target file inferred from the task and none given",
+                fix="pass --target <file>, or give the task a scope line "
+                    '("Only edit `x.py`")')
+        bad, checked, absent = [], [], []
+        for t in targets:
+            is_py = t.suffix == ".py"
+            is_ts = t.suffix in TS_SUFFIXES
+            if not (is_py or is_ts):
+                continue
+            if is_ts and not TS_PARSE.is_file():
+                # No sidecar to parse TS with -- skip THIS file rather than
+                # silently passing it (the old code just `continue`d, so a TS
+                # syntax error was never seen). Recorded via `absent`-style skip.
+                continue
+            if not t.is_file():
+                # A CREATION task: the target does not exist yet. Not a defect,
+                # and emphatically not a crash -- the gate used to die here with
+                # FileNotFoundError, which reads as the gate being broken rather
+                # than the task being a create.
+                absent.append(t.name)
+                continue
+            checked.append(t)
+            if is_py:
+                try:
+                    ast.parse(t.read_text(errors="replace"))
+                except SyntaxError as e:
+                    bad.append(f"{t.name}:{e.lineno}: {e.msg}")
+            else:  # TS/JS -- delegate to the ts-parse sidecar (exits nonzero on
+                   # a syntactic diagnostic, like ast.parse raising SyntaxError).
+                p = subprocess.run(["node", str(TS_PARSE), str(t)],
+                                   capture_output=True, text=True)
+                if p.returncode != 0:
+                    first = (p.stderr or p.stdout).strip().splitlines()
+                    bad.append(first[0] if first else f"{t.name}: does not parse")
+        if bad:
+            return self.add("target-parses", FAIL,
+                            "target does not parse", detail="; ".join(bad))
+        if absent and not checked:
+            return self.add(
+                "target-parses", PASS,
+                f"{', '.join(absent)} does not exist yet -- a creation task",
+                detail="nothing to parse at baseline; the verify must assert "
+                       "the file exists and parses after the model writes it")
+        if not checked:
+            return self.skipped(
+                "target-parses",
+                "no python target to parse ("
+                + ", ".join(t.name for t in targets) + ")")
+        return self.add("target-parses", PASS,
+                        ", ".join(t.name for t in checked) + " parses")
+
+    def check_verify_shape(self):
+        vf = self.wt / "verify.sh"
+        if not vf.exists():
+            return self.unproven("verify-shape",
+                                 "no verify.sh -- the verify's shape is unknown")
+        src = vf.read_text(errors="replace")
+        probs = []
+        if re.search(r"^\s*set\s+-[a-z]*e", src, re.M):
+            probs.append("`set -e` aborts on the first failing check, so the "
+                         "model never sees the full FAIL list it is told to "
+                         "work through (use `set -u` and a fails counter)")
+        if "VERIFY_OK" not in src:
+            probs.append("never prints VERIFY_OK -- the worker's success signal")
+        if not re.search(r"exit\s+1", src):
+            probs.append("has no non-zero exit path, so it cannot fail")
+        if probs:
+            return self.add("verify-shape", WARN, f"{len(probs)} shape issue(s)",
+                            detail="; ".join(probs),
+                            fix='end with: echo "--- $fails failed ---"; '
+                                '[ "$fails" -eq 0 ] && echo VERIFY_OK || exit 1')
+        return self.add("verify-shape", PASS, "counting idiom, VERIFY_OK, exit 1")
+
+    # ---- dynamic checks ------------------------------------------------
+    def check_baseline_fails(self):
+        t0 = time.time()
+        rc, out = self.sh(self.a.verify)
+        self.verify_secs = time.time() - t0
+        self.baseline_rc, self.baseline_out = rc, out
+        if rc == 124:
+            return self.add("baseline-fails", FAIL,
+                            f"verify timed out after {VERIFY_TIMEOUT_S}s")
+        if rc == 0 or "VERIFY_OK" in out:
+            return self.add(
+                "baseline-fails", FAIL,
+                f"verify PASSES on the untouched baseline (exit {rc})",
+                detail="It cannot tell a completed task from an untouched one. "
+                       "A run that changes nothing would be certified done.",
+                fix="make the verify assert the PROPERTY the fix introduces")
+        return self.add("baseline-fails", PASS,
+                        f"fails at baseline as it must (exit {rc}, "
+                        f"{self.verify_secs:.1f}s)")
+
+    def check_draft_confirmed(self):
+        """Drafted cases must be read by a human before they gate a dispatch.
+
+        The gate mechanically catches non-discriminating, unsatisfiable and
+        benign-against-the-literals. It CANNOT catch a verify that
+        discriminates, asserts every literal, and tests the wrong property --
+        refimpl-satisfies is the decidable slice of relevance, not relevance.
+        A model-drafted case that is merely irrelevant passes everything else
+        here, so "a human looked" is a real property and gets a real check.
+        """
+        drafted, unreadable, seen = [], [], set()
+        # Python fixtures carry `DRAFT_UNCONFIRMED = True`; JS/TS fixtures carry
+        # `const DRAFT_UNCONFIRMED = true`. Scan BOTH families (and TASK.md) for
+        # EITHER marker -- an unconfirmed draft in any of them means no human has
+        # confirmed the cases. Scanning only .py fixtures let an unconfirmed
+        # .mjs/.mts draft reach GO without the one irreducible relevance review.
+        candidates = ([self.wt / self.a.task_file]
+                      + self.fixture_py_files() + self.fixture_js_files())
+        for f in candidates:
+            try:
+                rp = f.resolve()
+            except Exception:
+                rp = f
+            if rp in seen:
+                continue
+            seen.add(rp)
+            try:
+                if not f.is_file():
+                    continue
+                text = f.read_text(errors="replace")
+                if DRAFT_MARK in text or DRAFT_MARK_JS_RE.search(text):
+                    drafted.append(f.name)
+            except Exception as e:
+                # Swallowing this made the check go COMPLETELY SILENT -- no
+                # PASS, no FAIL, no UNPROVEN -- on an unreadable fixture, so an
+                # unconfirmed model-drafted fixture became invisible to the
+                # gate and reached GO. Third time this same invariant ("a human
+                # read the cases") failed silently, after mark_drafted's no-op
+                # re.sub. An absence of evidence is not evidence of absence.
+                unreadable.append(f"{f.name} ({type(e).__name__})")
+        if unreadable:
+            return self.unproven(
+                "draft-confirmed",
+                f"could not read {len(unreadable)} file(s), so an unconfirmed "
+                f"draft cannot be ruled out: {'; '.join(unreadable)}",
+                fix="make the file readable and re-run; until then nobody has "
+                    "established that a human reviewed these cases")
+        if not drafted:
+            return
+        self.add(
+            "draft-confirmed", FAIL,
+            f"{len(drafted)} file(s) hold UNCONFIRMED model-drafted cases",
+            detail=", ".join(drafted),
+            fix="read every case and ask 'could this pass on broken work?', "
+                "then: ollama-dispatch-draft <worktree> --confirm. The gate "
+                "proved these DISCRIMINATE; only you can say they are "
+                "RELEVANT.")
+
+    def check_scaffold_authored(self):
+        """A generated scaffold is not a verify.
+
+        `ollama-dispatch-scaffold` emits a fixture with an EMPTY case list and a
+        verify that prints SCAFFOLD_INCOMPLETE, deliberately: a generator can
+        emit a verify that DISCRIMINATES but cannot decide whether it is
+        RELEVANT, and that judgement is the one step nothing mechanises. Without
+        this check the resulting NO-GO lands on verify-quality -- true, but a
+        downstream symptom that sends you to rewrite the wrong thing.
+        """
+        if SCAFFOLD_MARK not in (self.baseline_out or ""):
+            return
+        self.add(
+            "scaffold-authored", FAIL,
+            "the generated scaffold has no adversarial cases yet",
+            detail=(self.baseline_out or "").strip()[-300:],
+            fix="author >= 3 adversarial cases in the fixture: the boundary "
+                "and both sides of it, the degenerate inputs that must not "
+                "raise, at least one a plausible WRONG fix would fail, and the "
+                "regression half. Then re-run this gate.")
+
+    def check_env_parity(self):
+        """Did the baseline run fail for the RIGHT reason?
+
+        Behavioural, not structural: a verify that dies on ImportError fails on
+        every iteration for a reason that has nothing to do with the task, and
+        the model has no way to make it stop.
+        """
+        if self.baseline_rc is None:
+            return self.unproven("env-parity", "the baseline run never happened")
+        out = self.baseline_out
+        # (pattern, label, tailored one-line fix). A JS/TS baseline dies on the
+        # environment two ways the generic venv fix does not address: a missing
+        # node_modules package (often a SUB-PACKAGE's own deps the root symlink
+        # misses) and an IMPORT-TIME `throw` on an unset required env var. Both
+        # are now auto-handled by the scaffold's bootstrap; surface the specific
+        # module/var + fix here as a backstop when one still slips through.
+        _venv_fix = ("bootstrap a venv in verify.sh and run every check through "
+                     "it: PY=.venv/bin/python; [ -x \"$PY\" ] || { python3 -m "
+                     "venv .venv && .venv/bin/pip install -q -r "
+                     "requirements.txt; }")
+        sigs = [
+            (r"ModuleNotFoundError: No module named ['\"]?([\w.]+)",
+             "missing python module", _venv_fix),
+            (r"Cannot find (?:package|module) ['\"]([^'\"]+)['\"]",
+             "missing node module",
+             "the target imports a package the worktree's node_modules lacks -- "
+             "if it lives under a sub-package (its own package.json + "
+             "node_modules), symlink that sub-package's node_modules from the "
+             "source in verify.sh (re-scaffold to auto-detect); else `npm ci`"),
+            (r"([A-Z][A-Z0-9_]{2,})\s+env(?:ironment)?[ _]?var(?:iable)?\s+is\s+"
+             r"required", "import-time env var required",
+             "the target throws at import when this env var is unset -- export a "
+             "dummy in verify.sh's bootstrap AND name it in TASK.md's Test "
+             "environment section (re-scaffold to auto-detect both)"),
+            (r"ImportError: ([^\n]{0,80})", "import error", _venv_fix),
+            (r"([\w./-]+): command not found", "missing command", _venv_fix),
+            (r"No such file or directory: ['\"]([^'\"]+)", "missing file",
+             _venv_fix),
+            (r"externally-managed-environment", "PEP-668: system pip is blocked",
+             _venv_fix),
+        ]
+        hits, chosen_fix = [], None
+        for pat, label, fix in sigs:
+            m = re.search(pat, out)
+            if m:
+                hits.append(f"{label}: {m.group(1) if m.groups() else m.group(0)}")
+                if chosen_fix is None:
+                    chosen_fix = fix
+        if hits:
+            return self.add(
+                "env-parity", FAIL,
+                "the baseline run died on the ENVIRONMENT, not on the task",
+                detail="; ".join(hits[:3]),
+                fix=chosen_fix or _venv_fix)
+        has_req = (self.wt / "requirements.txt").exists()
+        vf = self.wt / "verify.sh"
+        bootstraps = vf.exists() and "venv" in vf.read_text(errors="replace")
+        if has_req and not bootstraps:
+            return self.add("env-parity", WARN,
+                            "repo has requirements.txt but verify.sh never "
+                            "bootstraps a venv",
+                            detail="it happens to work now; it will break the "
+                                   "first time the target imports a dep")
+        return self.add("env-parity", PASS,
+                        "baseline failed on the task, not the environment")
+
+    def check_verify_speed(self):
+        if self.verify_secs is None:
+            return self.unproven("verify-speed", "the baseline run never happened")
+        if self.verify_secs > SLOW_VERIFY_S:
+            return self.add("verify-speed", WARN,
+                            f"verify takes {self.verify_secs:.0f}s",
+                            detail=f"it runs after every edit; over "
+                                   f"{SLOW_VERIFY_S}s the loop crawls and "
+                                   f"iterations get spent waiting")
+        return self.add("verify-speed", PASS, f"{self.verify_secs:.1f}s per "
+                                              f"iteration")
+
+    def apply_refimpl(self):
+        if self.a.refimpl:
+            p = Path(self.a.refimpl).expanduser().resolve()
+            if not p.exists():
+                return False, f"--refimpl {p} does not exist"
+            rc, out = self.sh(f"git apply --verbose {json.dumps(str(p))}",
+                              timeout=120)
+            if rc != 0:
+                rc2, out2 = self.sh(f"patch -p1 -i {json.dumps(str(p))}",
+                                    timeout=120)
+                if rc2 != 0:
+                    return False, f"could not apply patch: {out.strip()[-300:]}"
+            return True, "patch applied"
+        rc, out = self.sh(self.a.refimpl_cmd, timeout=600)
+        if rc != 0:
+            return False, f"--refimpl-cmd exited {rc}: {out.strip()[-300:]}"
+        return True, "refimpl command ran"
+
+    def revert_refimpl(self):
+        """Restore tracked files; delete only files the refimpl itself added.
+
+        NOT `git clean -fdx` -- that would take TASK.md, verify.sh, the fixture
+        and .venv with it. The untracked set is diffed against the pre-refimpl
+        snapshot so exactly the refimpl's own new files go and nothing else does.
+        """
+        self.sh("git checkout -- .", timeout=120)
+        rc, out, _ = self.git("status", "--porcelain")
+        after = {l[3:].strip() for l in out.splitlines() if l[:2] == "??"}
+        # Reference is the untracked set as it stood JUST BEFORE the refimpl was
+        # applied (LOW11) -- not the pre-baseline set, which predates any .venv
+        # or __pycache__ the baseline verify created. Fall back to the
+        # pre-baseline set only if the pre-refimpl snapshot is unavailable.
+        ref = getattr(self, "_pre_refimpl_untracked", None)
+        if ref is None:
+            ref = getattr(self, "untracked_before", set())
+        for rel in sorted(after - ref):
+            p = self.wt / rel
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p)
+                elif p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+    def must_contain_literals(self):
+        """The `## Must contain` bullets -- what the spec obliges to appear."""
+        m = re.search(r"##+\s*Must contain[^\n]*\n(.*?)(?=\n##\s|\Z)",
+                      self.task_text, re.S | re.I)
+        if not m:
+            return []
+        return [b.group(1) for b in re.finditer(r"`([^`\n]{4,200})`", m.group(1))]
+
+    @staticmethod
+    def _literal_present(lit, blob):
+        """Is a Must-contain literal satisfied by the source blob?
+
+        Exact substring is the rule. The one loosening: a literal that is a
+        WHOLE quoted string -- `"processing"` in the Must-contain list -- is
+        satisfied by the same string under the OTHER quote style in the source
+        (`status = 'processing'`). Python treats "x" and 'x' as identical, so a
+        double-quoted spec literal FAILing against single-quoted source was a
+        false NO-GO (papercut #5). Only fully-quoted literals are loosened, so
+        a behavioural code token that merely contains a quote is untouched.
+        """
+        if lit in blob:
+            return True
+        if len(lit) >= 2 and lit[0] in "\"'" and lit[-1] == lit[0]:
+            inner = lit[1:-1]
+            if lit[0] not in inner:  # no embedded same-quote to complicate
+                alt = "'" if lit[0] == '"' else '"'
+                if alt + inner + alt in blob:
+                    return True
+        return False
+
+    def refimpl_scope_text(self):
+        """The files the CHANGE is allowed to live in -- not the whole repo.
+
+        This check used to concatenate every tracked file and ask whether the
+        literal appeared anywhere. In the purpose-built fixtures it did not, so
+        it looked sound. In a real repo it is inert: a "Must contain" literal
+        names a symbol you are integrating with, and that symbol is already
+        somewhere in the tree. Caught on the first real worktree --
+        machine-config, where `eval_arms_pending` already lived in
+        bin/handoff-emit.py and a deliberately benign verify was rendered GO.
+        An inert check is worse than no check: it looks like a check that passed.
+
+        Scope is the files the refimpl TOUCHED, plus the declared target. Not
+        the diff's added lines: a "Must contain" literal is as often one that
+        must be PRESERVED (a signature the fix must not change) as one that must
+        be added, and diff-scoping fails those. Not pre-existing untracked files
+        either -- the verify fixture names the very keys the spec lists, so
+        counting it re-inerts the check by a second route.
+        """
+        rel_paths = set()
+        rc, names, _ = self.git("diff", "--name-only")
+        if rc == 0:
+            rel_paths |= {l.strip() for l in names.splitlines() if l.strip()}
+        before = getattr(self, "untracked_before", set())
+        rc, untracked, _ = self.git("ls-files", "--others", "--exclude-standard")
+        if rc == 0:
+            rel_paths |= {l.strip() for l in untracked.splitlines()
+                          if l.strip() and l.strip() not in before}
+        rel_paths -= {STATE_FILE, *self.scaffold_rel_paths()}
+        paths = {self.wt / r for r in rel_paths}
+        paths |= {t for t in self.target_files() if t.is_file()}
+        blob = []
+        for f in sorted(paths):
+            try:
+                if f.is_file() and f.stat().st_size < 4_000_000:
+                    blob.append(f.read_text(errors="replace"))
+            except Exception:
+                pass
+        return "\n".join(blob)
+
+    def check_refimpl(self):
+        """Both-ways half 2, plus the relevance probe.
+
+        Two distinct facts come out of one run:
+          - the task is SATISFIABLE as specified (verify can be made to pass);
+          - the verify actually ENFORCES the spec. If a reference impl turns it
+            green while a "Must contain" literal is absent from the tree, then a
+            model can do the same -- that is a benign verify, caught before it
+            passes broken work rather than after.
+        """
+        if self.a.no_refimpl:
+            self.unproven(
+                "refimpl-passes",
+                "WAIVED (--no-refimpl): nobody has shown this task is "
+                "satisfiable or that a correct fix goes green",
+                fix="an unsatisfiable task burns every iteration the model has")
+            self.unproven("refimpl-satisfies",
+                          "WAIVED: nothing proved the verify ENFORCES the spec, "
+                          "so a benign verify would pass broken work")
+            self.unproven("verify-relevance",
+                          "WAIVED with the refimpl: no reference impl, nothing "
+                          "to mutate, relevance unmeasured")
+            self.skipped("refimpl-reverted", "no refimpl was applied")
+            return
+        # Snapshot the tree state IMMEDIATELY before applying the reference
+        # impl, so revert/reverted accounting is relative to here -- not to the
+        # pre-baseline snapshot. Two bugs this closes:
+        #   LOW11  untracked_before was captured before check_baseline_fails ran
+        #          the verify, which may have created .venv/__pycache__/fixture
+        #          outputs. Diffing revert against it deleted THOSE too. The
+        #          pre-refimpl set contains them, so only the refimpl's own new
+        #          files are removed.
+        #   LOW9   a --refimpl-cmd that COMMITS leaves the tree clean with HEAD
+        #          advanced, so `git checkout -- .` cannot revert it and
+        #          refimpl-reverted would PASS while the answer sits in HEAD.
+        self._pre_refimpl_head = self.git("rev-parse", "HEAD")[1].strip()
+        rc, out, _ = self.git("status", "--porcelain")
+        self._pre_refimpl_untracked = {
+            l[3:].strip() for l in out.splitlines() if l[:2] == "??"}
+        ok, why = self.apply_refimpl()
+        if not ok:
+            self.add("refimpl-passes", FAIL, "could not apply the reference impl",
+                     detail=why)
+            self.unproven("refimpl-satisfies",
+                          "the refimpl never applied, so the verify's grip on "
+                          "the spec was never tested")
+            self.unproven("verify-relevance",
+                          "the refimpl never applied, so nothing was mutated")
+            self.revert_refimpl()
+            self.check_reverted()
+            return
+        rc, out = self.sh(self.a.verify)
+        green = (rc == 0 and "VERIFY_OK" in out)
+        if green:
+            self.add("refimpl-passes", PASS,
+                     "reference impl makes the verify print VERIFY_OK")
+        else:
+            self.add("refimpl-passes", FAIL,
+                     f"reference impl does NOT satisfy the verify (exit {rc})",
+                     detail=(out.strip()[-400:] or "no output"),
+                     fix="either the task is unsatisfiable as written or the "
+                         "verify asserts something the spec never asked for -- "
+                         "the model would fail this too, indefinitely")
+        lits = self.must_contain_literals()
+        if not lits:
+            self.unproven(
+                "refimpl-satisfies",
+                'the task has no "Must contain" literals, so there is nothing '
+                'mechanical to hold the verify against',
+                fix="add a `## Must contain` list of literal tokens to the task")
+        else:
+            blob = self.refimpl_scope_text()
+            absent = [l for l in lits if not self._literal_present(l, blob)]
+            if absent and green:
+                self.add(
+                    "refimpl-satisfies", FAIL,
+                    f"the verify goes GREEN while {len(absent)} required "
+                    f"literal(s) are absent from the changed/target file(s)",
+                    detail="; ".join(repr(l) for l in absent[:4]),
+                    fix="the verify does not enforce the spec -- a model can "
+                        "pass it without doing what was asked. Assert the "
+                        "property behaviourally (a whole literal cannot match "
+                        "its own negation).")
+            elif absent:
+                self.add("refimpl-satisfies", WARN,
+                         f"{len(absent)} required literal(s) absent from the "
+                         f"reference impl's change",
+                         detail="; ".join(repr(l) for l in absent[:4])
+                                + " -- the refimpl and the spec disagree")
+            else:
+                self.add("refimpl-satisfies", PASS,
+                         f"reference impl contains all {len(lits)} required "
+                         f"literal(s)")
+        if green:
+            self.check_verify_relevance()
+        else:
+            self.unproven("verify-relevance",
+                          "the reference impl is not green, so there is nothing "
+                          "to mutate against")
+        self.revert_refimpl()
+        self.check_reverted()
+
+    def check_verify_relevance(self):
+        """Delegated to verify-relevance.py, run while the refimpl is applied.
+
+        This is the check that closes the gap draft-confirmed documents: the
+        gate could prove a verify DISCRIMINATES but not that it is RELEVANT,
+        so a human read of the cases was mandatory. Mutation relevance is the
+        machine-checkable slice of that read -- it cannot say the cases are
+        the RIGHT ones, but it can say whether the verify notices when the fix
+        it just accepted is broken in the obvious ways. Survivors are named so
+        the human read, where it still happens, starts from the holes.
+
+        Not merely a withheld auto-approve: a LOW-relevance verify is a hard NO-GO that blocks the dispatch entirely -- a broken fix must not survive its own verify, so signoff.py reads this evidence from the ledger and refuses to proceed.
+        """
+        if getattr(self.a, "no_relevance", False):
+            return self.unproven(
+                "verify-relevance",
+                "WAIVED (--no-relevance): nothing measured whether the verify "
+                "tests the property or a proxy for it",
+                fix="a low-relevance verify cannot auto-approve; a waived one "
+                    "cannot either")
+        vr = BIN / "verify-relevance.py"
+        if not vr.exists():
+            return self.unproven(
+                "verify-relevance", f"{vr} not found -- relevance is UNJUDGED",
+                fix="install verify-relevance.py next to this gate")
+        try:
+            spec = importlib.util.spec_from_file_location("verify_relevance", vr)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            return self.unproven("verify-relevance",
+                                 f"verify-relevance.py could not load: {e}")
+        rc, diff_text, _ = self.git("diff", "-U0")
+        if rc != 0 or not diff_text.strip():
+            return self.unproven("verify-relevance",
+                                 "the reference impl produced no tracked diff to "
+                                 "mutate (added files only?)")
+        try:
+            rec = mod.measure_applied(
+                self.wt, self.a.verify, diff_text,
+                literals=self.must_contain_literals(),
+                max_mutants=getattr(self.a, "relevance_max_mutants", 40),
+                budget_s=getattr(self.a, "relevance_budget_s", 600),
+                skip_green_check=True)
+        except Exception as e:
+            return self.unproven("verify-relevance",
+                                 f"measurement crashed: {type(e).__name__}: {e}")
+        # Keep the record small enough to live in the state file and ledger:
+        # summary + survivors, not every mutant's full source.
+        slim = {k: v for k, v in rec.items() if k not in ("mutants",)}
+        slim["survivors"] = [{k: v for k, v in m.items() if k != "source"}
+                             for m in rec.get("survivors", [])]
+        slim["verify_sha256"] = self.scaffold_digests().get("verify.sh")
+        self._state["verify_relevance"] = slim
+        v = rec["verdict"]
+        surv = "; ".join(f"{m['file']}:{m['line']} {m['mutation']}"
+                         for m in rec.get("survivors", [])[:4])
+        unex = rec.get("unexercised_sites") or []
+        if v == "relevant":
+            return self.add("verify-relevance", PASS,
+                            f"verify killed {rec['killed']}/{rec['evidence_mutants']} "
+                            f"property-breaking mutants (score {rec['score']}, "
+                            f"{rec['seconds']}s)",
+                            detail=("survivors: " + surv) if surv else "")
+        if v == "low":
+            return self.add(
+                "verify-relevance", FAIL,
+                f"LOW relevance: {rec['survived']}/{rec['evidence_mutants']} "
+                f"property-breaking mutants survived (score {rec['score']})",
+                detail=(("never exercised: " + ", ".join(unex) + ". ") if unex else "")
+                       + "survivors: " + surv,
+                fix="the verify is testing a proxy or a benign slice of the "
+                    "property. Add the case each survivor would fail. This "
+                    "dispatch is BLOCKED (NO-GO) until relevance is proven.")
+        return self.unproven("verify-relevance", rec.get("reason") or
+                             "relevance could not be measured",
+                             fix="a dispatch whose relevance is unmeasured "
+                                 "cannot auto-approve")
+
+    def check_reverted(self):
+        rc, out, _ = self.git("status", "--porcelain")
+        left = [l for l in out.splitlines() if l[:2] != "??" and l.strip()]
+        ref = getattr(self, "_pre_refimpl_untracked", None)
+        if ref is None:
+            ref = getattr(self, "untracked_before", set())
+        stray = ({l[3:].strip() for l in out.splitlines() if l[:2] == "??"} - ref)
+        # LOW9: a refimpl that COMMITTED its change leaves a clean working tree
+        # with HEAD advanced -- `git checkout -- .` cannot undo a commit, so
+        # without this the model would begin from the answer sitting in HEAD.
+        pre = getattr(self, "_pre_refimpl_head", None)
+        now_head = self.git("rev-parse", "HEAD")[1].strip() if pre else None
+        head_moved = bool(pre and now_head and now_head != pre)
+        if left or stray or head_moved:
+            detail = "; ".join(left[:4] + [f"?? {s}" for s in sorted(stray)[:4]])
+            if head_moved:
+                extra = f"HEAD advanced {pre[:12]} -> {now_head[:12]} (refimpl COMMITTED)"
+                detail = (detail + "; " + extra) if detail else extra
+            return self.add(
+                "refimpl-reverted", FAIL,
+                "the tree is NOT back at baseline after the reference impl"
+                + (" -- the refimpl COMMITTED its change, so the answer is in "
+                   "HEAD and `git checkout` cannot revert it" if head_moved else ""),
+                detail=detail,
+                fix=("reset HEAD to the gate baseline "
+                     f"(git -C {self.wt} reset --hard {pre[:12]}) and make the "
+                     "refimpl NOT commit" if head_moved else
+                     "the model would start from the answer -- restore with "
+                     f"git -C {self.wt} checkout -- ."))
+        return self.add("refimpl-reverted", PASS,
+                        "tree restored to baseline; the model starts clean")
+
+    def check_verify_quality(self):
+        """Delegated. This tool does not judge verify quality itself."""
+        vq = BIN / "verify-quality.py"
+        if not vq.exists():
+            return self.unproven(
+                "verify-quality",
+                f"{vq} not found -- verify soundness is UNJUDGED",
+                fix="this tool delegates gameability judgement rather than "
+                    "carrying a second copy; without it, nothing checked "
+                    "whether the verify can tell correct from inverted")
+        cmd = [sys.executable, str(vq), "--verify", self.a.verify,
+               "--cwd", str(self.wt), "--task-file",
+               str(self.wt / self.a.task_file), "--no-baseline"]
+        # --no-baseline: this tool already ran the baseline itself (check
+        # baseline-fails). Running it twice doubles the slowest step for a fact
+        # already established.
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except Exception as e:
+            return self.unproven("verify-quality",
+                                 f"verify-quality.py could not run: {e}")
+        out = (p.stdout + p.stderr).strip()
+        if p.returncode == 0:
+            return self.add("verify-quality", PASS,
+                            "verify-quality.py: sound",
+                            detail=out[-300:])
+        if p.returncode == 2:
+            return self.unproven("verify-quality",
+                                 f"verify-quality.py errored (exit 2), so it "
+                                 f"judged nothing: {out[-200:]}")
+        return self.add("verify-quality", FAIL,
+                        "verify-quality.py: verify is NOT discriminating",
+                        detail=out[-600:])
+
+    # ---- driver --------------------------------------------------------
+    def scaffold_rel_paths(self):
+        """Relative paths of every file the MODEL MUST NOT TOUCH.
+
+        NOTE `--verify` is a COMMAND ("bash verify.sh"), not a filename.
+        Treating it as a path silently hashed nothing and left the verify --
+        the one file whose tampering matters most -- unprotected. Pull the .sh
+        tokens out of the command instead.
+        """
+        rels, seen = [], set()
+        # The DECLARED TARGET is the one file the model is supposed to edit.
+        # followed_py_files() finds it anyway, because verify.sh legitimately
+        # names it (`open('target.py')`), and protecting it as scaffold flags
+        # the intended fix as tampering. Scaffold means untouchable; the target
+        # is the opposite of that.
+        targets = set()
+        for f in self.target_files():
+            try:
+                targets.add(str(f.relative_to(self.wt)))
+            except Exception:
+                pass
+
+        def take(rel):
+            rel = _norm_rel(rel)
+            if (rel and rel not in seen and rel not in targets
+                    and (self.wt / rel).is_file()):
+                seen.add(rel)
+                rels.append(rel)
+
+        take(self.a.task_file)
+        for m in re.finditer(r"([\w./-]+\.sh)\b", self.a.verify or ""):
+            take(m.group(1))
+        take("verify.sh")
+        for f in self.followed_py_files():
+            try:
+                take(str(f.relative_to(self.wt)))
+            except Exception:
+                pass
+        return rels
+
+    def scaffold_digests(self):
+        """sha256 of every file the MODEL MUST NOT TOUCH.
+
+        The task, the verify, and the fixtures the verify runs. A model that
+        edits its own verify or fixture passes trivially, and the green result
+        is indistinguishable from a real one unless you recorded what they
+        looked like before.
+        """
+        out, failed = {}, []
+        for rel in self.scaffold_rel_paths():
+            try:
+                out[rel] = hashlib.sha256(
+                    (self.wt / rel).read_bytes()).hexdigest()
+            except Exception as e:
+                # A file omitted from the contract cannot be checked for
+                # tampering by --review later, and silently omitting it makes
+                # scaffold-untouched report PASS over a file it never hashed.
+                failed.append(f"{rel} ({type(e).__name__})")
+        if failed:
+            out["__unhashable__"] = failed
+        return out
+
+    def _audit_untracked(self, prev, new_untracked):
+        """MED4: files that appeared since the gate baseline.
+
+        The scope audit used to skip ALL untracked files ("not the model's
+        doing") -- but a root-level `*.py`/`*.mjs` the model dropped can SHADOW a
+        stdlib or local import, because the fixture runs with the worktree as
+        sys.path[0] (it precedes stdlib). A `hashlib.py`/`subprocess.py` at the
+        worktree root then makes the import resolve to the model's file, and both
+        the scaffold and scope audits pass over the tampering. Those are a FAIL;
+        other new untracked files are a WARN.
+        """
+        before = set(prev.get("untracked_before") or [])
+        have_baseline = "untracked_before" in prev
+
+        def noise(p):
+            first = p.split("/", 1)[0]
+            return first.startswith(".") or first in ("__pycache__", "node_modules")
+
+        added = [p for p in new_untracked if p not in before and not noise(p)]
+        shadow = [p for p in added
+                  if "/" not in p and Path(p).suffix in (".py", ".mjs")]
+        if shadow and have_baseline:
+            return self.add(
+                "scope-untracked", FAIL,
+                f"{len(shadow)} new root-level module(s) the gate never saw -- "
+                "these SHADOW a stdlib/local import (the fixture runs with the "
+                "worktree as sys.path[0])",
+                detail=", ".join(shadow),
+                fix="delete them; a dropped hashlib.py/subprocess.py at the "
+                    "worktree root makes the import resolve to the model's file "
+                    "and the scaffold/scope audits pass over tampering")
+        if shadow:
+            return self.add(
+                "scope-untracked", WARN,
+                f"{len(shadow)} new root-level module(s) present, but the gate "
+                "record predates untracked-set recording so they cannot be "
+                "confirmed new",
+                detail=", ".join(shadow))
+        if have_baseline and added:
+            return self.add(
+                "scope-untracked", WARN,
+                f"{len(added)} untracked file(s) not present at the gate baseline",
+                detail=", ".join(sorted(added)[:8]))
+
+    def check_scope_respected(self, prev, committed_files=None):
+        """Did the model change ONLY what the task declared?
+
+        A green verify says nothing about files the verify does not touch. On
+        the Sonarr reverse-pack dispatch a model DELETED a tracked test file
+        unrelated to the task and the verify stayed green the whole time,
+        because the deleted file was not part of that fix's verify. A less
+        careful merge -- or an auto-approve -- would have shipped a silent
+        deletion of a tracked test.
+
+        Deletions are named separately from edits: an out-of-scope edit shows up
+        in a diff review, a deletion is an absence and reviewers do not notice
+        absences.
+        """
+        scope = set(prev.get("declared_scope") or [])
+        rc, out, _ = self.git("status", "--porcelain")
+        if rc != 0:
+            return self.unproven("scope-respected", "git status failed")
+        deleted, changed, new_untracked = [], [], []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            code, path = line[:2], line[3:].strip()
+            if code == "??":
+                if path != STATE_FILE:
+                    new_untracked.append(path)
+                continue
+            if " -> " in path:    # a rename reports both halves
+                path = path.split(" -> ", 1)[1]
+            if path in scope:
+                continue
+            # .preflight-state.json is NO LONGER exempt: a TRACKED-and-MODIFIED
+            # state file is a rewrite of the very contract this audit trusts, so
+            # it must FAIL, not pass silently (HIGH2).
+            (deleted if "D" in code else changed).append(f"{code.strip()} {path}")
+        # committed base..HEAD changes (MED7) -- invisible to `git status`.
+        for path in (committed_files or []):
+            if path in scope:
+                continue
+            changed.append(f"commit {path}")
+        # untracked additions the gate never saw (MED4).
+        self._audit_untracked(prev, new_untracked)
+        if not scope:
+            return self.unproven(
+                "scope-respected",
+                "the gate run recorded no declared scope, so out-of-scope "
+                "changes cannot be distinguished from intended ones",
+                fix='give the task a scope line ("Only edit `x.py`") or pass '
+                    "--target, then re-run the gate before dispatching")
+        if deleted or changed:
+            return self.add(
+                "scope-respected", FAIL,
+                f"{len(deleted) + len(changed)} tracked file(s) changed OUTSIDE "
+                f"the declared scope"
+                + (f" -- {len(deleted)} DELETED" if deleted else ""),
+                detail="; ".join(deleted + changed),
+                fix="a green verify does not cover files the verify never "
+                    "touches. Restore them (`git checkout -- <path>`) and "
+                    "review why the model went outside "
+                    + ", ".join(sorted(scope)))
+        return self.add("scope-respected", PASS,
+                        f"only the {len(scope)} declared file(s) changed")
+
+    def check_scaffold_untouched(self, prev):
+        """The model must not have edited the task, the verify, or a fixture."""
+        want = prev.get("scaffold_sha256") or {}
+        if not want:
+            return self.unproven(
+                "scaffold-untouched",
+                "the gate run recorded no scaffold digests, so verify/fixture "
+                "tampering cannot be ruled out",
+                fix="re-run the gate before dispatching so it records them")
+        unhashable = want.pop("__unhashable__", None)
+        if unhashable:
+            self.add("scaffold-untouched", WARN,
+                     f"{len(unhashable)} scaffold file(s) could not be hashed "
+                     "at gate time, so tampering in them is UNCHECKED",
+                     detail="; ".join(unhashable))
+        bad = []
+        for rel, sha in want.items():
+            f = self.wt / rel
+            try:
+                now = hashlib.sha256(f.read_bytes()).hexdigest() if f.is_file() else None
+            except Exception:
+                now = None
+            if now is None:
+                bad.append(f"{rel} (GONE)")
+            elif now != sha:
+                bad.append(rel)
+        if bad:
+            return self.add(
+                "scaffold-untouched", FAIL,
+                f"{len(bad)} scaffold file(s) changed during the run",
+                detail="; ".join(bad),
+                fix="the model edited its own task/verify/fixture -- the green "
+                    "verify proves nothing. Restore and re-dispatch with the "
+                    "scope line naming these files explicitly.")
+        return self.add("scaffold-untouched", PASS,
+                        f"all {len(want)} scaffold file(s) byte-identical: "
+                        + ", ".join(sorted(want)))
+
+    def run_review(self):
+        """POST-RUN scope audit. READ-ONLY -- never mutates the tree.
+
+        The pre-dispatch half of this tool applies a refimpl and reverts it.
+        That is exactly what must NOT happen here: this runs on a finished job's
+        tree, and the fix is the thing being reviewed.
+        """
+        if self.check_worktree() == FAIL:
+            return self.report(review=True)
+        sf = self.wt / STATE_FILE
+        lp = self.ledger_path_for(self.wt)
+        # Resolve the scope contract, PREFERRING the ledger. The ledger lives
+        # OUTSIDE the worktree, so unlike the in-tree .preflight-state.json it
+        # is not a file the finished job could have rewritten. Both are held to
+        # the declared_scope-present rule (load_state require_scope) so a
+        # non-empty but contract-less in-tree file cannot SHADOW a real contract
+        # -- the exact gap that let a model widen declared_scope and re-hash its
+        # edited fixture and pass review (HIGH2). This also back-ports the
+        # integrator's resolve_contract for the `--repo` auto-worktree flow,
+        # which carries no in-tree state but does record to the ledger.
+        in_tree = self.load_state(sf, require_scope=True) if sf.exists() else {}
+        ledger = self.load_state(lp, require_scope=True) if lp.exists() else {}
+
+        CONTRACT_KEYS = ("declared_scope", "scaffold_sha256", "baseline_commit")
+        prev, contract_source, mismatch = {}, None, False
+        if in_tree and ledger:
+            # BOTH exist: they MUST agree, or the in-tree copy has been tampered
+            # with. Audit against the authoritative ledger regardless.
+            mism = [k for k in CONTRACT_KEYS if in_tree.get(k) != ledger.get(k)]
+            prev, contract_source = ledger, f"ledger {lp.name}"
+            if mism:
+                mismatch = True
+                self.add(
+                    "contract-source", FAIL,
+                    "in-tree .preflight-state.json DISAGREES with the external "
+                    "ledger on the scope contract (contract-mismatch)",
+                    detail="mismatched field(s): " + ", ".join(mism)
+                           + " -- the in-tree copy may have been rewritten to "
+                             "widen scope or re-hash an edited fixture; auditing "
+                             "against the authoritative ledger",
+                    fix="restore or delete the in-tree state and re-review; the "
+                        "ledger outside the tree is the contract of record")
+        elif ledger:
+            prev, contract_source = ledger, f"ledger {lp.name}"
+        elif in_tree:
+            prev, contract_source = in_tree, "in-tree state"
+        if not prev:
+            self.unproven("scope-respected",
+                          f"no {STATE_FILE} and no ledger entry (with a declared "
+                          "scope) -- this tree was never gated, so there is no "
+                          "recorded scope to hold it against")
+            self.unproven("scaffold-untouched", "no gate run to compare against")
+            return self.report(review=True)
+        if not mismatch:
+            self.add("contract-source", PASS,
+                     f"scope contract resolved from {contract_source}")
+        base = prev.get("baseline_commit")
+        now = self.git("rev-parse", "HEAD")[1].strip()
+        committed = []
+        if base and now != base:
+            # HEAD moved. The scope audit below diffs the WORKING TREE against
+            # HEAD, so a model that COMMITTED an out-of-scope edit is invisible
+            # to it. Fold the committed range into the audit too (MED7).
+            self.add("same-baseline", WARN,
+                     "HEAD moved since the gate run",
+                     detail=f"gated at {base[:12]}, now {now[:12]}; also auditing "
+                            f"the committed range {base[:12]}..{now[:12]}")
+            rc, names, _ = self.git("diff", "--name-only", f"{base}..{now}")
+            if rc == 0:
+                committed = [l.strip() for l in names.splitlines() if l.strip()]
+        self.check_scope_respected(prev, committed_files=committed)
+        self.check_scaffold_untouched(prev)
+        return self.report(review=True)
+
+    def run(self):
+        if self.check_worktree() == FAIL:
+            return self.report()
+        # Before ANYTHING that touches the tree: this gate applies a refimpl,
+        # so running it inside another job's worktree can hand that job the
+        # answer mid-run.
+        if self.check_cwd_exclusive() == FAIL:
+            for cid in ("baseline-clean", "baseline-fails", "env-parity",
+                        "verify-speed", "verify-quality", "refimpl-passes",
+                        "refimpl-satisfies", "verify-relevance",
+                        "refimpl-reverted"):
+                self.unproven(cid, "not run: another active job owns this "
+                                   "tree, and this gate mutates it")
+            return self.report()
+        # Toolchain floors (gap #3) do not touch the tree and are worth naming
+        # even on a dirty baseline, so they run before baseline-clean.
+        self.check_toolchain()
+        base_ok = self.check_baseline_clean()
+        # Fold `--seal-baseline` into the GO decision (gap #2) -- needs the
+        # untracked set baseline-clean just populated.
+        self.check_harness_sealed()
+        self.check_task_shape()
+        self.check_task_unchanged()
+        self.check_required_literals()
+        self.check_heredoc_escaping()
+        self.check_spec_gap()
+        self.check_target_parses()
+        self.check_verify_shape()
+
+        if base_ok == FAIL:
+            for cid in ("baseline-fails", "env-parity", "verify-speed",
+                        "verify-quality", "refimpl-passes",
+                        "refimpl-satisfies", "verify-relevance",
+                        "refimpl-reverted"):
+                self.unproven(cid, "not run: the tree is not at baseline, so a "
+                                   "run here would prove nothing")
+            return self.report()
+
+        self.check_baseline_fails()
+        self.check_draft_confirmed()
+        self.check_scaffold_authored()
+        self.check_env_parity()
+        self.check_verify_speed()
+        self.check_verify_quality()
+        self.check_refimpl()
+        return self.report()
+
+    @staticmethod
+    def ledger_path_for(worktree) -> Path:
+        """One ledger entry per worktree path. The path is the join key the
+        gate record carries (job_cwd), so signoff.py can find it without
+        reading anything from inside the tree."""
+        key = hashlib.sha256(str(Path(worktree).resolve()).encode()).hexdigest()[:16]
+        return PREFLIGHT_LEDGER / f"{key}.json"
+
+    def write_ledger(self, st: dict):
+        """Copy the decision-bearing evidence OUTSIDE the worktree.
+
+        Best-effort and silent on failure: the ledger is an extra copy for the
+        autonomous consumer, and a gate that cannot write it must still print
+        its verdict. A missing ledger entry reads downstream as "relevance
+        never measured", which blocks auto-approve -- the safe direction.
+        """
+        try:
+            PREFLIGHT_LEDGER.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "worktree": str(self.wt),
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "verdict": st.get("verdict"),
+                "baseline_commit": st.get("baseline_commit"),
+                "declared_scope": st.get("declared_scope"),
+                "scaffold_sha256": st.get("scaffold_sha256"),
+                "untracked_before": st.get("untracked_before"),
+                "verify_failed_at_baseline": st.get("verify_failed_at_baseline"),
+                "verify_relevance": st.get("verify_relevance"),
+                "unproven": st.get("unproven"),
+                "blockers": st.get("blockers"),
+            }
+            # Atomic (LOW10): a plain write_text lets a concurrent reader
+            # (signoff.py) catch a half-written file, parse it as {}, and read
+            # "relevance never measured" -> "never gated". Write a sibling temp
+            # and os.replace it into place, which is atomic on the same fs.
+            target = self.ledger_path_for(self.wt)
+            tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
+            tmp.write_text(json.dumps(entry, indent=1))
+            os.replace(tmp, target)
+        except Exception:
+            pass
+
+    def report(self, review=False):
+        blockers = [r for r in self.results if r.status == FAIL]
+        warns = [r for r in self.results if r.status == WARN]
+        unproven = [r for r in self.results if r.status == UNPROVEN]
+        verdict = "NO-GO" if blockers else "GO"
+
+        sf = self.wt / STATE_FILE
+        try:
+            st = getattr(self, "_state", {})
+            st["verdict"] = verdict
+            st["blockers"] = [r.id for r in blockers]
+            st["unproven"] = [r.id for r in unproven]
+            # The authoritative both-ways reading, taken here BEFORE any model
+            # edit. The Research session's auto-approve needs exactly this fact
+            # and found it absent from all 85 gate records; publishing it from
+            # the one place that actually measures it beats re-deriving it
+            # downstream from a tree that has since been edited.
+            st["verify_failed_at_baseline"] = (
+                None if self.baseline_rc is None else self.baseline_rc != 0)
+            st["verify_seconds"] = self.verify_secs
+            # THE SCOPE CONTRACT (baseline_commit / declared_scope /
+            # scaffold_sha256 / untracked_before). --review later holds the
+            # finished tree against exactly this. It is only trustworthy when
+            # the tree was AT BASELINE when we hashed it: on a run where
+            # baseline-clean FAILED (a dirty or tampered tree, or a run that
+            # never reached baseline-clean), hashing the CURRENT files would pin
+            # the tampered content as the contract, and a later --review would
+            # then report the tampered scaffold "untouched" (HIGH1). So record
+            # the contract ONLY on a clean baseline; otherwise carry the PRIOR
+            # contract forward untouched. Verdict/blockers above are recorded
+            # unconditionally, so task-unchanged keeps working either way.
+            baseline_res = next(
+                (r for r in self.results if r.id == "baseline-clean"), None)
+            baseline_ok = baseline_res is not None and baseline_res.status == PASS
+            if baseline_ok:
+                # Separate try per field (LOW8): a relative_to ValueError on an
+                # absolute --target used to drop declared_scope AND
+                # scaffold_sha256 while silently keeping baseline_commit.
+                try:
+                    st["baseline_commit"] = self.git("rev-parse", "HEAD")[1].strip()
+                except Exception as e:
+                    st["baseline_commit_error"] = f"{type(e).__name__}: {e}"
+                try:
+                    st["declared_scope"] = sorted(
+                        self._rel_to_wt(f) for f in self.target_files())
+                except Exception as e:
+                    st["declared_scope_error"] = f"{type(e).__name__}: {e}"
+                try:
+                    st["scaffold_sha256"] = self.scaffold_digests()
+                except Exception as e:
+                    st["scaffold_sha256_error"] = f"{type(e).__name__}: {e}"
+                st["untracked_before"] = sorted(
+                    getattr(self, "untracked_before", set()))
+            else:
+                prior = self._prior_contract()
+                for k in ("baseline_commit", "declared_scope",
+                          "scaffold_sha256", "untracked_before"):
+                    if prior.get(k) is not None:
+                        st[k] = prior[k]
+            # A review must NEVER rewrite the scope contract it is judging
+            # against -- that would launder an out-of-scope change into the
+            # declared scope and the next review would call it clean.
+            if not review:
+                sf.write_text(json.dumps(st, indent=2) + "\n")
+                self.write_ledger(st)
+        except Exception:
+            pass
+
+        if self.a.json:
+            print(json.dumps({
+                "verdict": verdict,
+                "worktree": str(self.wt),
+                "blockers": [r.as_dict() for r in blockers],
+                "warnings": [r.as_dict() for r in warns],
+                "unproven": [r.as_dict() for r in unproven],
+                "checks": [r.as_dict() for r in self.results],
+                "verify_seconds": self.verify_secs,
+                "verify_relevance": (getattr(self, "_state", {}) or {}).get(
+                    "verify_relevance"),
+                # None means the baseline never ran -- distinct from False.
+                # Consumers MUST treat None as "unknown", never as falsy.
+                "verify_failed_at_baseline": (
+                    None if self.baseline_rc is None
+                    else self.baseline_rc != 0),
+            }, indent=2))
+            return 1 if blockers else 0
+
+        C = {PASS: "\033[32m", FAIL: "\033[1;31m", WARN: "\033[33m",
+             UNPROVEN: "\033[1;35m", SKIP: "\033[2m"} if sys.stdout.isatty() \
+            else {PASS: "", FAIL: "", WARN: "", UNPROVEN: "", SKIP: ""}
+        R = "\033[0m" if sys.stdout.isatty() else ""
+        print(f"\n{'post-run review' if review else 'pre-flight'}: {self.wt}")
+        print("-" * 72)
+        for r in self.results:
+            print(f"  {C[r.status]}[{r.status:4}]{R} {r.id:<18} {r.msg}")
+            if r.detail and r.status in (FAIL, WARN, UNPROVEN):
+                for line in _wrap(r.detail, 66):
+                    print(f"         {C[SKIP]}{line}{R}")
+            if r.fix and r.status in (FAIL, UNPROVEN):
+                for line in _wrap("fix: " + r.fix, 66):
+                    print(f"         {C[WARN]}{line}{R}")
+        print("-" * 72)
+        if blockers:
+            head = blockers[0]
+            print(f"{C[FAIL]}NO-GO{R}: {head.id} -- {head.msg}")
+            if len(blockers) > 1:
+                print(f"       plus {len(blockers)-1} more blocker(s): "
+                      + ", ".join(r.id for r in blockers[1:]))
+            if unproven:
+                print(f"       ({len(unproven)} property also UNPROVEN: "
+                      + ", ".join(r.id for r in unproven) + ")")
+            print("       do NOT merge this diff as-is."
+                  if review else "       nothing enqueued.")
+        else:
+            extra = []
+            if unproven:
+                extra.append(f"{len(unproven)} UNPROVEN")
+            if warns:
+                extra.append(f"{len(warns)} warning(s)")
+            print(f"{C[PASS]}GO{R}" + (f" -- {', '.join(extra)}" if extra else ""))
+            # Named individually, never as a count. A property nobody
+            # established is not a property that held; collapsing the two is
+            # how a gate starts certifying things it never looked at.
+            for r in unproven:
+                print(f"       {C[UNPROVEN]}UNPROVEN{R}: {r.id} -- {r.msg}")
+            if unproven:
+                print("       These were never established. If you enqueue "
+                      "anyway, a later failure on any of them is YOURS, not "
+                      "the model's.")
+            if review:
+                # A review is not an enqueue. Printing the enqueue command here
+                # would invite re-dispatching the tree you just approved.
+                # Only assert "scope held" when the audit actually RAN. If any
+                # property is UNPROVEN (e.g. a never-gated tree with no recorded
+                # contract), the scope audit did not establish anything and
+                # claiming it did is a GO line asserting a property the run
+                # never proved (MED5).
+                if unproven:
+                    print("       scope NOT established: "
+                          + ", ".join(r.id for r in unproven)
+                          + " UNPROVEN. The scope/scaffold audit did not run "
+                            "(this tree may never have been gated), so nothing "
+                            "here proves the change stayed in scope.")
+                else:
+                    print("       scope held: only the declared file(s) changed, "
+                          "and the task/verify/fixtures are untouched.")
+                print("       Still read the diff -- this proves scope, not "
+                      "correctness.")
+                return 0
+            print("\n  python3 ~/bin/ollama-queue.py enqueue --model <tag> "
+                  "--host <PIN> \\")
+            print(f"    --cwd {self.wt} \\")
+            print(f"    --task-file {self.wt / self.a.task_file} "
+                  "--task-kind coding \\")
+            print(f"    --verify {json.dumps(self.a.verify)} --num-ctx <fit> "
+                  "--max-iters 30 --label <label>")
+        return 1 if blockers else 0
+
+
+def _wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line)
+            line = w
+        else:
+            line = f"{line} {w}".strip()
+    if line:
+        out.append(line)
+    return out
+
+
+# ---- self-test ---------------------------------------------------------
+# In-process end-to-end tests. Each builds a throwaway git repo, drives the
+# gate, and asserts a specific guard bites. The two HIGH cases are written as
+# revert-tests: the assertion is one that FAILS if the fix is undone.
+_SELFTEST_DEFAULTS = dict(
+    task_file="TASK.md", verify="bash verify.sh", refimpl=None,
+    refimpl_cmd=None, no_refimpl=False, require=None, require_file=None,
+    target=None, review=False, no_relevance=False, auto_seal=False,
+    relevance_max_mutants=40, relevance_budget_s=600, json=False)
+
+_ST_TASK = """# Task: tag the function
+
+## Confirmed defect
+Observed: target.py:2 returns 1 untagged. Reproduced by running `bash verify.sh`.
+
+## Must contain
+- `FIXED_MARKER`
+
+## Loop
+Run `bash verify.sh` after every edit until it prints VERIFY_OK.
+
+## Scope
+Only edit `target.py`; do not edit verify.sh.
+"""
+
+_ST_VERIFY = """#!/usr/bin/env bash
+set -u
+fails=0
+if grep -q "FIXED_MARKER" target.py; then :; else echo "FAIL: marker absent"; fails=$((fails+1)); fi
+echo "--- $fails failed ---"
+if [ "$fails" -eq 0 ]; then echo VERIFY_OK; else exit 1; fi
+"""
+
+
+def _st_run_git(wt, *a):
+    subprocess.run(["git", "-C", str(wt), *a],
+                   capture_output=True, text=True, check=False)
+
+
+def _st_make_repo(wt):
+    wt.mkdir(parents=True, exist_ok=True)
+    (wt / "target.py").write_text("def f():\n    return 1\n")
+    (wt / "verify.sh").write_text(_ST_VERIFY)
+    (wt / "TASK.md").write_text(_ST_TASK)
+    _st_run_git(wt, "init", "-q")
+    _st_run_git(wt, "config", "user.email", "selftest@example.com")
+    _st_run_git(wt, "config", "user.name", "selftest")
+    _st_run_git(wt, "add", "-A")
+    _st_run_git(wt, "commit", "-q", "-m", "baseline")
+
+
+def _st_args(wt, **over):
+    import argparse as _ap
+    d = dict(_SELFTEST_DEFAULTS)
+    d.update(over)
+    return _ap.Namespace(worktree=str(wt), **d)
+
+
+def _st_drive(wt, review=False, **over):
+    """Run the gate (or review) in-process, capturing its stdout. Returns
+    (rc, Preflight, printed_text)."""
+    import contextlib, io
+    pf = Preflight(_st_args(wt, review=review, **over))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = pf.run_review() if review else pf.run()
+    return rc, pf, buf.getvalue()
+
+
+def _st_state(wt):
+    return json.loads((wt / STATE_FILE).read_text())
+
+
+def _self_test():
+    global PREFLIGHT_LEDGER, QUEUE_STATE
+    import tempfile, shutil as _sh
+
+    root = Path(tempfile.mkdtemp(prefix="preflight-selftest-"))
+    PREFLIGHT_LEDGER = root / "ledger"
+    QUEUE_STATE = root / "queue.json"
+    QUEUE_STATE.write_text(json.dumps({"jobs": []}))
+
+    results = []
+
+    def check(name, cond, extra=""):
+        results.append((name, bool(cond), extra))
+
+    def find(pf, cid):
+        return next((r for r in pf.results if r.id == cid), None)
+
+    try:
+        # ---- HIGH1: contract NOT rewritten on a NO-GO baseline-clean run -----
+        # Round 1: clean tree, gate records the contract. Round 2: tamper a
+        # TRACKED scaffold file so baseline-clean FAILS, re-run (not --review),
+        # and assert the recorded verify.sh digest did NOT move to the tampered
+        # one. REVERT-TEST: with the HIGH1 fix removed, report() re-hashes the
+        # current (tampered) files and this assertion goes red.
+        wt = root / "high1"
+        _st_make_repo(wt)
+        _st_drive(wt, no_refimpl=True, no_relevance=True)
+        st1 = _st_state(wt)
+        orig = (st1.get("scaffold_sha256") or {}).get("verify.sh")
+        check("HIGH1 round1 recorded a contract",
+              bool(orig) and st1.get("declared_scope") == ["target.py"],
+              f"scaffold={bool(orig)} scope={st1.get('declared_scope')}")
+        # tamper a tracked scaffold file
+        (wt / "verify.sh").write_text(_ST_VERIFY + "\n# tampered by the model\n")
+        tampered_hash = hashlib.sha256((wt / "verify.sh").read_bytes()).hexdigest()
+        rc2, pf2, _ = _st_drive(wt, no_refimpl=True, no_relevance=True)
+        st2 = _st_state(wt)
+        bclean = find(pf2, "baseline-clean")
+        check("HIGH1 round2 baseline-clean FAILED",
+              bclean is not None and bclean.status == FAIL)
+        check("HIGH1 contract carried forward, NOT rewritten from tampered tree",
+              (st2.get("scaffold_sha256") or {}).get("verify.sh") == orig
+              and orig != tampered_hash,
+              f"recorded={(st2.get('scaffold_sha256') or {}).get('verify.sh')} "
+              f"orig={orig} tampered={tampered_hash}")
+        check("HIGH1 verdict/blockers still recorded on the NO-GO",
+              st2.get("verdict") == "NO-GO"
+              and "baseline-clean" in (st2.get("blockers") or []))
+
+        # ---- HIGH2: in-tree vs ledger mismatch -> FAIL contract-mismatch -----
+        wt = root / "high2"
+        _st_make_repo(wt)
+        _st_drive(wt, no_refimpl=True, no_relevance=True)  # writes state + ledger
+        # tamper ONLY the in-tree state: widen scope, re-hash the edited fixture
+        stf = wt / STATE_FILE
+        d = json.loads(stf.read_text())
+        d["declared_scope"] = ["target.py", "evil.py"]
+        sc = dict(d.get("scaffold_sha256") or {})
+        sc["verify.sh"] = "deadbeef"
+        d["scaffold_sha256"] = sc
+        stf.write_text(json.dumps(d, indent=2))
+        rc, pfr, _ = _st_drive(wt, review=True)
+        cs = find(pfr, "contract-source")
+        check("HIGH2 review FAILs contract-mismatch when in-tree disagrees "
+              "with ledger",
+              cs is not None and cs.status == FAIL
+              and "contract-mismatch" in cs.msg)
+        check("HIGH2 review verdict is NO-GO on the mismatch",
+              any(r.status == FAIL for r in pfr.results))
+        # REVERT-TEST evidence: if instead the in-tree file matched the ledger,
+        # contract-source is PASS -- proving the FAIL is the mismatch, not noise.
+        wt_ok = root / "high2ok"
+        _st_make_repo(wt_ok)
+        _st_drive(wt_ok, no_refimpl=True, no_relevance=True)
+        rc, pfok, _ = _st_drive(wt_ok, review=True)
+        csok = find(pfok, "contract-source")
+        check("HIGH2 matching in-tree+ledger -> contract-source PASS (control)",
+              csok is not None and csok.status == PASS)
+
+        # ---- MED6: multi-file `Only edit` scope parsed fully -----------------
+        wt = root / "med6"
+        wt.mkdir()
+        (wt / "a.py").write_text("x=1\n")
+        (wt / "b.py").write_text("y=2\n")
+        pf = Preflight(_st_args(wt))
+        pf.task_text = "Intro. Only edit `a.py`, `b.py`; do not edit verify.sh.\n"
+        names = sorted(p.name for p in pf.target_files())
+        check("MED6 multi-backtick `a.py`, `b.py` -> both targets",
+              names == ["a.py", "b.py"], f"got {names}")
+        pf.task_text = "Only edit `a.py, b.py`.\n"  # comma inside one backtick
+        names2 = sorted(p.name for p in pf.target_files())
+        check("MED6 comma-in-one-backtick `a.py, b.py` -> both targets",
+              names2 == ["a.py", "b.py"], f"got {names2}")
+
+        # ---- MED5: "scope held" NOT printed while UNPROVEN -------------------
+        wt = root / "med5"
+        _st_make_repo(wt)  # never gated -> no state, no ledger entry
+        rc, pf5, out5 = _st_drive(wt, review=True)
+        check("MED5 never-gated review does NOT claim 'scope held'",
+              "scope held" not in out5)
+        check("MED5 never-gated review says scope NOT established / UNPROVEN",
+              "scope NOT established" in out5 or "UNPROVEN" in out5)
+
+        # ---- MED4 sanity: a root-level module the gate never saw -> FAIL -----
+        wt = root / "med4"
+        _st_make_repo(wt)
+        _st_drive(wt, no_refimpl=True, no_relevance=True)
+        (wt / "hashlib.py").write_text("# shadow\n")  # untracked, root-level
+        rc, pf4, _ = _st_drive(wt, review=True)
+        su = find(pf4, "scope-untracked")
+        check("MED4 new root-level hashlib.py flagged FAIL",
+              su is not None and su.status == FAIL, str(su and su.msg))
+
+        # ---- LOW12: malformed queue entry does not crash cwd-exclusive ------
+        QUEUE_STATE.write_text(json.dumps(
+            {"jobs": ["not-a-dict", {"id": None, "status": "running",
+                                     "cwd": str(root / "low12")}]}))
+        wt = root / "low12"
+        _st_make_repo(wt)
+        try:
+            rc, pf12, _ = _st_drive(wt, no_refimpl=True, no_relevance=True)
+            ce = find(pf12, "cwd-exclusive")
+            check("LOW12 cwd-exclusive survives a non-dict / null-id job",
+                  ce is not None)
+        except Exception as e:
+            check("LOW12 cwd-exclusive survives a non-dict / null-id job",
+                  False, f"raised {type(e).__name__}: {e}")
+        QUEUE_STATE.write_text(json.dumps({"jobs": []}))
+
+        # ---- LOW15: _norm_rel keeps a hidden file's dot ----------------------
+        check("LOW15 _norm_rel('./.hidden.py') keeps the dot",
+              _norm_rel("./.hidden.py") == ".hidden.py",
+              _norm_rel("./.hidden.py"))
+        check("LOW15 _norm_rel('./sub/x.py') strips only the ./",
+              _norm_rel("./sub/x.py") == "sub/x.py")
+
+        # ---- OVERCAPTURE: "do not edit `x`" tokens are NOT captured as targets
+        # The REAL scaffold scope line backticks the fixture in a "do not edit"
+        # clause; capturing those made the fixture a TARGET, which emptied
+        # fixture_py_files()/fixture_js_files() and turned spec-gap AND
+        # draft-confirmed inert on the standard shape. REVERT-TEST: undo the
+        # target_files() truncation and verify.sh/test_fixture.py reappear here.
+        wt = root / "overcapture"
+        wt.mkdir(parents=True, exist_ok=True)
+        for n in ("target.py", "verify.sh", "test_fixture.py"):
+            (wt / n).write_text("x\n")
+        pfoc = Preflight(_st_args(wt))
+        pfoc.task_text = ("Only edit `target.py`; do not edit `verify.sh`, "
+                          "`test_fixture.py` or `TASK.md`.\n")
+        oc_names = sorted(p.name for p in pfoc.target_files())
+        check("OVERCAPTURE 'do not edit' files excluded from targets",
+              oc_names == ["target.py"], f"got {oc_names}")
+
+        # ---- GAP1: draft-confirmed covers JS/TS fixtures, not just Python -----
+        # An unconfirmed .mts/.mjs draft (const DRAFT_UNCONFIRMED = true) must
+        # FAIL draft-confirmed exactly as a Python one does; a confirmed
+        # (marker-stripped) fixture must not fire it. Pure text scan -> no
+        # runtime needed, so these always run. REVERT-TEST: before the fix
+        # check_draft_confirmed never looked at .mjs/.mts, so the "bad" cases
+        # returned no result (r is None) and these assertions go red.
+        def _mk_draft(dirname, fxname, marked):
+            w = root / dirname
+            w.mkdir(parents=True, exist_ok=True)
+            (w / "verify.sh").write_text(
+                "#!/usr/bin/env bash\nnode " + fxname + "\n")
+            marker = "const DRAFT_UNCONFIRMED = true;\n" if marked else ""
+            (w / fxname).write_text(marker + "const CASES = [];\n")
+            # Scope names a target that is NOT the fixture, so target-inference
+            # cannot confound what draft-confirmed sees.
+            (w / "TASK.md").write_text("Task. Only edit `impl.ts`.\n")
+            pf = Preflight(_st_args(w))
+            pf.task_text = (w / "TASK.md").read_text()
+            pf.check_draft_confirmed()
+            return find(pf, "draft-confirmed")
+
+        for suf in ("mts", "mjs"):
+            fxname = f"verify_impl.{suf}"
+            rbad = _mk_draft(f"gap1-{suf}-bad", fxname, marked=True)
+            check(f"GAP1 unconfirmed .{suf} draft -> draft-confirmed FAILS",
+                  rbad is not None and rbad.status == FAIL,
+                  str(rbad and rbad.status))
+            rok = _mk_draft(f"gap1-{suf}-ok", fxname, marked=False)
+            check(f"GAP1 confirmed .{suf} draft -> draft-confirmed does NOT fire",
+                  rok is None, str(rok and rok.status))
+
+        # ---- GAP2: fixture_discriminates runs a JS fixture under node, not py -
+        # Lives in ollama-dispatch-draft. Before the fix a .mjs ran under
+        # sys.executable (python3) -> SyntaxError -> nonzero -> vacuous
+        # "discriminates". After: node runs it and the real exit is read, so a
+        # BENIGN .mjs (exits 0) is correctly caught as non-discriminating.
+        # Guarded on node presence -> skip-with-notice, never a false pass.
+        try:
+            from importlib.machinery import SourceFileLoader as _SFL
+            _draft = _SFL("odd_draft",
+                          str(BIN / "ollama-dispatch-draft")).load_module()
+        except Exception as e:
+            _draft = None
+            check("GAP2 ollama-dispatch-draft importable", False, str(e))
+        if _draft is not None:
+            if not shutil.which("node"):
+                results.append(
+                    ("GAP2 SKIPPED (node absent): fixture_discriminates JS "
+                     "runtime unproven here", True, "node not on PATH"))
+            else:
+                wb = root / "gap2-benign"
+                wb.mkdir(parents=True, exist_ok=True)
+                (wb / "verify_impl.mjs").write_text(
+                    "const CASES = [];\nprocess.exit(0);\n")
+                db, wdb = _draft.fixture_discriminates(wb)
+                check("GAP2 benign .mjs (exits 0 under node) -> NOT "
+                      "discriminating (was a vacuous True under python3)",
+                      db is False, f"disc={db} why={str(wdb)[:60]}")
+                wd = root / "gap2-disc"
+                wd.mkdir(parents=True, exist_ok=True)
+                (wd / "verify_impl.mjs").write_text(
+                    "const CASES = [];\nprocess.exit(1);\n")
+                dd, wdd = _draft.fixture_discriminates(wd)
+                check("GAP2 discriminating .mjs (exits 1 under node) -> "
+                      "discriminates", dd is True, f"disc={dd} why={str(wdd)[:60]}")
+
+        # ---- GAP3: .mts discrimination resolves tsx LOCALLY, and fails HONESTLY
+        # when tsx is unavailable -- never the old silent `npx --yes tsx` that
+        # needs the network and hangs/fails on the offline queue host.
+        # Lives in ollama-dispatch-draft.resolve_tsx / fixture_discriminates.
+        #  (a) tsx resolvable (vendored) -> a .mts that exits nonzero
+        #      discriminates (True). Guarded: skip-with-notice if the vendored
+        #      tsx isn't installed, so a bare checkout doesn't false-fail.
+        #  (b) tsx forced-unavailable (vendored path bogus + which() stubbed so
+        #      neither PATH-tsx nor an npx cache resolves) -> fixture_discriminates
+        #      returns None (UNPROVEN), NOT a vacuous True and NOT a network
+        #      attempt. This case ALWAYS runs. REVERT-TEST: restore the old
+        #      `else ["npx","--yes","tsx"]` and (b) would try to spawn npx
+        #      (network) instead of returning the honest None.
+        if _draft is not None:
+            tcmd, tsrc = _draft.resolve_tsx(root / "no-such-wt")
+            if tcmd is not None and not str(tsrc).startswith("npx"):
+                wm = root / "gap3-mts-disc"
+                wm.mkdir(parents=True, exist_ok=True)
+                # CASES_AUTHORED guard is how fixture_of() finds a .mts; the
+                # typed `: number` proves tsx type-strips (bare node/py can't).
+                (wm / "verify_impl.mts").write_text(
+                    "const CASES_AUTHORED: boolean = true;\nprocess.exit(1);\n")
+                dm, wdm = _draft.fixture_discriminates(wm)
+                check("GAP3 .mts (exits 1 under vendored tsx) -> discriminates "
+                      "locally, no network", dm is True,
+                      f"disc={dm} why={str(wdm)[:80]} src={tsrc}")
+            else:
+                results.append(
+                    ("GAP3 SKIPPED (local tsx absent): .mts local-discrimination "
+                     "unproven here -- run `cd ~/bin/ts-mutator && npm install`",
+                     True, f"resolve_tsx={tsrc}"))
+            # (b) honest failure when tsx is genuinely unavailable -- ALWAYS runs.
+            _saved_vendor = _draft.TSX_VENDOR
+            _saved_which = _draft.shutil.which
+            try:
+                _draft.TSX_VENDOR = root / "definitely" / "no" / "tsx"
+                _draft.shutil.which = lambda _n: None  # no PATH tsx, no npx
+                wu = root / "gap3-mts-unavail"
+                wu.mkdir(parents=True, exist_ok=True)
+                (wu / "verify_impl.mts").write_text(
+                    "const CASES_AUTHORED: boolean = true;\nprocess.exit(1);\n")
+                du, wdu = _draft.fixture_discriminates(wu)
+                check("GAP3 tsx forced-unavailable -> fixture_discriminates is "
+                      "UNPROVEN (None), not a vacuous pass or network attempt",
+                      du is None and "tsx not resolvable" in str(wdu),
+                      f"disc={du} why={str(wdu)[:80]}")
+            finally:
+                _draft.TSX_VENDOR = _saved_vendor
+                _draft.shutil.which = _saved_which
+    finally:
+        try:
+            _sh.rmtree(root)
+        except Exception:
+            pass
+
+    passed = sum(1 for _, ok, _ in results if ok)
+    total = len(results)
+    for name, ok, extra in results:
+        tag = "PASS" if ok else "FAIL"
+        line = f"  [{tag}] {name}"
+        if not ok and extra:
+            line += f"   ({extra})"
+        print(line)
+    print("-" * 60)
+    print(f"self-test: {passed}/{total} passed")
+    return 0 if passed == total else 1
+
+
+def main():
+    # Intercept --self-test before argparse, which otherwise requires the
+    # `worktree` positional. Runs the in-process guard tests and exits.
+    if "--self-test" in sys.argv[1:]:
+        return _self_test()
+    ap = argparse.ArgumentParser(
+        description="GO/NO-GO gate for an ollama dispatch worktree.",
+        epilog="exit 0 = GO, 1 = NO-GO, 2 = usage error")
+    ap.add_argument("worktree", help="worktree containing TASK.md + verify.sh")
+    ap.add_argument("--self-test", action="store_true",
+                    help="run the in-process guard self-tests and exit")
+    ap.add_argument("--task-file", default="TASK.md")
+    ap.add_argument("--verify", default="bash verify.sh")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--refimpl", help="reference-impl patch (git apply / patch -p1)")
+    g.add_argument("--refimpl-cmd", help="shell command that writes the reference "
+                                         "impl into the worktree")
+    g.add_argument("--no-refimpl", action="store_true",
+                   help="EXPLICIT WAIVER of the both-ways proof. Recorded in the "
+                        "verdict as UNPROVEN; the task may be unsatisfiable and "
+                        "you will not find out until the model has burned its "
+                        "iterations on it.")
+    ap.add_argument("--require", action="append", metavar="LITERAL",
+                    help="a literal your last edit added to the task; asserted "
+                         "present. Repeatable. This is the edit-landed guard.")
+    ap.add_argument("--require-file", help="file of --require literals, one/line")
+    ap.add_argument("--target", action="append",
+                    help="file the model is told to edit (inferred from the task "
+                         "otherwise)")
+    ap.add_argument("--review", action="store_true",
+                    help="POST-RUN audit of a finished dispatch instead of the "
+                         "pre-flight. READ-ONLY. Holds the tree against the "
+                         "scope contract the gate recorded before dispatch: "
+                         "did anything TRACKED change outside the declared "
+                         "target, and are the task/verify/fixtures still "
+                         "byte-identical. A green verify covers neither.")
+    ap.add_argument("--no-relevance", action="store_true",
+                    help="EXPLICIT WAIVER of the mutation-relevance check. "
+                         "Recorded as UNPROVEN; the dispatch can never "
+                         "auto-approve.")
+    ap.add_argument("--auto-seal", action="store_true",
+                    help="if the authored harness is not sealed into the launch "
+                         "baseline (untracked/modified in a linked worktree), "
+                         "commit it here instead of NO-GOing. Default is a loud "
+                         "NO-GO with the exact `--seal-baseline` command.")
+    ap.add_argument("--relevance-max-mutants", type=int, default=40)
+    ap.add_argument("--relevance-budget-s", type=int, default=600)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    # --review audits a FINISHED run; there is no both-ways proof to do and
+    # nothing to apply -- demanding a refimpl here would only tempt an operator
+    # into pointing a tree-mutating flag at a tree they are trying to inspect.
+    if not args.review and not (args.refimpl or args.refimpl_cmd
+                                or args.no_refimpl):
+        ap.error("the both-ways proof needs a reference impl: pass --refimpl "
+                 "<patch>, --refimpl-cmd '<cmd>', or waive it explicitly with "
+                 "--no-refimpl")
+    if args.review and (args.refimpl or args.refimpl_cmd):
+        ap.error("--review is READ-ONLY and never applies a reference impl; "
+                 "drop --refimpl/--refimpl-cmd")
+    try:
+        pf = Preflight(args)
+        return pf.run_review() if args.review else pf.run()
+    except KeyboardInterrupt:
+        print("\ninterrupted -- the worktree may still have the reference impl "
+              "applied; check `git status` before enqueuing.", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""ollama-dispatch-draft -- have a local model DRAFT the adversarial cases.
+
+WHERE THIS SITS
+---------------
+  ollama-dispatch-scaffold   emits everything except the judgment
+  ollama-dispatch-draft      drafts the judgment part, and PROVES it mechanically
+  ollama-dispatch-preflight  gates it
+  <you>                      decide whether it is RELEVANT           <- irreducible
+
+WHAT THE GATE CAN AND CANNOT DO -- read this before trusting the pipeline
+------------------------------------------------------------------------
+The gate mechanically catches a verify that does not discriminate
+(`baseline-fails`, `verify-quality`), a task that is unsatisfiable
+(`refimpl-passes`), and a verify that goes green while a "Must contain" literal
+is absent (`refimpl-satisfies`).
+
+It does NOT catch a verify that discriminates, asserts every literal, and tests
+the WRONG PROPERTY. `refimpl-satisfies` is the decidable slice of relevance, not
+relevance. Concretely, a drafted case like
+
+    is_safe({"count": 99}, True) == True
+
+fails at baseline, contains the required literal once the refimpl lands, and
+passes the ENTIRE gate -- while testing nothing about the boundary the task is
+actually about. Irrelevance is what a weak drafter produces most often.
+
+So this tool does not remove the human. It changes the job from AUTHORING cases
+to REVIEWING drafted ones -- much cheaper, same judgment -- and it enforces that
+the review happened: drafts carry DRAFT_UNCONFIRMED, the gate FAILs on it, and
+only `--confirm` removes it. A pipeline that is green because nobody looked is
+the failure this whole toolchain exists to prevent.
+
+THE LOOP IS SEPARABLE FROM THE MODEL, DELIBERATELY
+--------------------------------------------------
+`--drafter-cmd` injects any command in place of the model, so the retry logic is
+provable without a GPU -- the same reason the gate takes `--refimpl-cmd`. A loop
+whose only test needs a live model is a loop that gets tested once.
+
+  ollama-dispatch-draft <worktree>                    # dispatch to the default model
+  ollama-dispatch-draft <worktree> --rounds 3
+  ollama-dispatch-draft <worktree> --drafter-cmd './fake-drafter.sh'   # testing
+  ollama-dispatch-draft <worktree> --confirm          # after you have READ them
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DRAFT_MARK = "DRAFT_UNCONFIRMED = True"
+DRAFT_MARK_JS = "const DRAFT_UNCONFIRMED = true"
+GATE = Path.home() / "bin" / "ollama-dispatch-preflight"
+QUEUE = Path.home() / "bin" / "ollama-queue.py"
+DEFAULT_MODEL = "qwen3.8:27b-q4_K_M"
+DEFAULT_HOST = "studio"
+# Blockers the drafter itself is expected to see and must NOT treat as a bad
+# draft: the draft is unconfirmed by construction until a human confirms it.
+IGNORED_BLOCKERS = {"draft-confirmed"}
+
+# Delimiters wrapping the cases injected into a chk()-style .mts fixture, so a
+# re-draft (round 2+) REPLACES the prior injection instead of stacking a second
+# copy of the cases (the .py/.mjs path is idempotent because it regex-replaces
+# the whole `CASES = [...]` block; the .mts path has no such block to replace).
+MTS_BEGIN = "// >>> DRAFTED-CASES (auto-injected) >>>"
+MTS_END = "// <<< DRAFTED-CASES <<<"
+
+
+def _extract_chk_block(text: str):
+    """Pull the chk()-case body out of a drafter's stdout for a .mts fixture.
+
+    The .py/.mjs drafter emits a `CASES = [...]` array; the TS-symbol fixture
+    has no array -- it is a run of `chk('name', cond)` statements (optionally in
+    their own `{ ... }` scopes). Strip an optional code fence and require at
+    least one chk() call; return None if the output has no cases to splice.
+    """
+    t = text.strip()
+    t = re.sub(r"^```[A-Za-z0-9_-]*\n", "", t)
+    t = re.sub(r"\n```\s*$", "", t).strip()
+    if "chk(" not in t:
+        return None
+    return t
+
+
+DRAFT_CHECK = r'''#!/usr/bin/env python3
+"""Verify for the DRAFTING job -- run by the worker after every edit.
+
+Inverted on purpose and it is worth reading twice: this passes when the fixture
+FAILS. The tree is at the buggy baseline while drafting, so "the fixture fails"
+IS "the cases discriminate". Putting that in the worker's own verify loop means
+a benign draft gets corrected by the model itself, before anything reaches a
+human -- which is far cheaper than bouncing it at the gate and re-drafting the
+whole thing.
+"""
+import ast
+import pathlib
+import subprocess
+import sys
+
+FX = pathlib.Path("test_fixture.py")
+MIN_CASES = 6
+fails = 0
+
+src = FX.read_text()
+try:
+    tree = ast.parse(src)
+except SyntaxError as e:
+    print(f"  FAIL: {FX} does not parse: {e}")
+    print("--- 1 failed ---")
+    sys.exit(1)
+
+cases = None
+for node in tree.body:
+    if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "CASES" for t in node.targets):
+        cases = node.value
+n = len(cases.elts) if isinstance(cases, ast.List) else 0
+if n < MIN_CASES:
+    print(f"  FAIL: {n} case(s), need at least {MIN_CASES}")
+    fails += 1
+else:
+    print(f"  ok: {n} cases authored")
+
+p = subprocess.run([sys.executable, str(FX)], capture_output=True, text=True)
+out = (p.stdout + p.stderr).strip()
+if "Traceback" in out:
+    print("  FAIL: the fixture CRASHED rather than reporting failures:")
+    print("    " + out.splitlines()[-1][:200])
+    fails += 1
+elif p.returncode == 0:
+    print("  FAIL: every case PASSES on the current buggy code, so the cases")
+    print("        cannot tell a correct fix from no fix at all. Each case must")
+    print("        FAIL now and PASS after the fix. Target the exact boundary.")
+    fails += 1
+else:
+    print(f"  ok: fixture fails on the buggy code (exit {p.returncode}) -- the")
+    print("      cases discriminate")
+
+print(f"--- {fails} failed ---")
+if fails == 0:
+    print("VERIFY_OK")
+    sys.exit(0)
+sys.exit(1)
+'''
+
+DRAFT_CHECK_JS = r'''#!/usr/bin/env node
+// Verify for the DRAFTING job -- run by the worker after every edit (node).
+// Inverted on purpose, exactly like draft-check.py: this passes when the
+// fixture FAILS. The tree is at the buggy baseline while drafting, so "the
+// fixture fails" IS "the cases discriminate".
+
+import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+
+const FX = 'verify_impl.mjs';
+const MIN_CASES = 6;
+let fails = 0;
+
+let src;
+try {
+    src = readFileSync(FX, 'utf8');
+} catch (e) {
+    console.log(`  FAIL: cannot read ${FX}: ${e.message}`);
+    console.log('--- 1 failed ---');
+    process.exit(1);
+}
+
+// Count the top-level elements of CASES = [ ... ] -- commas at bracket depth 0.
+function topLevelCount(body) {
+    let depth = 0, count = 0;
+    for (const ch of body) {
+        if (ch === '[' || ch === '{' || ch === '(') depth++;
+        else if (ch === ']' || ch === '}' || ch === ')') depth--;
+        else if (ch === ',' && depth === 0) count++;
+    }
+    return body.trim() ? count + 1 : 0;
+}
+
+const m = src.match(/^\s*(?:(?:export\s+)?(?:const|let|var)\s+)?CASES\s*=\s*\[([\s\S]*?)\n\]/m);
+const n = m ? topLevelCount(m[1]) : 0;
+if (n < MIN_CASES) {
+    console.log(`  FAIL: ${n} case(s), need at least ${MIN_CASES}`);
+    fails++;
+} else {
+    console.log(`  ok: ${n} cases authored`);
+}
+
+const p = spawnSync(process.execPath, [FX], { encoding: 'utf8' });
+const out = ((p.stdout || '') + (p.stderr || '')).trim();
+if (/SyntaxError|ReferenceError/.test(out)) {
+    console.log('  FAIL: the fixture CRASHED rather than reporting failures:');
+    const lines = out.split('\n').filter((l) => l.trim());
+    console.log('    ' + (lines[lines.length - 1] || '').slice(0, 200));
+    fails++;
+} else if (p.status === 0) {
+    console.log('  FAIL: every case PASSES on the current buggy code, so the cases');
+    console.log('        cannot tell a correct fix from no fix at all. Each case must');
+    console.log('        FAIL now and PASS after the fix. Target the exact boundary.');
+    fails++;
+} else {
+    console.log(`  ok: fixture fails on the buggy code (exit ${p.status}) -- the`);
+    console.log('      cases discriminate');
+}
+
+console.log(`--- ${fails} failed ---`);
+if (fails === 0) {
+    console.log('VERIFY_OK');
+    process.exit(0);
+}
+process.exit(1);
+'''
+
+
+def sh(cmd, cwd=None, timeout=None):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                       shell=isinstance(cmd, str), timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+# The gate's OWN vendored tsx (bin/ts-mutator, `npm install -D tsx`). The gate
+# already trusts and installs bin/ts-mutator for the TS AST mutator; tsx rides
+# the same install so a fresh checkout re-obtains it with `npm ci`.
+TSX_VENDOR = Path.home() / "bin" / "ts-mutator" / "node_modules" / ".bin" / "tsx"
+
+
+def resolve_tsx(wt: Path):
+    """Resolve a runnable `tsx` command WITHOUT a silent network fetch.
+
+    Returns (cmd_prefix_list, source) when tsx is resolvable, else (None, why).
+    The old code fell straight to `npx --yes tsx`, which needs the network and
+    HANGS/FAILS on the offline queue host -- a check that cannot succeed there,
+    dressed up as a fallback. Resolution order, all local:
+      1. worktree node_modules/.bin/tsx  (the repo's own dev dep)
+      2. the gate's vendored bin/ts-mutator/node_modules/.bin/tsx
+      3. a `tsx` already on PATH
+      4. `npx --offline tsx` ONLY when a cached tsx makes an offline run
+         plausible (`--offline` forbids any fetch, so it fails fast instead of
+         hanging); never a bare networked `npx --yes tsx`.
+    When none resolve, return None + an honest cause so the caller says UNPROVEN
+    rather than vacuously passing or reaching for a network that isn't there.
+    """
+    if wt is not None:
+        local = wt / "node_modules" / ".bin" / "tsx"
+        if local.exists():
+            return [str(local)], "worktree node_modules/.bin/tsx"
+    if TSX_VENDOR.exists():
+        return [str(TSX_VENDOR)], "gate vendored bin/ts-mutator/node_modules/.bin/tsx"
+    onpath = shutil.which("tsx")
+    if onpath:
+        return [onpath], "tsx on PATH"
+    if shutil.which("npx"):
+        import glob as _glob
+        cache = Path.home() / ".npm" / "_npx"
+        if _glob.glob(str(cache / "*" / "node_modules" / ".bin" / "tsx")):
+            return ["npx", "--offline", "tsx"], "npx --offline tsx (cached)"
+    return None, ("tsx not resolvable locally and no network -- install tsx "
+                  "(npm install -D tsx in the repo, or `cd ~/bin/ts-mutator && "
+                  "npm install` for the gate's vendored copy)")
+
+
+def fixture_of(wt: Path):
+    for name in ("test_fixture.py",):
+        if (wt / name).is_file():
+            return wt / name
+    for p in sorted(wt.glob("*.py")):
+        if "CASES" in p.read_text(errors="replace"):
+            return p
+    # JS / .mjs fixtures (TypeScript/JS dispatches): named lookup first, then a
+    # glob fallback keyed on CASES -- same shape as the Python lookups above.
+    for name in ("verify_impl.mjs",):
+        if (wt / name).is_file():
+            return wt / name
+    for p in sorted(wt.glob("*.mjs")) + sorted(wt.glob("*.js")):
+        if "CASES" in p.read_text(errors="replace"):
+            return p
+    # TS symbol fixture (.mts): a chk('name', cond) block list guarded by
+    # CASES_AUTHORED, NOT a `CASES = [...]` array -- so it is keyed on the guard,
+    # not on "CASES" alone (which the surrounding prose also contains).
+    for name in ("verify_impl.mts",):
+        if (wt / name).is_file():
+            return wt / name
+    for p in sorted(wt.glob("*.mts")):
+        if "CASES_AUTHORED" in p.read_text(errors="replace"):
+            return p
+    return None
+
+
+def gate(wt: Path, refimpl_cmd=None):
+    """Run the real gate, --json. Returns (verdict, blocker_ids, raw).
+
+    --auto-seal: the harness-sealed gate check (preflight, 2026-09-11) postdates
+    this tool. On a --repo linked worktree the authored harness is untracked at
+    draft time (scaffold seals LATE, by design), so without --auto-seal the gate
+    NO-GOs on `harness-sealed` every round -- and `refimpl-passes` fails as a
+    knock-on (no clean baseline to run the both-ways proof against), so the
+    drafter can never converge and burns rounds on a harness issue it cannot fix.
+    --auto-seal commits the drafted harness (target stays buggy -> baseline still
+    RED for the right reason), which is the seal the operator does next anyway;
+    on an already-sealed tree it is a no-op, so direct callers are not regressed."""
+    cmd = [sys.executable, str(GATE), str(wt), "--json", "--auto-seal"]
+    cmd += (["--refimpl-cmd", refimpl_cmd] if refimpl_cmd else ["--no-refimpl"])
+    rc, out, err = sh(cmd)
+    try:
+        data = json.loads(out)
+    except Exception:
+        return "PARSE-ERROR", [], out + err
+    ids = [b["check"] for b in data.get("blockers", [])]
+    return data.get("verdict"), ids, data
+
+
+def fixture_discriminates(wt: Path):
+    """Does the FIXTURE ALONE fail on the buggy tree?
+
+    `baseline-fails` asks whether the whole verify fails at baseline, and in a
+    generated scaffold it always does -- `check_literals.py` fails until the fix
+    lands, and the counting idiom ORs the sections together. So a completely
+    BENIGN set of cases (every one passing on the buggy code) still leaves the
+    verify red at baseline, `baseline-fails` passes for the wrong reason, and
+    the gate green-lights a draft that tests nothing.
+
+    Found the first time this loop ran: it accepted `is_safe({"count": 99},
+    True) == True` and friends. So the drafter asks the narrower question the
+    gate cannot: run the fixture BY ITSELF against the untouched tree, and
+    require it to fail. That is the behavioural half of the both-ways proof,
+    isolated.
+    """
+    fx = fixture_of(wt)
+    if not fx:
+        return None, "no fixture to run"
+    # Each fixture must run under ITS OWN runtime, or the check is inert:
+    #   .py            -> python3 (sys.executable)
+    #   .mts/.ts       -> tsx (type-strips and resolves the typed import that
+    #                    bare python3/node cannot), resolved LOCALLY by
+    #                    resolve_tsx(). If tsx is genuinely unavailable we return
+    #                    None (UNPROVEN) -- an honest "could not run" -- rather
+    #                    than the old silent `npx --yes tsx`, which needs the
+    #                    network and hangs/fails on the offline queue host.
+    #   .mjs/.js/...   -> node. Running a JS file under sys.executable (python3)
+    #                    is a guaranteed SyntaxError -> nonzero exit -> the check
+    #                    read a VACUOUS "fails at baseline = True" and NEVER
+    #                    executed the cases, so a benign JS draft sailed through.
+    suffix = fx.suffix
+    if suffix in (".mts", ".ts"):
+        tsx_cmd, tsx_src = resolve_tsx(wt)
+        if tsx_cmd is None:
+            return None, tsx_src  # honest UNPROVEN, never a vacuous pass/network
+        run_cmd = tsx_cmd + [str(fx)]
+    elif suffix in (".mjs", ".js", ".jsx", ".cjs"):
+        node = shutil.which("node")
+        if not node:
+            return None, ("node is not on PATH -- cannot run the JS fixture to "
+                          "test discrimination")
+        run_cmd = [node, str(fx)]
+    else:
+        run_cmd = [sys.executable, str(fx)]
+    rc, out, err = sh(run_cmd, cwd=wt, timeout=300)
+    if rc == 0:
+        return False, ("every drafted case PASSES on the buggy code, so the "
+                       "cases prove nothing. " + (out.strip()[-200:] or ""))
+    return True, f"fixture alone fails at baseline (exit {rc}), as it must"
+
+
+def draft_prompt(wt: Path, feedback=None):
+    """The instruction handed to the drafter.
+
+    Deliberately NOT 'write a test that passes'. A drafter optimising for a
+    green verify writes the benign case every time -- that is the whole failure
+    mode. It is asked for cases a WRONG fix would fail.
+    """
+    task = (wt / "TASK.md").read_text(errors="replace")
+    fx = fixture_of(wt)
+    body = fx.read_text(errors="replace") if fx else ""
+    p = f"""Author the adversarial test cases for this dispatch.
+
+You are NOT fixing the code. You are writing the CASES list that decides whether
+someone else's fix is correct.
+
+--- TASK.md ---
+{task}
+--- end TASK.md ---
+
+--- {fx.name if fx else 'fixture'} (fill in CASES) ---
+{body}
+--- end fixture ---
+
+Write the cases in this shape. It is taken from three fixtures that caught real
+bugs in this codebase, NOT from a style guide:
+
+  1. THE POSITIVE CASE -- the thing the fix is supposed to start doing.
+  2. THE BOUNDARY, AND ONE CASE ON EACH SIDE OF IT. For a threshold: just under,
+     exactly at, just over. This is what a plausible WRONG fix (an off-by-one)
+     fails.
+  3. THE SAFETY / NO-EVIDENCE CASE -- the load-bearing one. When the input gives
+     no grounds to act, the code must DO NOTHING rather than guess. A real
+     example from this codebase: a season pack in a season with no
+     single-keeper evidence must NEVER be selected, because it could be the
+     only copy. Ask "what is the destructive thing this could do on thin
+     evidence?" and pin it.
+  4. THE AMBIGUITY CASE -- more than one candidate must return None/[], not an
+     arbitrary pick. Zero candidates likewise.
+  5. THE OVER-BROADENING CONTROL -- a near-miss input that must NOT be affected.
+     A fix that strips a year from "(2023)" must not touch "1923" (a title that
+     IS a year) or "(us)" (a non-year parenthetical). Without this, an
+     over-eager fix passes.
+  6. DEGENERATE INPUTS -- missing key, None, empty, wrong type, a value with no
+     recognisable token at all. These must NOT raise. A raising case counts as
+     a failure, which makes a broken fixture look discriminating.
+  7. IDEMPOTENCE / PRESERVATION -- if the change is additive, the original must
+     survive it.
+  8. CASE-INSENSITIVITY where identifiers are compared, if the task involves
+     matching.
+  9. THE REGRESSION HALF -- behaviour that already works and must keep working.
+
+Hard rules:
+  * Every case must FAIL on the current buggy code and PASS on a correct fix,
+    EXCEPT the regression half (7-9), which passes both ways on purpose.
+    A case that passes on the buggy code and is not a regression case proves
+    nothing.
+  * At least 6 cases. Keep the existing tuple shape exactly.
+  * Do not invent behaviour the task does not ask for.
+
+Output ONLY the replacement CASES list, starting with `CASES = [` and ending
+with `]`. No prose, no code fences, no other edits.
+"""
+    # INTEGRATION fixtures: when the task (or the fixture skeleton) drives a web
+    # app rather than a pure function, the cases still fit the (desc, thunk,
+    # want) tuple shape -- the thunk just makes a request and returns the part
+    # being asserted -- so this is guidance only, no change to how CASES are
+    # spliced. Keeps a FastAPI/HTTP dispatch from getting a pure-function case
+    # list that never touches a route.
+    hay = (task + "\n" + body).lower()
+    if re.search(r"fastapi|starlette|httpx|testclient|\bwsgi\b|\basgi\b|flask|"
+                 r"endpoint|\broute\b|http\s|status[_ ]?code|/[a-z0-9_]+\s", hay):
+        p += """
+THIS IS AN INTEGRATION FIXTURE (it drives an app through a client, not a pure
+function). Keep the (desc, thunk, want) tuple shape, but each thunk makes a real
+request and returns the slice you assert:
+  * status codes: ("GET /health -> 200", lambda: client.get("/health").status_code, 200)
+  * response bodies: ("health body", lambda: client.get("/health").json()["status"], "ok")
+  * the UNHAPPY paths -- a missing/invalid/oversized input must return the RIGHT
+    4xx (422/400/404/409), NOT a 500 and NOT a silent 200. A wrong build that
+    500s or accepts junk is exactly what a happy-path-only fixture misses.
+  * auth/permission if the contract implies it (401/403 without a valid token).
+  * assert the SHAPE of an error body where the contract names one, not only the
+    code. Reuse the client/app the fixture skeleton already sets up; do not spin
+    up a second one.
+"""
+    if feedback:
+        p += f"""
+YOUR PREVIOUS DRAFT WAS REJECTED BY THE GATE:
+{feedback}
+Fix that specifically. A rejected draft usually means the cases pass on the
+buggy code, or they do not exercise what the task asked for.
+"""
+    return p
+
+
+def _apply_cases_mts(fx: Path, text: str):
+    """Splice drafted chk() cases into a TS-symbol .mts fixture. Returns (ok, why).
+
+    The .mts fixture is a run of `chk('name', cond)` statements guarded by
+    `const CASES_AUTHORED = false;` (which prints SCAFFOLD_INCOMPLETE and exits
+    until real cases exist). Inject the cases into the authored region, flip the
+    guard true so they RUN, and stamp the JS unconfirmed-draft marker. The
+    fixture's own `if (checks < 3)` floor still enforces the >= 3 case count.
+    """
+    block = _extract_chk_block(text)
+    if not block:
+        return False, ("drafter output contained no chk(...) case statements "
+                       "(a .mts symbol fixture expects chk() cases, not a "
+                       "`CASES = [...]` array)")
+    body = fx.read_text(errors="replace")
+    if "CASES_AUTHORED" not in body:
+        return False, f"{fx.name} has no CASES_AUTHORED guard to author against"
+    comment = "// Model-drafted; NOT yet read by a human."
+    region = f"{MTS_BEGIN}\n{comment}\n{DRAFT_MARK_JS};\n{block}\n{MTS_END}"
+    if MTS_BEGIN in body and MTS_END in body:
+        # round 2+: replace the prior injection rather than stack a second copy.
+        body = re.sub(re.escape(MTS_BEGIN) + r".*?" + re.escape(MTS_END),
+                      lambda _: region, body, count=1, flags=re.S)
+    else:
+        # Insert just before the guard so the cases are in scope before the
+        # CASES_AUTHORED check. Anchor on the DELETE-THIS-BLOCK banner, falling
+        # back to the guard declaration itself.
+        anchor = "// >>> DELETE THIS BLOCK once"
+        idx = body.find(anchor)
+        if idx == -1:
+            idx = body.find("const CASES_AUTHORED")
+        if idx == -1:
+            return False, f"{fx.name}: no guard to anchor the cases before"
+        body = body[:idx] + region + "\n\n" + body[idx:]
+    if "const CASES_AUTHORED = false;" in body:
+        body = body.replace("const CASES_AUTHORED = false;",
+                            "const CASES_AUTHORED = true;", 1)
+    fx.write_text(body)
+    n = block.count("chk(")
+    return True, f"spliced {n} chk() case(s) into {fx.name}"
+
+
+def apply_cases(wt: Path, text: str):
+    """Splice a drafted CASES list into the fixture. Returns (ok, why)."""
+    fx = fixture_of(wt)
+    if not fx:
+        return False, "no fixture file found"
+    if fx.suffix == ".mts":
+        return _apply_cases_mts(fx, text)
+    m = re.search(r"CASES\s*=\s*\[.*?^\]", text, re.S | re.M)
+    if not m:
+        return False, "drafter output contained no `CASES = [ ... ]` block"
+    new_cases = m.group(0)
+    body = fx.read_text(errors="replace")
+    if not re.search(r"^CASES\s*=\s*\[.*?^\]", body, re.S | re.M):
+        return False, f"{fx.name} has no CASES block to replace"
+    body = re.sub(r"^CASES\s*=\s*\[.*?^\]", lambda _: new_cases, body,
+                  count=1, flags=re.S | re.M)
+    # JS / .mjs fixtures get the `//` comment and the JS marker -- never the
+    # Python `#` comment or the Python marker.
+    is_js = fx.suffix in (".mjs", ".js")
+    mark = DRAFT_MARK_JS if is_js else DRAFT_MARK
+    comment = ("// Model-drafted; NOT yet read by a human." if is_js
+               else "# Model-drafted; NOT yet read by a human.")
+    if mark not in body:
+        body = body.replace(
+            "CASES = [",
+            f"{comment}\n{mark}\n\nCASES = [",
+            1)
+    fx.write_text(body)
+    n = len([l for l in new_cases.splitlines()
+             if l.strip().startswith("(")])
+    return True, f"spliced {n} case(s) into {fx.name}"
+
+
+def run_drafter(wt: Path, prompt: str, a):
+    """Produce a draft. Returns (mode, payload, why).
+
+    mode "stdout"  -- --drafter-cmd: its stdout is the CASES block to splice.
+    mode "inplace" -- the queue: the worker EDITED the fixture itself.
+
+    The queue worker is an AGENTIC FILE-EDITING LOOP, not a text generator, and
+    the first live run cost a job proving it. Given --max-iters 1 the model
+    spent its one iteration on list_files + read_file and never answered:
+    "DID NOT CONVERGE after 1 iterations". Asking it for stdout was the wrong
+    shape entirely. So it is now given the job it is actually built for -- edit
+    the file, run a verify, iterate -- and the draft is read from the FILE.
+    """
+    if a.drafter_cmd:
+        rc, out, err = sh(a.drafter_cmd, cwd=wt, timeout=a.timeout)
+        if rc != 0:
+            return None, None, f"--drafter-cmd exited {rc}: {err.strip()[-300:]}"
+        return "stdout", out, "drafter-cmd"
+
+    # JS / .mjs fixtures get the node draft-check; Python keeps python3.
+    fx = fixture_of(wt)
+    is_js = bool(fx and fx.suffix in (".mjs", ".js"))
+    if is_js:
+        (wt / "draft-check.mjs").write_text(DRAFT_CHECK_JS)
+        verify_cmd = "node draft-check.mjs"
+    else:
+        (wt / "draft-check.py").write_text(DRAFT_CHECK)
+        verify_cmd = "python3 draft-check.py"
+    pf = wt / "DRAFT-TASK.md"
+    pf.write_text(prompt)
+    # Studio work goes through the queue, never a direct API call.
+    cmd = [sys.executable, str(QUEUE), "enqueue", "--model", a.model,
+           "--host", a.host, "--cwd", str(wt), "--task-file", str(pf),
+           "--task-kind", "coding", "--num-ctx", str(a.num_ctx),
+           "--verify", verify_cmd,
+           "--max-iters", str(a.max_iters), "--label", f"draft-{wt.name}"]
+    rc, out, err = sh(cmd)
+    if rc != 0:
+        return None, None, f"enqueue failed: {err.strip()[-300:]}"
+    m = re.search(r"\b([0-9a-f]{12})\b", out) or re.search(r"\b([0-9a-f]{8,})\b", out)
+    if not m:
+        return None, None, f"could not read a job id from: {out.strip()[:200]}"
+    job = m.group(1)
+    print(f"    queued {job} (verify: the fixture must FAIL on the buggy tree)")
+    deadline = time.time() + a.timeout
+    last = None
+    while time.time() < deadline:
+        time.sleep(15)
+        row = job_row(job)
+        if not row:
+            continue
+        st = row.get("status")
+        if st != last:
+            print(f"    {job}: {st}")
+            last = st
+        if st in ("done", "failed", "cancelled"):
+            if st != "done":
+                log = row.get("log_path") or ""
+                tail = ""
+                if log and Path(log).is_file():
+                    tail = Path(log).read_text(errors="replace").strip()[-400:]
+                return None, None, f"job {job} {st} (exit {row.get('exit_code')})\n{tail}"
+            return "inplace", None, f"job {job} done"
+    return None, None, f"job {job} did not finish within {a.timeout}s"
+
+
+def job_row(job):
+    """The queue's own state file -- `status --json` is not a stable contract."""
+    try:
+        d = json.loads((Path.home() / "bin" / "ollama-queue-state.json")
+                       .read_text())
+        jobs = d.get("jobs") or []
+        return next((j for j in jobs if str(j.get("id")).startswith(job)), None)
+    except Exception:
+        return None
+
+
+def mark_drafted(wt: Path):
+    """Stamp an in-place edit as an unconfirmed draft."""
+    fx = fixture_of(wt)
+    if not fx:
+        return False, "no fixture file found"
+    # JS / .mjs fixtures get the `//` comment and the JS marker -- never the
+    # Python `#` comment or the Python marker.
+    is_js = fx.suffix in (".mjs", ".js")
+    mark = DRAFT_MARK_JS if is_js else DRAFT_MARK
+    comment = ("// Model-drafted; NOT yet read by a human." if is_js
+               else "# Model-drafted; NOT yet read by a human.")
+    body = fx.read_text(errors="replace")
+    if mark in body:
+        return True, f"{fx.name} already marked as an unconfirmed draft"
+    new_body = re.sub(r"^CASES\s*=\s*\[",
+                      f"{comment}\n{mark}\n\nCASES = [",
+                      body, count=1, flags=re.M)
+    # VERIFY the marker landed. re.sub is a no-op when the pattern misses (e.g.
+    # CASES indented inside a function, so `^CASES` never matches), and the
+    # first version then wrote the file back unchanged and returned
+    # "marked ... as an unconfirmed draft". That is the worst possible lie
+    # here: the gate's draft-confirmed check keys on this marker, so an
+    # unreviewed model-drafted fixture would sail through to GO and the ONE
+    # invariant this tool exists to enforce -- a human read the cases -- would
+    # be silently off.
+    if mark not in new_body:
+        return False, (f"could not mark {fx.name}: no top-level `CASES = [` to "
+                       f"anchor on. Add `{mark}` by hand before gating, "
+                       "or the draft-confirmed check cannot fire.")
+    fx.write_text(new_body)
+    return True, f"marked {fx.name} as an unconfirmed draft"
+
+
+def cmd_confirm(wt: Path):
+    """Remove the marker. The one step that says a human read the cases."""
+    touched = []
+    files = (list(wt.glob("*.py")) + list(wt.glob("*.mjs"))
+             + list(wt.glob("*.js")) + list(wt.glob("*.mts"))
+             + [wt / "TASK.md"])
+    for p in files:
+        try:
+            text = p.read_text(errors="replace") if p.is_file() else ""
+            if DRAFT_MARK in text or DRAFT_MARK_JS in text:
+                b = p.read_text()
+                b = "\n".join(l for l in b.splitlines()
+                              if DRAFT_MARK not in l
+                              and DRAFT_MARK_JS not in l
+                              and l.strip() != "# Model-drafted; NOT yet read by a human."
+                              and l.strip() != "// Model-drafted; NOT yet read by a human.")
+                p.write_text(b + ("\n" if not b.endswith("\n") else ""))
+                touched.append(p.name)
+        except Exception:
+            pass
+    if not touched:
+        print("nothing to confirm -- no unconfirmed drafts in this worktree")
+        return 1
+    print("confirmed (you are now the reason these cases are trusted): "
+          + ", ".join(touched))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Draft adversarial cases with a local model; the gate "
+                    "bounces bad drafts, you judge relevance.")
+    ap.add_argument("worktree")
+    ap.add_argument("--confirm", action="store_true",
+                    help="you have READ the drafted cases: remove the marker")
+    ap.add_argument("--rounds", type=int, default=3,
+                    help="how many times to re-draft on a gate bounce")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--num-ctx", type=int, default=32768)
+    ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--max-iters", type=int, default=8,
+                    help="worker iterations per draft. 1 is NOT "
+                         "enough -- the worker spends early ones "
+                         "exploring with list_files/read_file.")
+    ap.add_argument("--refimpl-cmd",
+                    help="passed through to the gate for the both-ways proof")
+    ap.add_argument("--drafter-cmd",
+                    help="run this instead of dispatching a model; its stdout "
+                         "is the draft. Exists so the retry loop is provable "
+                         "without a GPU.")
+    a = ap.parse_args()
+    wt = Path(a.worktree).expanduser().resolve()
+    if not wt.is_dir():
+        ap.error(f"{wt} is not a directory")
+    if a.confirm:
+        return cmd_confirm(wt)
+    if not (wt / "TASK.md").is_file():
+        ap.error(f"no TASK.md in {wt} -- scaffold it first")
+
+    feedback = None
+    for rnd in range(1, a.rounds + 1):
+        print(f"\n=== draft round {rnd}/{a.rounds} ===")
+        mode, payload, how = run_drafter(wt, draft_prompt(wt, feedback), a)
+        if mode is None:
+            print(f"  drafter failed: {how}")
+            return 2
+        print(f"  {how}")
+        if mode == "stdout":
+            ok, why = apply_cases(wt, payload)
+            print(f"  {why}")
+            if not ok:
+                feedback = f"Your output was unusable: {why}"
+                continue
+        else:
+            ok, why = mark_drafted(wt)
+            print(f"  {why}")
+            if not ok:
+                # Proceeding would hand back a draft the gate cannot flag as
+                # unconfirmed -- i.e. an unreviewed draft that can reach GO.
+                return 2
+        # The narrow question the gate cannot ask -- BEFORE the gate, because a
+        # benign draft is the common failure and this is the cheap test for it.
+        disc, why_disc = fixture_discriminates(wt)
+        if disc is False:
+            print(f"  benign draft: {why_disc}")
+            feedback = (
+                "Every case you wrote PASSES on the current buggy code, so none "
+                "of them can tell a correct fix from no fix at all. Each case "
+                "must FAIL now and PASS after the fix. Target the exact "
+                "boundary in the task.")
+            continue
+        print(f"  {why_disc}")
+        verdict, blockers, data = gate(wt, a.refimpl_cmd)
+        real = [b for b in blockers if b not in IGNORED_BLOCKERS]
+        if not real:
+            print(f"  gate: {verdict} (ignoring draft-confirmed, which is "
+                  "expected until you confirm)")
+            fx = fixture_of(wt)
+            print("\n" + "-" * 72)
+            print("DRAFTED, MECHANICALLY CLEAN, AND NOT YET TRUSTED.")
+            print("-" * 72)
+            if fx:
+                m = re.search(r"^CASES\s*=\s*\[.*?^\]", fx.read_text(),
+                              re.S | re.M)
+                if m:
+                    print(m.group(0))
+            print("-" * 72)
+            print("The gate proved these DISCRIMINATE. It cannot prove they are")
+            print("RELEVANT -- a case that fails at baseline and asserts every")
+            print("literal can still test the wrong property entirely.")
+            print("\nRead each one and ask: could this pass on broken work?")
+            print(f"  then:  ollama-dispatch-draft {shlex.quote(str(wt))} --confirm")
+            print(f"  or:    re-run to draft again, or author them yourself")
+            return 0
+        detail = "; ".join(
+            f"{b['check']}: {b['message']}"
+            for b in data.get("blockers", [])
+            if b["check"] not in IGNORED_BLOCKERS)
+        print(f"  gate bounced: {', '.join(real)}")
+        feedback = detail
+    print(f"\n{a.rounds} rounds, still bouncing. The gate is doing its job -- "
+          "this\ndrafter is not converging on this task. Author the cases "
+          "yourself, or\nre-run with a stronger --model.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

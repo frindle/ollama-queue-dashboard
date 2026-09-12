@@ -1,0 +1,2644 @@
+#!/usr/bin/env python3
+"""ollama-dispatch-scaffold -- emit a dispatch scaffold, minus the judgment.
+
+WHY THIS EXISTS
+---------------
+`ollama-dispatch-preflight` automated the GATE. The SCAFFOLD was still
+hand-written every dispatch: worktree, TASK.md sections, the venv/Package
+bootstrap, the counting-idiom verify, the fixture harness, the refimpl. That is
+the bulk of the per-dispatch typing and none of it is judgment -- it is the same
+five files with different nouns, and hand-typing them is how a required section
+goes missing and the failure then reads as model incapacity.
+
+THE ONE THING IT DELIBERATELY DOES NOT DO
+-----------------------------------------
+It does not author the adversarial assertions, and it does NOT emit a scaffold
+that passes the gate.
+
+That is the whole design, not a limitation. A generator that emitted a
+gate-passing scaffold would let an operator skip the only step that cannot be
+mechanised: deciding what makes a verify RELEVANT rather than merely
+discriminating. A benign fixture (flag=True, count=99) discriminates change and
+certifies broken work; picking the inputs that separate "did the job" from
+"made the test go green" is the judgment this whole toolchain exists to
+protect. So the emitted fixture has an EMPTY case list and the verify exits 1
+with SCAFFOLD_INCOMPLETE until a human fills it in. The gate will NO-GO, loudly
+and by name, and that NO-GO is the generator working correctly.
+
+Pipeline:  scaffold  ->  you author the adversarial cases  ->  gate  ->  enqueue
+
+  ollama-dispatch-scaffold --label fix-foo --repo ~/src/proj --lang python \\
+      --target app/thing.py --entry-point app/thing.py:88 \\
+      --defect "confirmed: X returns Y; observed by running Z" \\
+      --property "X must return W for the boundary inputs"
+
+  ollama-dispatch-scaffold --label usagebar --new-project ~/scratch/usagebar \\
+      --lang swift --target Sources/Core/Parser.swift
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+SCAFFOLD_MARK = "SCAFFOLD_INCOMPLETE"
+LANGS = ("python", "swift", "typescript", "ts", "js", "javascript")
+# ts/js/javascript are aliases -- one tsx-based harness serves them all (tsx
+# type-strips .ts/.mts and runs .js/.mjs unchanged).
+LANG_ALIASES = {"ts": "typescript", "js": "typescript", "javascript": "typescript"}
+
+# The TS/JS sidecars live next to this script (bin/ts-mutator/). ts-parse is the
+# ast.parse analogue used as a best-effort syntax floor in the TS verify (tsc
+# --noEmit is the authoritative parse+type check). ts-extract is no longer used
+# by the scaffold -- the fixture now imports the REAL exported symbol under tsx
+# rather than re-extracting a span to run in isolation.
+SCRIPT_DIR = Path(__file__).resolve().parent
+TS_PARSE = SCRIPT_DIR / "ts-mutator" / "ts-parse.mjs"
+
+# suffixes build_ts / the TS verify treat as TS/JS
+TS_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+
+
+def sh(cmd, cwd=None):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+def _safe_branch(label: str) -> str:
+    """A git-legal branch name derived from --label. A worktree cut at a detached
+    HEAD (`worktree add <dest> HEAD`) has no branch, so seal_baseline and the
+    model's fix commit land on an unreachable ref that `worktree remove`/`prune`
+    orphans for gc -- and the integrate tool assumes a real `dispatch/<slug>`
+    branch. Sanitize to git's ref rules: no `..`, no leading/trailing `-` `.`
+    `/`, no forbidden metachars."""
+    s = re.sub(r"[^A-Za-z0-9._/-]", "-", label)
+    s = re.sub(r"\.{2,}", ".", s)
+    s = re.sub(r"/{2,}", "/", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = s.strip("-./")
+    return "dispatch/" + (s or "scaffold")
+
+
+def _worktree_scratch_default(label: str) -> Path:
+    """Default worktree location. NOT $TMPDIR: on macOS that is
+    /var/folders/.../T, which the OS purges after ~3 days -- a dispatch that sat
+    over a long weekend would vanish mid-review. Under a stable scratch dir the
+    help text already advertises ("under the scratchpad"); override with
+    OLLAMA_DISPATCH_WORKTREES."""
+    base = os.environ.get("OLLAMA_DISPATCH_WORKTREES")
+    root = Path(base).expanduser() if base else \
+        Path.home() / ".ollama-dispatch" / "worktrees"
+    return root / f"wt-{label}"
+
+
+def _remove_worktree(repo: Path, dest: Path, branch: str | None = None):
+    """Undo a `git worktree add` so a retry is clean. `git worktree add` refuses
+    an already-registered path, and the old --force never removed/pruned, so a
+    failure after creation wedged every retry. Remove + prune (+ delete the
+    branch we created) makes re-running idempotent."""
+    sh(["git", "-C", str(repo), "worktree", "remove", "--force", str(dest)])
+    sh(["git", "-C", str(repo), "worktree", "prune"])
+    if branch:
+        sh(["git", "-C", str(repo), "branch", "-D", branch])
+
+
+def _tsc_target_grep(target: str) -> str:
+    """A shell-quoted ERE that matches a tsc error line for THIS target and not a
+    sibling that shares its prefix. `grep -F 'app/foo.ts'` is a substring match,
+    so a tsc error in `app/foo.tsx` false-FAILs as in-target. tsc prints
+    `path(line,col):` (or `path:line:col:`), so anchor on the target followed by
+    `(` or `:`, with the path metachars regex-escaped."""
+    return shlex.quote(re.escape(target) + "[(:]")
+
+
+# ---------------------------------------------------------------------------
+# TASK.md -- every section the gate's `task-shape` check requires, with the
+# judgment parts marked TODO rather than invented. A plausible-looking invented
+# defect is worse than a blank one: it reads as confirmed when nobody confirmed
+# it.
+# ---------------------------------------------------------------------------
+def task_md(a):
+    defect = a.defect or (
+        "TODO -- state the CONFIRMED defect: the observed symptom and how you\n"
+        "verified it. Not a suspected mechanism, not a named culprit. If you\n"
+        "have not actually reproduced it, stop and reproduce it first: a task\n"
+        "asserting a defect that does not exist still gets you a change.")
+    entry = a.entry_point or f"TODO -- {a.target}:<line>"
+    prop = a.property or (
+        "TODO -- state the property the change must satisfy, behaviourally.")
+    # Scope line: a --ts-runner node-test fix SPANS MULTIPLE files, so the
+    # single --target cannot express the editable set and `scope-respected`
+    # false-fails the very mode that exists for multi-file fixes. Allow extra
+    # in-scope files (--edit-file, node-test only) to be declared here.
+    scope_files = [a.target] + [f for f in getattr(a, "edit_file", []) or []
+                                if f != a.target]
+    scope_edit = ", ".join(f"`{f}`" for f in scope_files)
+    # `## Test environment` naming any import-time env vars verify.sh exports --
+    # empty for non-TS or when nothing was detected. Named here so the spec-gap
+    # check does not flag the vars the bootstrap sets (auto-export -> auto-name).
+    env_section = _ts_test_env_section(a)
+    return f"""# TASK: {a.label}
+
+## Confirmed defect (observed, not suspected)
+
+{defect}
+
+## Entry point
+
+{entry}
+
+## Required change
+
+{prop}
+
+Behaviour that must NOT change:
+- TODO -- list what must still hold. This is where regressions get caught: the
+  verify's non-adversarial half exists to pin these, and a fix that breaks one
+  should turn them red.
+
+## Must contain
+
+- `TODO -- a literal token the correct change necessarily introduces`
+
+(The gate holds the reference impl against this list. If the verify goes green
+while one of these is absent from the changed files, the verify does not
+enforce the spec -- that is a benign verify, caught mechanically.)
+
+(A bare bullet checks the default target. To PIN a literal to a specific file --
+useful when a fix spans a helper file and the route/wiring that calls it --
+prefix the bullet with `in <path>:`, e.g.
+`- in app/api/x/route.ts: ` followed by a backtick-quoted token. Then that
+token is required in THAT file, not the target.)
+
+## Scope
+
+Only edit {scope_edit}; do not edit `verify.sh`, `{a.fixture_rel}` or `TASK.md`.
+{a.fixture_rel} is the test fixture -- changing it invalidates the check.
+
+{env_section}## Keep every changed line exercised (relevance)
+
+After the job runs, a mutation check flips/deletes each line you changed and
+asks the verify to catch it. A changed line whose every mutant survives --
+because no test asserts it -- FAILS the gate even when the fix is correct, and
+the review never runs. So do NOT emit an isolated, untested line:
+- Fold an unavoidable constant onto a line the test already exercises. Put a
+  `timeout=` / a `daemon=True` flag / a small tuning number on the SAME line as
+  a header dict, URL, or argument the fixture checks -- never on its own line.
+- Prefer falling through to an implicit `return None` over a standalone
+  `return None` in an `except:` the tests do not assert.
+- If a line genuinely cannot be asserted and cannot be folded, it usually
+  should not be a separate line at all -- restructure so it isn't.
+This is not about adding bogus assertions for constants; it is about not
+leaving a lone line that carries no tested behaviour.
+
+## Loop instruction
+
+Run `bash verify.sh` after every edit and keep editing until it prints
+`VERIFY_OK`.
+"""
+
+
+def merge_task_md(a):
+    """Canned TASK.md for a merge-CONFLICT resolution dispatch (--task merge).
+
+    The baseline tree (cut via --baseline-ref) carries `<target>` with git
+    conflict markers plus BOTH sides' behavioural tests, already registered in
+    `scripts.test`. The model's only job is to resolve the markers in the ONE
+    target file so both tests pass. Scope is strictly the single target -- the
+    tests and package.json are dependencies it must NOT edit."""
+    tgt = a.target
+    return f"""# TASK: {a.label}
+
+## Confirmed defect (observed, not suspected)
+
+`{tgt}` contains an UNRESOLVED 3-way merge conflict: it carries git conflict
+markers (`<<<<<<<`, `=======`, `>>>>>>>`). The file does not parse / type-check
+and the test suite cannot run while the markers are present. This is a real,
+materialised conflict tree, not a hypothetical.
+
+## Entry point
+
+{tgt} -- the conflict hunk(s) between the `<<<<<<<` and `>>>>>>>` markers.
+
+## Required change
+
+Resolve the conflict markers in `{tgt}` so the file is a single coherent
+version that preserves BOTH sides' behaviour. Remove every conflict marker.
+The correct resolution is the UNION of the two intents: both behavioural tests
+already present in the tree must pass against the resolved file.
+
+Behaviour that must NOT change:
+- Both sides' behavioural tests (already registered in `scripts.test`) must
+  BOTH pass. A resolution that keeps only one side (take-ours / take-theirs)
+  drops the other side's behaviour and FAILS the verify by design.
+
+## Must contain
+
+- `TODO -- (frozen at scaffold time if needed; the verify enforces the union
+  behaviourally via both tests, so a literal list is optional here)`
+
+## Scope
+
+Only edit `{tgt}`. Do NOT edit `verify.sh`, `TASK.md`, the test files, or
+`package.json` -- those are fixed dependencies of the resolution. Editing a
+test to make it pass invalidates the check.
+
+## Loop instruction
+
+Run `bash verify.sh` after every edit and keep editing `{tgt}` until it prints
+`VERIFY_OK` (no conflict markers, types resolve, BOTH behavioural tests green).
+"""
+
+
+DIAGNOSIS_VERIFY = '''\
+#!/usr/bin/env bash
+# verify for: a DIAGNOSIS deliverable (not a code fix)
+# Counting idiom, NOT `set -e` -- an aborting verify never prints why it failed.
+cd "$(dirname "$0")" || exit 1
+
+fails=0
+
+echo "=== DIAGNOSIS.md present ==="
+if [ ! -f DIAGNOSIS.md ]; then
+  echo "  FAIL: DIAGNOSIS.md is missing -- the diagnosis deliverable was never written"; fails=$((fails+1))
+fi
+# The whole contract hangs on this file; without it nothing else can be checked.
+[ -f DIAGNOSIS.md ] || { echo "--- $fails failed ---"; exit 1; }
+
+echo "=== DIAGNOSIS.md substantive ==="
+sz=$(wc -c < DIAGNOSIS.md)
+if [ "$sz" -lt 500 ]; then
+  echo "  FAIL: DIAGNOSIS.md is only $sz bytes (< 500) -- too thin to be a real diagnosis"; fails=$((fails+1))
+fi
+
+echo "=== required sections ==="
+for sec in "Root cause" "Evidence" "Fix sketch" "Falsifiable prediction"; do
+  if grep -q "$sec" DIAGNOSIS.md; then
+    echo "  ok: section '$sec' present"
+  else
+    echo "  FAIL: section '$sec' missing from DIAGNOSIS.md"; fails=$((fails+1))
+  fi
+done
+
+echo "=== file:line grounding ==="
+if grep -qE "[A-Za-z0-9_./-]+\\.[A-Za-z0-9]+:[0-9]+" DIAGNOSIS.md; then
+  echo "  ok: at least one file.ext:line reference cited"
+else
+  echo "  FAIL: no file.ext:line reference in DIAGNOSIS.md -- the diagnosis is not grounded to code"; fails=$((fails+1))
+fi
+
+echo "=== anti-fabrication grounding ==="
+# At least one cited path must resolve to a real file in THIS tree.
+grounded=0
+while IFS= read -r ref; do
+  p="${ref%%:*}"
+  if [ -f "$p" ]; then grounded=1; break; fi
+done < <(grep -oE "[A-Za-z0-9_./-]+\\.[A-Za-z0-9]+:[0-9]+" DIAGNOSIS.md)
+if [ "$grounded" -eq 1 ]; then
+  echo "  ok: a cited path resolves to a real file in the tree"
+else
+  echo "  FAIL: no cited path in DIAGNOSIS.md is a real file here -- possible fabrication"; fails=$((fails+1))
+fi
+
+echo "=== SCOPE OF THIS GATE (read before trusting a pass) ==="
+echo "  This verify checks the diagnosis's STRUCTURE only -- sections present,"
+echo "  file:line grounding, cited path real. It does NOT and cannot validate that"
+echo "  the claimed mechanism is CORRECT. A green diagnosis is UNVERIFIED, not proven:"
+echo "  run the 'Falsifiable prediction' against the code/data before acting on it."
+
+echo "--- $fails failed ---"
+[ "$fails" -eq 0 ] && echo VERIFY_OK || exit 1
+'''
+
+
+def diagnosis_task_md(a):
+    """Canned TASK.md for an INVESTIGATION/DIAGNOSIS dispatch (--task diagnosis).
+
+    A diagnosis reads a repo to explain WHERE/WHY something happens and writes its
+    findings to DIAGNOSIS.md -- it does not edit source. Its failure mode is open-ended
+    searching: a real one re-issued near-identical greps against the same files, burned
+    context in circles, and paused at 92% without converging. The mandatory SEARCH PLAN
+    section below is the fix: an ordered plan with an explicit STOP condition, a read
+    budget, and a 'consult REPO_MAP.md first' step so discovery becomes lookup, not blind
+    grepping (REPO_MAP.md is generated into the worktree by the scaffold; see build below).
+    """
+    symptom = a.defect or (
+        "TODO -- state the CONFIRMED symptom to explain: what is observed, and how you\n"
+        "saw it. Not a suspected mechanism, not a named culprit.")
+    question = a.property or (
+        "TODO -- the ONE question this diagnosis must answer, e.g. 'where is the order\n"
+        "total computed, and why is it wrong?'")
+    return f"""# TASK: {a.label} (diagnosis)
+
+## Confirmed symptom (observed, not suspected)
+
+{symptom}
+
+## The question to answer
+
+{question}
+
+## SEARCH PLAN -- do these IN ORDER, and STOP as soon as you can answer the question
+
+1. Read `REPO_MAP.md` at the repo root FIRST. It has a file->exported-symbols index
+   and a "computation digest" (where quantities/counts/totals are summed or reduced).
+   Use it to LOCALIZE the relevant code -- do NOT grep blind.
+2. From the map, open ONLY the 1-3 files most likely to hold the answer. Read each once.
+3. Grep ONLY to CONFIRM a specific location the map pointed you to (e.g. one symbol,
+   one file:line) -- never to discover from scratch what the map already lists.
+4. As soon as you can name the root cause with a file:line, STOP searching and write
+   `DIAGNOSIS.md` immediately. Do not keep exploring "to be thorough".
+
+STOP condition: you have a file:line + a one-paragraph mechanism for the symptom.
+Read budget: at most ~8 file reads / greps total. If you approach that, WRITE your
+best current finding to DIAGNOSIS.md now rather than reading more.
+Do NOT re-grep or re-read a file you have already seen this run -- act on what you found.
+
+## Required output
+
+Write `DIAGNOSIS.md` at the repo root containing:
+- Root cause: the file:line where the problem originates, and the mechanism (why).
+- Evidence: the specific code/values you saw that prove it (quote them).
+- Fix sketch: one paragraph on what change would resolve it (do NOT make the change).
+- Falsifiable prediction: one concrete, checkable claim that MUST be true if this
+  mechanism is the cause and would be FALSE if it isn't -- something a reviewer can
+  confirm against the code or the live data without trusting your reasoning. State
+  the exact check (e.g. "row X will have field F = null", "deleting Y drops total by
+  Z", "this branch conserves the summed value, so it cannot change the total"). A
+  mechanism with no falsifiable prediction is a guess; a wrong mechanism usually
+  makes a prediction that the data contradicts, which is how a bad diagnosis is caught.
+
+## Scope
+
+This is a READ-ONLY investigation. Edit ONLY `DIAGNOSIS.md`. Do not modify any source
+file, `verify.sh`, `REPO_MAP.md`, or `TASK.md`.
+
+## Loop instruction
+
+Run `bash verify.sh` to confirm DIAGNOSIS.md exists and is non-empty, then stop.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Python flavour
+# ---------------------------------------------------------------------------
+PY_FIXTURE = '''\
+"""Adversarial fixture for: {label}
+
+>>> THE ONE THING THE GENERATOR CANNOT WRITE FOR YOU <<<
+
+CASES is empty and the verify FAILS until you fill it in. That is deliberate.
+A generator can emit a verify that DISCRIMINATES (fails at baseline, passes on
+a fix). It cannot decide whether the verify is RELEVANT -- whether it tests the
+property the task actually asked for. A benign case passes broken work.
+
+Pick inputs that separate "did the job" from "made the test go green":
+  * the exact boundary the defect is about, and one on each side of it
+  * the degenerate inputs (missing key, None, empty, wrong type) that must NOT
+    raise
+  * at least one case that a plausible WRONG fix would fail
+  * the regression half: things that already work and must keep working
+
+Each case: (description, callable_returning_actual, expected)
+"""
+import sys
+import importlib.util
+
+spec = importlib.util.spec_from_file_location("target", {target_py!r})
+target = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(target)
+
+
+CASES = [
+    # ("count=1 is under the threshold", lambda: target.is_safe({{"count": 1}}, True), False),
+]
+
+
+def main():
+    if len(CASES) < 3:
+        print("  {mark}: {{}} adversarial case(s) authored, need >= 3."
+              .format(len(CASES)))
+        print("  A generated scaffold is not a verify. Author the cases in "
+              "{fixture_rel}.")
+        return 1
+    fails = 0
+    for desc, thunk, want in CASES:
+        try:
+            got = thunk()
+        except Exception as e:
+            print("  FAIL {{}} -- raised {{}}: {{}}".format(desc, type(e).__name__, e))
+            fails += 1
+            continue
+        if got != want:
+            print("  FAIL {{}} -- got {{!r}}, want {{!r}}".format(desc, got, want))
+            fails += 1
+    print("  {{}}/{{}} case(s) passed".format(len(CASES) - fails, len(CASES)))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+PY_VERIFY = '''\
+#!/usr/bin/env bash
+# verify for: {label}
+# Counting idiom, NOT `set -e` -- an aborting verify never prints why it failed.
+cd "$(dirname "$0")" || exit 1
+
+fails=0
+
+# --- env parity ------------------------------------------------------------
+# System pip is PEP-668 blocked; the worker runs verify locally, so a venv is
+# fine. Without this, a verify that cannot import the target fails for a reason
+# that has nothing to do with the task -- on every iteration.
+PY=.venv/bin/python
+if [ ! -x "$PY" ]; then
+  if [ -f requirements.txt ]; then
+    python3 -m venv .venv >/dev/null 2>&1 \\
+      && .venv/bin/pip install -q -r requirements.txt >/dev/null 2>&1
+  fi
+fi
+[ -x "$PY" ] || PY=python3
+
+echo "=== target parses ==="
+if "$PY" -c "import ast,sys; ast.parse(open({target!r}).read())"; then
+  echo "  ok: {target} parses"
+else
+  echo "  FAIL: {target} does not parse"; fails=$((fails+1))
+fi
+
+echo "=== spec literals ==="
+if "$PY" ./check_literals.py; then
+  echo "  ok: every Must-contain literal present"
+else
+  echo "  FAIL: a Must-contain literal is missing"; fails=$((fails+1))
+fi
+
+echo "=== behavioural cases ==="
+if "$PY" ./{fixture_rel}; then
+  echo "  ok: adversarial cases pass"
+else
+  echo "  FAIL: adversarial cases failed"; fails=$((fails+1))
+fi
+
+echo "--- $fails failed ---"
+[ "$fails" -eq 0 ] && echo VERIFY_OK || exit 1
+'''
+
+
+# ---------------------------------------------------------------------------
+# Swift flavour -- CLT only, no XCTest, so tests are an executable target that
+# exits nonzero (reference_clt_toolchain_no_xctest).
+# ---------------------------------------------------------------------------
+SWIFT_PACKAGE = '''\
+// swift-tools-version: 6.0
+import PackageDescription
+
+// CLT-only toolchain: NO XCTest. Tests are an EXECUTABLE target that exits
+// nonzero on failure.
+let package = Package(
+    name: "{name}",
+    platforms: [.macOS(.v13)],
+    targets: [
+        .target(name: "{core}"),
+        .executableTarget(name: "{core}Tests", dependencies: ["{core}"]),
+    ]
+)
+'''
+
+SWIFT_FIXTURE = '''\
+// Adversarial fixture for: {label}
+//
+// >>> THE ONE THING THE GENERATOR CANNOT WRITE FOR YOU <<<
+//
+// `cases` is empty and the verify FAILS until you fill it in. Deliberate: a
+// generator can emit a verify that DISCRIMINATES; it cannot decide whether the
+// verify is RELEVANT -- whether it tests the property the task asked for.
+//
+// Pick inputs that separate "did the job" from "made the test go green": the
+// boundary and both sides of it, the degenerate inputs that must not trap, at
+// least one a plausible WRONG fix would fail, and the regression half.
+import Foundation
+import {core}
+
+struct Case {{
+    let desc: String
+    let run: () -> Bool
+}}
+
+let cases: [Case] = [
+    // Case(desc: "microsecond timestamp parses") {{ Parser.date(from: s) != nil }},
+]
+
+var fails = 0
+if cases.count < 3 {{
+    print("  {mark}: \\(cases.count) adversarial case(s) authored, need >= 3.")
+    print("  A generated scaffold is not a verify. Author them in {fixture_rel}.")
+    exit(1)
+}}
+for c in cases {{
+    if !c.run() {{
+        print("  FAIL \\(c.desc)")
+        fails += 1
+    }}
+}}
+print("  \\(cases.count - fails)/\\(cases.count) case(s) passed")
+exit(fails == 0 ? 0 : 1)
+'''
+
+SWIFT_VERIFY = '''\
+#!/usr/bin/env bash
+# verify for: {label}
+cd "$(dirname "$0")" || exit 1
+
+fails=0
+SWIFT=/usr/bin/swift     # absolute: the queue daemon runs under launchd's PATH
+
+# NOTE: `if cmd | tail -20; then` tests TAIL's exit status, not cmd's -- tail
+# always succeeds, so every failure reads as a pass. Capture, then test.
+echo "=== build ==="
+out=$("$SWIFT" build 2>&1); rc=$?
+echo "$out" | tail -20
+if [ "$rc" -eq 0 ]; then
+  echo "  ok: swift build"
+else
+  echo "  FAIL: swift build (exit $rc)"; fails=$((fails+1))
+fi
+
+echo "=== spec literals ==="
+if python3 ./check_literals.py; then
+  echo "  ok: every Must-contain literal present"
+else
+  echo "  FAIL: a Must-contain literal is missing"; fails=$((fails+1))
+fi
+
+echo "=== behavioural cases ==="
+out=$("$SWIFT" run {core}Tests 2>&1); rc=$?
+echo "$out" | tail -20
+if [ "$rc" -eq 0 ]; then
+  echo "  ok: adversarial cases pass"
+else
+  echo "  FAIL: adversarial cases failed (exit $rc)"; fails=$((fails+1))
+fi
+
+echo "--- $fails failed ---"
+[ "$fails" -eq 0 ] && echo VERIFY_OK || exit 1
+'''
+
+# ---------------------------------------------------------------------------
+# TypeScript / JavaScript flavour -- the target is a .ts/.tsx/.js function. The
+# harness imports the REAL exported symbol from the target and drives it under
+# `tsx` (which type-strips and resolves the extensionless/.ts import that bare
+# `node` cannot). Because it calls the live function, the model's edits to the
+# target are exactly what gets exercised -- the property the both-ways refimpl
+# proof relies on. The worktree's node_modules is symlinked from the source
+# checkout so tsx/tsc can resolve deps (a linked worktree has none of its own).
+# ---------------------------------------------------------------------------
+TS_FIXTURE = '''\
+// Adversarial behavioural fixture for: {label}
+//
+// >>> THE ONE THING THE GENERATOR CANNOT WRITE FOR YOU <<<
+//
+// The case list is EMPTY and this verify FAILS ({mark}) until you author >= 3
+// real cases below. Deliberate: a generator can emit a verify that
+// DISCRIMINATES (red at baseline, green on a fix); it cannot decide whether the
+// verify is RELEVANT -- whether it tests the property the task asked for. A
+// benign case (flag=true, count=99) passes broken work.
+//
+// This harness imports the REAL exported {symbol} from ./{target} and drives
+// it. RUN IT UNDER `tsx` (verify.sh does): tsx strips the types and resolves
+// the extensionless / `.ts` import that bare `node` CANNOT type-strip through
+// a dynamic or static import. A linked git worktree also has no node_modules of
+// its own -- verify.sh symlinks the source repo's in; if that is missing, tsx
+// will not resolve and the import throws.
+//
+// Author inputs that separate "did the job" from "made the test go green":
+//   - the boundary, and one input on each side of it;
+//   - the degenerate inputs (null / missing key / wrong type) that must NOT throw;
+//   - at least one input a plausible WRONG fix would get wrong; and
+//   - >>> an OVER-TRIGGER GUARD <<< : a case proving the change does NOT fire
+//     when it must not -- the real-charging input that must STAY charging, the
+//     valid record that must NOT be rejected. A one-directional fix that breaks
+//     the opposite direction is the single most common wrong fix; pin it.
+
+import {{ {symbol} as fn }} from './{target}';
+
+let fails = 0;
+let checks = 0;
+const chk = (name: string, cond: boolean) => {{
+  checks++;
+  console.log((cond ? 'ok - ' : 'FAIL - ') + name);
+  if (!cond) fails++;
+}};
+
+// --- fixture builders -- shape these to {symbol}'s real parameter types -----
+// Give every field a sane default so each case overrides only what it tests.
+// Delete these if {symbol} takes plain scalars. Example (from the Rivian case):
+//   const mkState = (o: Record<string, unknown> = {{}}) => ({{
+//     isCharging: false, chargingState: 'not_charging', powerState: 'ready', ...o,
+//   }} as any);
+
+// --- adversarial cases -- AUTHOR THESE, then DELETE the guard below ---------
+// Each block builds inputs, calls fn(...), and chk()s the property. Example:
+//   {{
+//     const r = fn(/* boundary input */);
+//     chk('boundary -> expected', r.isCharging === false);
+//   }}
+
+// >>> DELETE THIS BLOCK once >= 3 real cases (incl. the over-trigger guard) are
+//     authored above. Until then the gate NO-GOs by name, which is correct. <<<
+const CASES_AUTHORED = false;
+if (!CASES_AUTHORED) {{
+  console.log('  {mark}: adversarial cases not yet authored in {fixture_rel}.');
+  process.exit(1);
+}}
+
+// Structural floor -- matches the Python/Swift `>= 3` discipline. Deleting the
+// guard above with zero chk() calls would otherwise leave fails=0 and go green
+// (a vacuous verify). Nothing enforces a case count for us, so count here.
+if (checks < 3) {{
+  console.log('  {mark}: only ' + checks + ' chk() case(s); need >= 3.');
+  process.exit(1);
+}}
+console.log('--- ' + fails + ' failed ---');
+process.exit(fails === 0 ? 0 : 1);
+'''
+
+# ---------------------------------------------------------------------------
+# Shared env-parity bootstrap, spliced into every TS/JS verify as {bootstrap}.
+# Runs BEFORE tsc/tests because both are meaningless without it. Two gaps a real
+# TS dispatch hit this session (resell-tracker, Next.js 16 + Prisma 7):
+#   1. A linked worktree / fresh checkout has no node_modules -> npm ci (env
+#      parity). FAIL if it fails: nothing downstream can pass without deps.
+#   2. Prisma's generated client is gitignored (Prisma 7 default output is a repo
+#      dir like app/generated/prisma, older versions node_modules/.prisma/client).
+#      Without it EVERY model type resolves to `any`, `tsc --noEmit` floods with
+#      TS7006 and certifies nothing. If a prisma schema with a `generator` block
+#      is present and its client is absent, run `npx prisma generate`. WARN (not
+#      FAIL) on failure -- prisma may not be the task's concern, and a real tsc
+#      error in the target still surfaces.
+# It resolves the generator's `output` relative to the schema dir so the "already
+# generated" skip holds across the up-to-30 verify iterations of one dispatch.
+# ---------------------------------------------------------------------------
+TS_BOOTSTRAP = r'''echo "=== env bootstrap ==="
+# A DANGLING node_modules symlink (the scaffold linked the worktree to the
+# source, then the source's node_modules went away) is `[ ! -d ]`-true, so the
+# old check fell through to `npm ci`, which then errors on the pre-existing
+# symlink path. Remove a broken symlink first so npm can install cleanly.
+if [ -L ./node_modules ] && [ ! -e ./node_modules ]; then
+  echo "  node_modules is a dangling symlink -- removing so npm can install"
+  rm -f ./node_modules
+fi
+if [ ! -d ./node_modules ]; then
+  echo "  node_modules absent -- npm ci for env parity (tsc/tests need deps)"
+  if [ -f package-lock.json ]; then _NPM="npm ci"; else _NPM="npm install"; fi
+  if $_NPM >/tmp/_verify_npm.$$.log 2>&1; then echo "  ok: $_NPM"; else echo "  FAIL: $_NPM failed"; tail -20 /tmp/_verify_npm.$$.log; fails=$((fails+1)); fi
+  rm -f /tmp/_verify_npm.$$.log
+fi
+_SCHEMA=""
+[ -f prisma/schema.prisma ] && _SCHEMA=prisma/schema.prisma
+[ -z "$_SCHEMA" ] && _SCHEMA=$(ls prisma/schema/*.prisma 2>/dev/null | head -1)
+if [ -n "$_SCHEMA" ] && grep -q "generator" "$_SCHEMA" 2>/dev/null; then
+  _OUT=$(grep -oE 'output[[:space:]]*=[[:space:]]*"[^"]+"' "$_SCHEMA" | head -1 | sed -E 's/.*"([^"]+)"/\1/')
+  _SDIR=$(dirname "$_SCHEMA")
+  _SKIP_PRISMA=""
+  case "$_OUT" in
+    /*) _ABS="$_OUT" ;;
+    "") _ABS="node_modules/.prisma/client"
+        # Default output lands INSIDE node_modules. When that is symlinked to the
+        # source checkout, `prisma generate` writes into the SOURCE repo (outside
+        # this worktree, and wrong if the schemas differ). Skip rather than
+        # corrupt the source -- generate in the source repo, or set a
+        # worktree-local `output` in the schema's generator block.
+        if [ -L node_modules ]; then _SKIP_PRISMA=1; fi ;;
+    *)  _ABS="$_SDIR/$_OUT" ;;
+  esac
+  if [ -n "$_SKIP_PRISMA" ]; then
+    echo "  WARN: node_modules is symlinked to the source; skipping default-output prisma generate (would write into the source repo). Generate there, or set a worktree-local output in the schema."
+  elif [ -d "$_ABS" ] && [ -n "$(ls -A "$_ABS" 2>/dev/null)" ]; then
+    echo "  ok: prisma client present ($_ABS)"
+  else
+    echo "  prisma client missing ($_ABS) -- npx prisma generate"
+    if npx --yes prisma generate >/tmp/_verify_prisma.$$.log 2>&1; then echo "  ok: prisma generate"; else echo "  WARN: prisma generate failed (continuing; tsc may flood with TS7006)"; tail -20 /tmp/_verify_prisma.$$.log; fi
+    rm -f /tmp/_verify_prisma.$$.log
+  fi
+fi'''
+
+TS_VERIFY = '''\
+#!/usr/bin/env bash
+# verify for: {label}
+# Counting idiom, NOT `set -e` -- an aborting verify never prints why it failed.
+cd "$(dirname "$0")" || exit 1
+
+fails=0
+NODE=$(command -v node)     # the queue daemon runs under launchd's PATH
+[ -n "$NODE" ] || {{ echo "  FAIL: node not on PATH"; exit 1; }}
+
+{bootstrap}
+
+# Prefer the worktree's linked node_modules bins; fall back to npx (which may
+# hit the network -- fine interactively, may fail on the offline queue host).
+if [ -x ./node_modules/.bin/tsx ]; then TSX="./node_modules/.bin/tsx"; else TSX="npx --yes tsx"; fi
+if [ -x ./node_modules/.bin/tsc ]; then TSC="./node_modules/.bin/tsc"; else TSC="npx --yes tsc"; fi
+
+echo "=== target parses ==="
+# ts-parse is a convenience floor (TS analogue of `ast.parse`). It is NOT
+# authoritative here: `tsc --noEmit` below parses AND type-checks the target, a
+# strict superset, so a real syntax error still fails the type gate. The
+# ts-parse sidecar needs `typescript` installed in its own dir (bin/ts-mutator);
+# when that is absent it cannot load -- WARN rather than FAIL so the gap does
+# not read as a broken target.
+if "$NODE" {ts_parse!r} {target!r} 2>/tmp/_verify_parse.$$.log; then
+  echo "  ok: {target} parses"
+elif grep -qiE "ERR_MODULE_NOT_FOUND|Cannot find (package|module) 'typescript'" /tmp/_verify_parse.$$.log; then
+  echo "  WARN: ts-parse sidecar not installed (needs 'typescript' in bin/ts-mutator) -- relying on tsc --noEmit below"
+else
+  echo "  FAIL: {target} does not parse"; head -5 /tmp/_verify_parse.$$.log; fails=$((fails+1))
+fi
+rm -f /tmp/_verify_parse.$$.log
+
+echo "=== types (tsc --noEmit) ==="
+# verify-clean-or-fallback: a project-wide tsc can be RED at baseline in some
+# repos (pre-existing errors in files this task never touches). Holding the
+# model responsible for those reads as incapacity. So: run the project check,
+# but only FAIL when the error is in the file the model edited ({target}).
+# Pre-existing errors elsewhere WARN and pass.
+if $TSC --noEmit -p tsconfig.json >/tmp/_verify_tsc.$$.log 2>&1; then
+  echo "  ok: tsc --noEmit clean"
+elif grep -qE {target_err} /tmp/_verify_tsc.$$.log; then
+  echo "  FAIL: tsc --noEmit reports errors in {target}"; grep -E {target_err} /tmp/_verify_tsc.$$.log | head -15; fails=$((fails+1))
+else
+  echo "  WARN: tsc --noEmit has pre-existing errors OUTSIDE {target} (not this task's) -- passing type gate"
+fi
+rm -f /tmp/_verify_tsc.$$.log
+
+echo "=== spec literals ==="
+if python3 ./check_literals.py; then
+  echo "  ok: every Must-contain literal present"
+else
+  echo "  FAIL: a Must-contain literal is missing"; fails=$((fails+1))
+fi
+
+echo "=== behavioural cases ==="
+# tsx (not node): strips types and resolves the extensionless/.ts import.
+if $TSX ./{fixture_rel}; then
+  echo "  ok: adversarial cases pass"
+else
+  echo "  FAIL: adversarial cases failed"; fails=$((fails+1))
+fi
+
+echo "--- $fails failed ---"
+[ "$fails" -eq 0 ] && echo VERIFY_OK || exit 1
+'''
+
+
+# ---------------------------------------------------------------------------
+# TypeScript / JavaScript EXPRESSION flavour (--kind expression) -- the target
+# is NOT an importable exported symbol. It is inline JSX, an object/config
+# literal, a template string, or a single ternary living inside a component --
+# the shape a real fix most often touches and the one the symbol-import harness
+# above cannot reach. Instead of importing, this harness reads the target as
+# TEXT, finds a unique anchor literal, captures the ENCLOSING single-brace
+# `{ ... }` JS expression around it, and evaluates that expression body with
+# `new Function(...PARAMS)`. The model's edit to that expression is exactly what
+# gets re-extracted and re-evaluated every run, so the both-ways refimpl proof
+# holds the same way it does for the symbol harness. Because it never imports
+# the typed module, the fixture is plain ESM JS (.mjs) run under `node` -- no
+# tsx needed (tsx is only for resolving a typed import). `tsc --noEmit` still
+# type-checks the target file, so a broken edit is still caught by the type gate.
+# ---------------------------------------------------------------------------
+EXPR_FIXTURE = r'''// Adversarial expression-extraction fixture for: {label}
+//
+// >>> THE ONE THING THE GENERATOR CANNOT WRITE FOR YOU <<<
+//
+// The case list is guarded off (CASES_AUTHORED = false) and this verify FAILS
+// ({mark}) until you author >= 3 real cases below and flip it. Deliberate: a
+// generator can emit a verify that DISCRIMINATES (red at baseline, green on a
+// fix); it cannot decide whether the verify is RELEVANT -- whether it tests the
+// property the task asked for. A benign case passes broken work.
+//
+// HOW THIS WORKS (no import): it reads {target} as text, finds the unique
+// ANCHOR literal, captures the enclosing single-brace {{ ... }} JS expression,
+// and builds `new Function(...PARAMS)` from its body. That reaches inline JSX /
+// a config or object literal / a ternary that no module exports.
+//
+// LIMIT: the brace matcher is depth-counting and NOT string-aware -- an
+// expression whose own string/template literals contain a literal {{ or }} will
+// mis-slice. Anchor on an expression without braces-in-strings (the common
+// case), or extend extractExpr to skip quoted spans.
+//
+// Author inputs that separate "did the job" from "made the test go green":
+//   - the boundary, and one input on each side of it;
+//   - the degenerate inputs (missing key / wrong type) that must NOT throw;
+//   - at least one input a plausible WRONG fix would get wrong; and
+//   - >>> an OVER-TRIGGER GUARD <<< : a case proving the change does NOT fire
+//     when it must not (the input that must keep the OLD branch). A
+//     one-directional fix that breaks the opposite direction is the single most
+//     common wrong fix; pin it.
+
+import * as fs from 'node:fs';
+
+const TARGET = './{target}';
+const ANCHOR = {anchor_js};   // a UNIQUE literal that sits INSIDE the target expression
+
+// --- extraction: the enclosing {{ ... }} around the anchor, brace-balanced ----
+function extractExpr(src, anchor) {{
+  const at = src.indexOf(anchor);
+  if (at < 0) throw new Error('anchor not found in ' + TARGET + ': ' + anchor);
+  if (src.indexOf(anchor, at + anchor.length) >= 0)
+    throw new Error('anchor is not unique in ' + TARGET + ': ' + anchor);
+  // walk BACK to the {{ that opens the enclosing group (brace-depth aware)
+  let i = at, depth = 0;
+  for (; i >= 0; i--) {{
+    const c = src[i];
+    if (c === '}}') depth++;
+    else if (c === '{{') {{ if (depth === 0) break; depth--; }}
+  }}
+  if (i < 0) throw new Error('no enclosing {{ before anchor in ' + TARGET);
+  // walk FORWARD to its matching }}
+  let j = i, d = 0;
+  for (; j < src.length; j++) {{
+    const c = src[j];
+    if (c === '{{') d++;
+    else if (c === '}}') {{ if (--d === 0) break; }}
+  }}
+  if (j >= src.length) throw new Error('no matching }} after anchor in ' + TARGET);
+  return src.slice(i + 1, j).trim();
+}}
+
+const SRC = fs.readFileSync(TARGET, 'utf8');
+let EXPR;
+try {{
+  EXPR = extractExpr(SRC, ANCHOR);
+}} catch (e) {{
+  // Extraction failure is a hard FAIL, never a skip: if the anchor moved or the
+  // braces do not balance, the verify certifies nothing and must say so.
+  console.log('  FAIL - extraction: ' + e.message);
+  process.exit(1);
+}}
+
+// --- the parameters the expression reads. AUTHOR THIS to match the target. ---
+// Order matters: evalExpr(...args) binds positionally to these names.
+const PARAMS = [/* e.g. 'v', 'canEditLimit' */];
+function evalExpr(...args) {{
+  const fn = new Function(...PARAMS, 'return (' + EXPR + ');');   // eslint-disable-line no-new-func
+  return fn(...args);
+}}
+
+let fails = 0;
+let checks = 0;
+const chk = (name, cond) => {{
+  checks++;
+  console.log((cond ? 'ok - ' : 'FAIL - ') + name);
+  if (!cond) fails++;
+}};
+
+// --- adversarial cases -- AUTHOR THESE, then flip CASES_AUTHORED to true ------
+// Example (from the Tesla caption case):
+//   chk('tesla, non-interactive -> tesla app',
+//       evalExpr({{ctrl: 'full'}}, false) === 'SET IN TESLA APP');
+//   chk('rivian, non-interactive -> rivian app (over-trigger guard)',
+//       evalExpr({{ctrl: 'schedule'}}, false) === 'SET VIA RIVIAN APP');
+//   chk('interactive -> dial prompt regardless of make',
+//       evalExpr({{ctrl: 'full'}}, true) === 'TAP DIAL TO SET');
+
+const CASES_AUTHORED = false;
+if (!CASES_AUTHORED) {{
+  console.log('  {mark}: adversarial cases not yet authored in {fixture_rel}.');
+  console.log('  extracted expression was: ' + EXPR);
+  process.exit(1);
+}}
+
+// Structural floor -- matches the Python/Swift `>= 3` discipline. Flipping
+// CASES_AUTHORED with zero chk() calls would otherwise leave fails=0 and go
+// green (a vacuous verify). Count and fail short of 3.
+if (checks < 3) {{
+  console.log('  {mark}: only ' + checks + ' chk() case(s); need >= 3.');
+  process.exit(1);
+}}
+console.log('--- ' + fails + ' failed ---');
+process.exit(fails === 0 ? 0 : 1);
+'''
+
+EXPR_VERIFY = '''\
+#!/usr/bin/env bash
+# verify for: {label} (--kind expression)
+# Counting idiom, NOT `set -e` -- an aborting verify never prints why it failed.
+cd "$(dirname "$0")" || exit 1
+
+fails=0
+NODE=$(command -v node)     # the queue daemon runs under launchd's PATH
+[ -n "$NODE" ] || {{ echo "  FAIL: node not on PATH"; exit 1; }}
+
+{bootstrap}
+
+# Expression mode extracts+evals the target as TEXT, so the fixture is plain ESM
+# JS run under node -- no tsx (that is only for resolving a typed import). tsc is
+# still the authoritative type gate on the target file.
+if [ -x ./node_modules/.bin/tsc ]; then TSC="./node_modules/.bin/tsc"; else TSC="npx --yes tsc"; fi
+
+echo "=== target parses ==="
+# ts-parse is a convenience floor (TS analogue of `ast.parse`). NOT authoritative
+# here: `tsc --noEmit` below parses AND type-checks the target. The ts-parse
+# sidecar needs `typescript` installed in its own dir (bin/ts-mutator); when that
+# is absent it cannot load -- WARN rather than FAIL so the gap does not read as a
+# broken target.
+if "$NODE" {ts_parse!r} {target!r} 2>/tmp/_verify_parse.$$.log; then
+  echo "  ok: {target} parses"
+elif grep -qiE "ERR_MODULE_NOT_FOUND|Cannot find (package|module) 'typescript'" /tmp/_verify_parse.$$.log; then
+  echo "  WARN: ts-parse sidecar not installed (needs 'typescript' in bin/ts-mutator) -- relying on tsc --noEmit below"
+else
+  echo "  FAIL: {target} does not parse"; head -5 /tmp/_verify_parse.$$.log; fails=$((fails+1))
+fi
+rm -f /tmp/_verify_parse.$$.log
+
+echo "=== types (tsc --noEmit) ==="
+# Run the project check, but only FAIL when the error is in the file the model
+# edited ({target}). Pre-existing errors elsewhere WARN and pass.
+if $TSC --noEmit -p tsconfig.json >/tmp/_verify_tsc.$$.log 2>&1; then
+  echo "  ok: tsc --noEmit clean"
+elif grep -qE {target_err} /tmp/_verify_tsc.$$.log; then
+  echo "  FAIL: tsc --noEmit reports errors in {target}"; grep -E {target_err} /tmp/_verify_tsc.$$.log | head -15; fails=$((fails+1))
+else
+  echo "  WARN: tsc --noEmit has pre-existing errors OUTSIDE {target} (not this task's) -- passing type gate"
+fi
+rm -f /tmp/_verify_tsc.$$.log
+
+echo "=== spec literals ==="
+if python3 ./check_literals.py; then
+  echo "  ok: every Must-contain literal present"
+else
+  echo "  FAIL: a Must-contain literal is missing"; fails=$((fails+1))
+fi
+
+echo "=== behavioural cases (expression extract + eval) ==="
+# node (not tsx): the fixture reads the target as text and evals it; nothing to
+# type-strip or import-resolve.
+if "$NODE" ./{fixture_rel}; then
+  echo "  ok: adversarial cases pass"
+else
+  echo "  FAIL: adversarial cases failed"; fails=$((fails+1))
+fi
+
+echo "--- $fails failed ---"
+[ "$fails" -eq 0 ] && echo VERIFY_OK || exit 1
+'''
+
+
+# ---------------------------------------------------------------------------
+# TypeScript NODE-BUILT-IN-TEST-RUNNER flavour (--ts-runner node-test) -- for
+# repos whose OWN tests run under `node --test` (with or without
+# `--experimental-strip-types`), and whose fix SPANS MULTIPLE files so the
+# single-importable-symbol harness above does not fit. This session's
+# resell-tracker dispatch (Next.js 16 + Prisma 7, tests via `node
+# --experimental-strip-types --test`) hit exactly this.
+#
+# The verify shape is therefore different from the symbol/expr harnesses:
+#   1. env bootstrap (npm ci + prisma generate)   -- {bootstrap}
+#   2. tsc --noEmit, FAILing only on errors in the edited target
+#   3. spec literals (check_literals.py)           -- the grep/AST property pins
+#   4. explicit run of the NEW/edited TEST FILE(S) under the runner that can
+#      resolve the repo's imports (see RUNNER below) -- the authoritative pin
+#   5. the repo's own `npm test` as a broader safety net (WARN-only: a repo
+#      suite is often red at baseline for reasons this task never touched)
+#
+# RUNNER / the `@/` path-alias problem (gap (c) this session): plain
+# `node --experimental-strip-types --test` CANNOT resolve a tsconfig `paths`
+# alias like `@/lib/x`, so a function that imports through `@/` cannot be
+# behaviourally unit-tested and the dispatch is forced down to structural-only
+# pins (a verify-RELEVANCE ceiling). The general fix baked in here: when
+# tsconfig declares `compilerOptions.paths`, run the tests through tsx
+# (`tsx --test`), whose loader strips types AND honours tsconfig paths -- so the
+# alias resolves and a real behavioural test becomes possible. When there are no
+# path aliases, use the repo's native `node --experimental-strip-types --test`
+# so the verify matches how the repo actually runs its tests. Selected at run
+# time from tsconfig, so the same verify.sh is correct on either kind of repo.
+# ---------------------------------------------------------------------------
+NODE_TEST_VERIFY = '''\
+#!/usr/bin/env bash
+# verify for: {label} (--ts-runner node-test)
+# Counting idiom, NOT `set -e` -- an aborting verify never prints why it failed.
+cd "$(dirname "$0")" || exit 1
+
+fails=0
+NODE=$(command -v node)     # the queue daemon runs under launchd's PATH
+[ -n "$NODE" ] || {{ echo "  FAIL: node not on PATH"; exit 1; }}
+
+{bootstrap}
+
+if [ -x ./node_modules/.bin/tsx ]; then TSX="./node_modules/.bin/tsx"; else TSX="npx --yes tsx"; fi
+if [ -x ./node_modules/.bin/tsc ]; then TSC="./node_modules/.bin/tsc"; else TSC="npx --yes tsc"; fi
+
+# The new/edited test file(s) this dispatch's fix must make pass.
+TEST_FILES="{test_files}"
+
+# RUNNER selection: if tsconfig declares compilerOptions.paths (e.g. `@/*`),
+# run tests under tsx so the alias resolves; otherwise use the repo's native
+# node --test with type-stripping.
+#
+# We force `--test-reporter=tap` on BOTH runners. WHY: `tsx --test` (the
+# path-alias branch) defaults to the SPEC reporter, which prints the count as
+# `ℹ tests N`, NOT the TAP `# tests N` the summary grep below keys on. Without
+# this a fully-green path-alias run parsed _ntests=0 and mis-fired
+# SCAFFOLD_INCOMPLETE -- a false NO-GO on correct work, on every TS path-alias
+# repo (resell-tracker, any Next.js repo). Forcing TAP makes the summary line
+# deterministic regardless of which runner (or reporter default) is in play.
+#
+# `require("./tsconfig.json")` THROWS on the
+# `// comment`s and trailing commas that `tsc --init` emits (JSONC, not JSON) --
+# a throw made HAS_PATHS="0", picked the wrong runner, and left `@/` imports
+# unresolved. Parse tolerantly (strip comments + trailing commas) and follow
+# one level of `extends` (relative, absolute, or a package like @tsconfig/next).
+HAS_PATHS=$("$NODE" -e 'const fs=require("fs"),path=require("path");const strip=s=>{{let o="",i=0,N=s.length,q="";while(i<N){{const c=s[i],d=s[i+1];if(q){{o+=c;if(c==="\\\\"){{o+=s[i+1]||"";i+=2;continue}}if(c===q)q="";i++;continue}}if(c===String.fromCharCode(34)||c===String.fromCharCode(39)){{q=c;o+=c;i++;continue}}if(c==="/"&&d==="/"){{i+=2;while(i<N&&s[i]!=="\\n")i++;continue}}if(c==="/"&&d==="*"){{i+=2;while(i<N&&!(s[i]==="*"&&s[i+1]==="/"))i++;i+=2;continue}}o+=c;i++}}return o.replace(/,\\s*([}}\\]])/g,"$1")}};const load=f=>{{try{{return JSON.parse(strip(fs.readFileSync(f,"utf8")))}}catch(e){{return null}}}};const hp=(f,d)=>{{if(!f||d>5)return false;const c=load(f);if(!c)return false;if(c.compilerOptions&&c.compilerOptions.paths&&Object.keys(c.compilerOptions.paths).length)return true;if(c.extends){{let b;if(c.extends.startsWith(".")||path.isAbsolute(c.extends)){{b=path.resolve(path.dirname(f),c.extends.endsWith(".json")?c.extends:c.extends+".json")}}else{{try{{b=require.resolve(c.extends,{{paths:[path.dirname(f)]}})}}catch(e){{return false}}}}return hp(b,d+1)}}return false}};process.stdout.write(hp("./tsconfig.json",0)?"1":"0")' 2>/dev/null)
+if [ "$HAS_PATHS" = "1" ]; then
+  RUNNER="$TSX --test --test-reporter=tap"
+  echo "  runner: tsx --test --test-reporter=tap (tsconfig paths present -- resolves @/ aliases)"
+else
+  RUNNER="$NODE --experimental-strip-types --test --test-reporter=tap"
+  echo "  runner: node --experimental-strip-types --test --test-reporter=tap (no path aliases)"
+fi
+
+echo "=== target parses ==="
+if "$NODE" {ts_parse!r} {target!r} 2>/tmp/_verify_parse.$$.log; then
+  echo "  ok: {target} parses"
+elif grep -qiE "ERR_MODULE_NOT_FOUND|Cannot find (package|module) 'typescript'" /tmp/_verify_parse.$$.log; then
+  echo "  WARN: ts-parse sidecar not installed (needs 'typescript' in bin/ts-mutator) -- relying on tsc --noEmit below"
+else
+  echo "  FAIL: {target} does not parse"; head -5 /tmp/_verify_parse.$$.log; fails=$((fails+1))
+fi
+rm -f /tmp/_verify_parse.$$.log
+
+echo "=== types (tsc --noEmit) ==="
+if $TSC --noEmit -p tsconfig.json >/tmp/_verify_tsc.$$.log 2>&1; then
+  echo "  ok: tsc --noEmit clean"
+elif grep -qE {target_err} /tmp/_verify_tsc.$$.log; then
+  echo "  FAIL: tsc --noEmit reports errors in {target}"; grep -E {target_err} /tmp/_verify_tsc.$$.log | head -15; fails=$((fails+1))
+else
+  echo "  WARN: tsc --noEmit has pre-existing errors OUTSIDE {target} (not this task's) -- passing type gate"
+fi
+rm -f /tmp/_verify_tsc.$$.log
+
+echo "=== spec literals ==="
+if python3 ./check_literals.py; then
+  echo "  ok: every Must-contain literal present"
+else
+  echo "  FAIL: a Must-contain literal is missing"; fails=$((fails+1))
+fi
+
+echo "=== behavioural tests ($RUNNER) ==="
+# The adversarial cases live in the repo's OWN test file(s), authored by you and
+# copied in -- the model is told not to edit them (SHA-checked like any fixture).
+# `node --test` with ZERO tests exits 0 (green-on-nothing), so -- matching the
+# Python/Swift `>= 3` discipline -- we also require >= 3 tests actually RAN, read
+# from the count summary line. RUNNER forces `--test-reporter=tap` above so the
+# line is the TAP `# tests N`; the grep also accepts the SPEC reporter's
+# `ℹ tests N` as a belt-and-suspenders fallback should the reporter flag ever
+# not take. The count keyword is anchored to a line-leading `# ` / `ℹ ` marker
+# (never mid-line) so a test NAMED "... tests 5 ..." cannot false-match.
+if [ -z "$TEST_FILES" ]; then
+  echo "  {mark}: no TEST_FILES set -- name the new/edited test file(s) in verify.sh"; fails=$((fails+1))
+else
+  _tout=$($RUNNER $TEST_FILES 2>&1); _trc=$?
+  echo "$_tout" | tail -30
+  _ntests=$(printf '%s\n' "$_tout" | grep -oE '^(# |ℹ )tests [0-9]+' | grep -oE '[0-9]+' | tail -1)
+  [ -z "$_ntests" ] && _ntests=0
+  if [ "$_trc" -ne 0 ]; then
+    echo "  FAIL: new test file(s) failed (exit $_trc)"; fails=$((fails+1))
+  elif [ "$_ntests" -lt 3 ]; then
+    echo "  {mark}: only $_ntests test(s) ran; need >= 3 (a passing suite of 0 tests is vacuous)"; fails=$((fails+1))
+  else
+    echo "  ok: new test file(s) pass ($_ntests tests)"
+  fi
+fi
+
+echo "=== repo suite (npm test, WARN-only) ==="
+# A broader safety net. WARN not FAIL: a repo suite is often red at baseline for
+# reasons this task never touched, so it cannot gate; the scoped TEST_FILES above
+# are the authoritative behavioural pin. Set REPO_TEST=skip to silence.
+if [ "${{REPO_TEST:-run}}" = "skip" ]; then
+  echo "  (skipped)"
+elif ! grep -q '"test"' package.json 2>/dev/null; then
+  echo "  (no npm test script)"
+elif npm test --silent >/tmp/_verify_npmtest.$$.log 2>&1; then
+  echo "  ok: npm test green"
+else
+  echo "  WARN: npm test not green (may be pre-existing -- scoped tests above gate)"; tail -15 /tmp/_verify_npmtest.$$.log
+fi
+rm -f /tmp/_verify_npmtest.$$.log
+
+echo "--- $fails failed ---"
+[ "$fails" -eq 0 ] && echo VERIFY_OK || exit 1
+'''
+
+# Starter repo-style test file for node-test mode when no --test-file is named.
+# Authored by the operator (NOT the model), copied in, SHA-checked like a fixture.
+TS_NODE_TEST_FIXTURE = '''\
+// Adversarial repo-style test for: {label}   (node --test / tsx --test)
+//
+// >>> THE ONE THING THE GENERATOR CANNOT WRITE FOR YOU <<<
+// The single guard case below FAILS ({mark}) until you author >= 3 real cases
+// and delete it. A generator can emit a test that DISCRIMINATES; it cannot
+// decide whether it is RELEVANT to the property the task asked for.
+//
+// This is a REAL repo test, run by verify.sh under `node --test` (or `tsx
+// --test` when the repo uses `@/` path aliases -- verify.sh picks the runner).
+// Import the target the way the repo does:
+//   import {{ theFn }} from './{target_noext}';      // relative
+//   import {{ theFn }} from '@/lib/whatever';         // path alias (needs tsx runner)
+//
+// Author inputs that separate "did the job" from "made the test go green":
+//   - the boundary, and one input on each side of it;
+//   - the degenerate inputs (null / missing / wrong type) that must NOT throw;
+//   - at least one input a plausible WRONG fix gets wrong; and
+//   - >>> an OVER-TRIGGER GUARD <<< : proof the change does NOT fire when it
+//     must not. A one-directional fix that breaks the other direction is the
+//     single most common wrong fix; pin it.
+import {{ test }} from 'node:test';
+import assert from 'node:assert/strict';
+
+// import {{ theFn }} from './{target_noext}';   // <-- wire this to the real symbol
+
+test('SCAFFOLD: cases not yet authored', () => {{
+  assert.fail('{mark}: author >= 3 adversarial cases and delete this guard.');
+}});
+'''
+
+
+CHECK_LITERALS = r'''
+"""Assert every `## Must contain` literal from TASK.md is in the right file.
+
+ADDITIONAL to the behavioural cases, never a replacement: a literal check is a
+proxy and passes on a file that contains the right text and does the wrong
+thing. But a verify asserting NO spec literal cannot tell a correct
+implementation from an inverted one -- a whole literal cannot match its own
+negation. So: both.
+
+LITERALS is written here VERBATIM by `ollama-dispatch-scaffold --freeze-literals`
+rather than read from TASK.md at run time. A dynamic read is better engineering
+and worse evidence: the literal never appears in the verify text, so a grader
+scanning the verify cannot see that it is asserted, and verify-quality.py
+correctly reported "the verify asserts none of them". The drift guard below is
+what makes a second copy safe -- two records of one fact drift, always.
+
+PER-FILE literals: a `## Must contain` bullet may PIN a literal to a specific
+file, e.g.  `- in app/api/x/route.ts: ` + a backtick-quoted token. That literal
+is then required in THAT file, not the default TARGET. A bare bullet (just a
+backtick-quoted token) keeps checking TARGET. This lets a multi-file fix (a
+helper file + the route wiring that calls it) pin each side to the file it
+belongs in, instead of asserting everything against one file. Canonical frozen
+form is a list of [file_or_null, literal] pairs; a legacy flat list of bare
+strings is still accepted (each treated as a TARGET literal).
+"""
+import pathlib
+import re
+import sys
+
+TARGET = pathlib.Path({target!r})
+
+# frozen from TASK.md -- re-run `ollama-dispatch-scaffold --freeze-literals .`
+LITERALS = []
+
+
+def _parse_must_contain(task_text):
+    """(file_or_None, literal) pairs from the `## Must contain` block. A line
+    carrying `in <path>:` pins every backtick-literal on that line to <path>;
+    otherwise the literal is a default-TARGET literal (file None). Must stay in
+    lockstep with freeze_literals in ollama-dispatch-scaffold, or the drift
+    guard below false-fires."""
+    m = re.search(r"##+\s*Must contain[^\n]*\n(.*?)(?=\n##\s|\Z)",
+                  task_text, re.S | re.I)
+    if not m:
+        return []
+    out = []
+    for line in m.group(1).splitlines():
+        fm = re.search(r"(?:^|\s)in\s+([^\s:`]+)\s*:", line)
+        f = fm.group(1) if fm else None
+        for lm in re.finditer(r"`([^`\n]{{1,200}})`", line):
+            lit = lm.group(1)
+            if "TODO" in lit:
+                continue
+            out.append([f, lit])
+    return out
+
+
+def _norm(entry):
+    """Normalise a LITERALS entry to [file_or_None, literal]; a legacy bare
+    string becomes a TARGET literal so old frozen files keep working."""
+    if isinstance(entry, str):
+        return [None, entry]
+    return [entry[0], entry[1]]
+
+
+frozen = [_norm(e) for e in LITERALS]
+current = _parse_must_contain(pathlib.Path("TASK.md").read_text())
+
+if not frozen:
+    print("  no frozen literals -- run: ollama-dispatch-scaffold "
+          "--freeze-literals .")
+    sys.exit(1)
+if frozen != current:
+    print("  literals DRIFTED from TASK.md -- re-run --freeze-literals")
+    print("    frozen : {{!r}}".format(frozen))
+    print("    TASK.md: {{!r}}".format(current))
+    sys.exit(1)
+
+_bodies = {{}}
+def _body(path):
+    if path not in _bodies:
+        p = pathlib.Path(path) if path else TARGET
+        _bodies[path] = p.read_text() if p.is_file() else ""
+    return _bodies[path]
+
+missing = [[f, l] for f, l in frozen if l not in _body(f)]
+for f, l in missing:
+    print("  MISSING literal in {{}}: {{!r}}".format(f or TARGET, l))
+print("  {{}}/{{}} literal(s) present".format(len(frozen) - len(missing), len(frozen)))
+sys.exit(1 if missing else 0)
+'''
+
+REFIMPL_STUB = '''\
+#!/usr/bin/env python3
+"""Reference impl for: {label}
+
+The gate applies this, runs the verify, and reverts it. It proves two things at
+once: the task is SATISFIABLE as specified, and the verify actually ENFORCES the
+spec (a refimpl that goes green while a "Must contain" literal is absent means
+the verify is benign).
+
+Write the SIMPLEST change that makes the verify pass. It doubles as your review
+reference when the model's diff comes back.
+"""
+import pathlib
+import sys
+
+wt = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+p = wt / {target!r}
+t = p.read_text()
+
+OLD = """TODO -- the exact text to replace"""
+NEW = """TODO -- the replacement"""
+
+assert OLD in t, "refimpl anchor not found -- did the target change?"
+p.write_text(t.replace(OLD, NEW, 1))
+print("refimpl applied")
+'''
+
+
+def build_python(root: Path, a):
+    # Only seed requirements.txt for a fresh project. In --repo mode an empty
+    # requirements.txt is an untracked leak into the diff, and for a pyproject-
+    # only repo it makes the verify build a venv against an empty file so imports
+    # fail for env reasons. PY_VERIFY already guards `[ -f requirements.txt ]`,
+    # so its absence is handled; a repo that DOES use one keeps its own.
+    if not a.repo:
+        (root / "requirements.txt").touch()
+    tgt = root / a.target
+    tgt.parent.mkdir(parents=True, exist_ok=True)
+    if not tgt.exists():
+        tgt.write_text('"""TODO -- the target under test."""\n')
+    (root / a.fixture_rel).write_text(PY_FIXTURE.format(
+        label=a.label, target_py=a.target, mark=SCAFFOLD_MARK,
+        fixture_rel=a.fixture_rel))
+    (root / "verify.sh").write_text(PY_VERIFY.format(
+        label=a.label, target=a.target, fixture_rel=a.fixture_rel))
+
+
+def _swift_module_from_target(target: str, label: str) -> str:
+    """The SwiftPM module a target lives in is `Sources/<Module>/...`. Deriving
+    it from --label (the old behaviour) yields a module the target is NOT part of
+    -- the fixture then `import`s a module the compiled `{target}` never joined
+    (an orphaned target, empty module). Derive it from the target's own path;
+    fall back to the label only when the path is not under Sources/."""
+    parts = Path(target).parts
+    if "Sources" in parts:
+        i = parts.index("Sources")
+        if i + 1 < len(parts) and not parts[i + 1].endswith(".swift"):
+            mod = re.sub(r"[^A-Za-z0-9]", "", parts[i + 1])
+            if mod:
+                return mod
+    return re.sub(r"[^A-Za-z0-9]", "", label.title()) or "Core"
+
+
+def build_swift(root: Path, a):
+    core = _swift_module_from_target(a.target, a.label)
+    src = root / "Sources" / core
+    tst = root / "Sources" / f"{core}Tests"
+    src.mkdir(parents=True, exist_ok=True)
+    tst.mkdir(parents=True, exist_ok=True)
+    # Don't clobber a real manifest in --repo mode: an existing Package.swift is
+    # the repo's own, and overwriting it with our two-target stub breaks the
+    # build. Only write our manifest when there isn't one (fresh project).
+    pkg = root / "Package.swift"
+    if not pkg.is_file():
+        pkg.write_text(SWIFT_PACKAGE.format(name=core, core=core))
+    elif a.repo:
+        print(f"  note: keeping existing Package.swift in {a.repo} "
+              f"(not overwriting with the scaffold's {core}/{core}Tests stub); "
+              "ensure it declares an executable test target the verify can run.",
+              file=sys.stderr)
+    tgt = root / a.target
+    tgt.parent.mkdir(parents=True, exist_ok=True)
+    if not tgt.exists():
+        tgt.write_text(f"// TODO -- the target under test.\nimport Foundation\n")
+    a.fixture_rel = f"Sources/{core}Tests/main.swift"
+    (root / a.fixture_rel).write_text(SWIFT_FIXTURE.format(
+        label=a.label, core=core, mark=SCAFFOLD_MARK,
+        fixture_rel=a.fixture_rel))
+    (root / "verify.sh").write_text(SWIFT_VERIFY.format(
+        label=a.label, core=core))
+
+
+
+def build_ts(root: Path, a):
+    # Static env-parity discovery from the source tree (sub-package
+    # node_modules + import-time required env vars). Runs once here so every
+    # verify flavour and task_md() sees a._ts_subpkg_nm / a._ts_env_vars.
+    _detect_ts_env_parity(a)
+    if a.kind == "expression":
+        return build_ts_expr(root, a)
+    if getattr(a, "ts_runner", "tsx") == "node-test":
+        return build_ts_node_test(root, a)
+    if not a.symbol:
+        if getattr(a, "task", None) == "diagnosis":
+            # A diagnosis is READ-ONLY: it writes DIAGNOSIS.md, imports no symbol,
+            # and its emitted fixture/verify are DISCARDED downstream (the diagnosis
+            # flavour deletes the fixture and overwrites verify.sh). Use a throwaway
+            # name so this soon-to-be-dropped stub is still valid rather than forcing
+            # the operator to invent a --symbol a diagnosis never uses.
+            a.symbol = "diagnosisTarget"
+        else:
+            # build_ts cannot name the imported symbol without it; main() enforces
+            # this, but guard so a direct call fails loudly rather than emitting a
+            # fixture that imports `undefined`.
+            raise SystemExit("--symbol is required for --lang typescript --kind symbol")
+    tgt = root / a.target
+    tgt.parent.mkdir(parents=True, exist_ok=True)
+    if not tgt.exists():
+        # A creation task: seed a stub so the tree has something to commit. The
+        # verify fails at baseline (symbol not yet real) until it is written.
+        tgt.write_text(f"// TODO -- define {a.symbol} here.\n"
+                       f"export function {a.symbol}() {{ /* TODO */ }}\n")
+    # .mts, not .mjs: the harness is TypeScript (it imports a typed symbol and
+    # annotates chk). .mts is unambiguously an ESM+TS module for tsx.
+    a.fixture_rel = "verify_impl.mts"
+    (root / a.fixture_rel).write_text(TS_FIXTURE.format(
+        label=a.label, mark=SCAFFOLD_MARK, fixture_rel=a.fixture_rel,
+        target=a.target, symbol=a.symbol))
+    (root / "verify.sh").write_text(TS_VERIFY.format(
+        label=a.label, fixture_rel=a.fixture_rel, target=a.target,
+        ts_parse=str(TS_PARSE), bootstrap=TS_BOOTSTRAP + _ts_env_parity_addendum(a),
+        target_err=_tsc_target_grep(a.target)))
+    a._ts_node_modules = _link_node_modules(root, a)
+
+
+def build_ts_node_test(root: Path, a):
+    """node --test flavour: the fix spans multiple files and the repo runs its
+    own tests via `node --test` (native `--experimental-strip-types` or, when the
+    repo uses `@/` path aliases, `tsx --test`). The adversarial cases live in a
+    real repo-style test file, not our importable-symbol harness. --test-file
+    names the new/edited test file(s); when none is given we emit a starter."""
+    tgt = root / a.target
+    tgt.parent.mkdir(parents=True, exist_ok=True)
+    if not tgt.exists():
+        tgt.write_text(f"// TODO -- implement the fix for {a.label} in {a.target}.\n")
+    test_files = list(a.test_file) if a.test_file else []
+    if not test_files:
+        # No test file named -- emit a starter at the worktree root for the
+        # operator to author (the model never edits it).
+        starter = "verify.test.ts"
+        target_noext = re.sub(r"\.[cm]?[jt]sx?$", "", a.target)
+        (root / starter).write_text(TS_NODE_TEST_FIXTURE.format(
+            label=a.label, mark=SCAFFOLD_MARK, target_noext=target_noext))
+        test_files = [starter]
+    a.fixture_rel = test_files[0]
+    (root / "verify.sh").write_text(NODE_TEST_VERIFY.format(
+        label=a.label, target=a.target, ts_parse=str(TS_PARSE),
+        bootstrap=TS_BOOTSTRAP + _ts_env_parity_addendum(a), mark=SCAFFOLD_MARK,
+        target_err=_tsc_target_grep(a.target),
+        test_files=" ".join(test_files)))
+    a._ts_node_modules = _link_node_modules(root, a)
+
+
+def build_ts_expr(root: Path, a):
+    """Expression/region mode: the target is inline JSX / a literal / a ternary,
+    not an exported symbol. The fixture extracts the enclosing `{ ... }` around
+    a unique anchor from the SOURCE and evals it -- no import, so it is plain
+    ESM JS (.mjs) run under node. `--anchor`, not `--symbol`."""
+    if not a.anchor:
+        raise SystemExit("--anchor is required for --lang typescript --kind expression")
+    tgt = root / a.target
+    tgt.parent.mkdir(parents=True, exist_ok=True)
+    if not tgt.exists():
+        # Expression mode extracts from an EXISTING source by anchor -- there is
+        # nothing sensible to stub for a creation task, so require the target.
+        raise SystemExit(f"--kind expression needs an existing target ({a.target} "
+                         "not found); it extracts an anchored expression from source")
+    # .mjs (plain ESM JS): the fixture imports nothing typed, it reads the target
+    # as text and evals via new Function -- node runs it directly, no tsx.
+    a.fixture_rel = "verify_impl.mjs"
+    (root / a.fixture_rel).write_text(EXPR_FIXTURE.format(
+        label=a.label, mark=SCAFFOLD_MARK, fixture_rel=a.fixture_rel,
+        target=a.target, anchor_js=json.dumps(a.anchor)))
+    (root / "verify.sh").write_text(EXPR_VERIFY.format(
+        label=a.label, fixture_rel=a.fixture_rel, target=a.target,
+        ts_parse=str(TS_PARSE), bootstrap=TS_BOOTSTRAP + _ts_env_parity_addendum(a),
+        target_err=_tsc_target_grep(a.target)))
+    a._ts_node_modules = _link_node_modules(root, a)
+
+
+def _link_node_modules(root: Path, a):
+    """Symlink <worktree>/node_modules -> <source repo>/node_modules.
+
+    A linked git worktree does NOT inherit the source checkout's installed deps,
+    and tsx/tsc need them. The worktree is cut from the same HEAD with the same
+    package-lock, so the source repo's resolved tree is exactly what a fresh
+    `npm ci` would produce -- symlinking it is seconds and no network, versus
+    minutes and a full disk copy per dispatch. RECOMMENDED strategy; `npm ci`
+    in the worktree is the fallback when there is no source tree to borrow.
+    Returns a human note on which strategy applied. --repo only.
+    """
+    dst = root / "node_modules"
+    if dst.is_symlink() and not dst.exists():
+        # a DANGLING symlink (source's node_modules went away): unlink so we can
+        # re-point it, and so verify.sh's `[ ! -d ]` npm ci path is not tripped
+        # by a broken symlink it cannot install over.
+        try:
+            dst.unlink()
+        except OSError:
+            return "node_modules is a dangling symlink -- remove it, then `npm ci`"
+    elif dst.exists() or dst.is_symlink():
+        return "node_modules already present"
+    if not a.repo:
+        return ("no --repo source tree -- run `npm ci` in the worktree before "
+                "the first verify")
+    src = Path(a.repo).expanduser().resolve() / "node_modules"
+    if not src.is_dir():
+        return (f"source {src} is not installed -- run `npm ci` in {a.repo} "
+                "(or the worktree) before verify")
+    try:
+        dst.symlink_to(src)
+        return f"symlinked node_modules -> {src}"
+    except OSError as e:  # noqa: BLE001
+        return (f"could not symlink node_modules ({e}) -- run `npm ci` in the "
+                "worktree")
+
+
+# ---------------------------------------------------------------------------
+# Env-parity DISCOVERY for TS/JS (improvement #4). Two gaps that today only
+# surface as failed verify runs -- each one discovered only by running the
+# behavioural verify, hand-fixed, then re-run:
+#   (1) a SUB-PACKAGE (a dir under the repo with its OWN package.json +
+#       node_modules -- e.g. `sidecar/`) whose deps the repo-ROOT node_modules
+#       symlink does not cover, so `import`-ing the target dies on
+#       `Cannot find module 'playwright-core'`.
+#   (2) IMPORT-TIME env-var throws in the target or a same-repo relative dep
+#       (`if (!TRACKER_URL) throw new Error('TRACKER_URL env var is required')`)
+#       that abort module load before any test logic runs.
+# Both are decidable by static inspection of the SOURCE tree BEFORE the first
+# verify, and both are then handled in the generated verify.sh env bootstrap so
+# it re-runs cleanly across the up-to-30 iterations of one dispatch.
+# ---------------------------------------------------------------------------
+
+# `require('./x')`, `import ... from './x'`, `import('./x')`, `export ... from
+# './x'` -- RELATIVE specs only (leading dot). A bare/`@scope` spec is a
+# node_modules package and is never followed.
+_JS_REL_IMPORT_RE = re.compile(
+    r"""(?:require\(\s*|import\s*\(\s*|from\s*)['"](\.[^'"]+)['"]""")
+
+# The import-time "required env var" throw, keyed off the MESSAGE text (the most
+# reliable signal, and exactly the observed evidence): a string/template literal
+# naming an UPPER_SNAKE var immediately before "env var is required". Matches
+# 'TRACKER_URL env var is required' and `TRACKER_USER_ID env var is required...`.
+_ENV_REQUIRED_MSG_RE = re.compile(
+    r"""['"`]\s*\$?\{?\s*([A-Z][A-Z0-9_]{2,})\s*\}?\s+env(?:ironment)?[ _]?"""
+    r"""var(?:iable)?\s+is\s+required""")
+# assert(process.env.X, ...) -- the assertion form of the same obligation.
+_ENV_ASSERT_RE = re.compile(
+    r"""assert\(\s*process\.env\.([A-Z][A-Z0-9_]{2,})""")
+
+_JS_DEP_EXTS = ("", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs",
+                ".cjs", ".json")
+
+
+def _resolve_same_repo_dep(src_file: Path, spec: str, repo_root: Path):
+    """Resolve a RELATIVE import spec from src_file to a real file inside
+    repo_root. Returns the Path or None (unresolved, or resolves outside the
+    repo -- never chase out of the source tree)."""
+    base = src_file.parent / spec
+    cands = []
+    for e in _JS_DEP_EXTS:
+        cands.append(base.with_name(base.name + e) if e else base)
+    for e in _JS_DEP_EXTS[1:]:            # spec is a directory -> its index file
+        cands.append(base / ("index" + e))
+    for c in cands:
+        if not c.is_file():
+            continue
+        try:
+            c.resolve().relative_to(repo_root.resolve())
+        except (ValueError, OSError):
+            return None                    # outside the repo -- do not follow
+        return c
+    return None
+
+
+def _scan_ts_required_env_vars(target_abs: Path, repo_root: Path,
+                               max_hops: int = 3):
+    """VAR names an import-time throw/assert demands, gathered from the target
+    and its same-repo relative deps (<= max_hops). node_modules and out-of-repo
+    specs are never followed. Returns {VAR: Path-where-found}."""
+    seen: set = set()
+    found: dict = {}
+
+    def visit(path: Path, depth: int):
+        try:
+            rp = path.resolve()
+        except OSError:
+            return
+        if rp in seen:
+            return
+        seen.add(rp)
+        try:
+            src = path.read_text(errors="replace")
+        except OSError:
+            return
+        for m in _ENV_REQUIRED_MSG_RE.finditer(src):
+            found.setdefault(m.group(1), path)
+        for m in _ENV_ASSERT_RE.finditer(src):
+            found.setdefault(m.group(1), path)
+        if depth >= max_hops:
+            return
+        for m in _JS_REL_IMPORT_RE.finditer(src):
+            dep = _resolve_same_repo_dep(path, m.group(1), repo_root)
+            if dep is not None:
+                visit(dep, depth + 1)
+
+    visit(target_abs, 0)
+    return found
+
+
+def _detect_subpackage_nm(target_rel: str, repo_root: Path):
+    """Nearest ancestor dir of the target (BELOW the repo root) that is its own
+    package -- a package.json AND a real (non-symlink) node_modules in the
+    source. Returns (rel_node_modules_path, source_node_modules_abs) or None.
+    The repo root itself is excluded: _link_node_modules already handles it."""
+    for parent in Path(target_rel).parents:
+        if parent == Path("."):
+            break                          # reached the repo root -- stop
+        pkg = repo_root / parent / "package.json"
+        nm = repo_root / parent / "node_modules"
+        if pkg.is_file() and nm.is_dir() and not nm.is_symlink():
+            return (str(parent / "node_modules"), nm.resolve())
+    return None
+
+
+def _env_dummy(var: str) -> str:
+    """A harmless import-time placeholder, shaped so a naive parse of the value
+    (new URL(...), Number(...)) does not itself throw."""
+    u = var.upper()
+    if "URL" in u or "URI" in u or u.endswith(("ENDPOINT", "HOST", "ORIGIN")):
+        return "http://localhost:3000"
+    if (u.endswith("ID") or "PORT" in u or "NUMBER" in u
+            or u.endswith(("NUM", "COUNT", "SIZE", "TIMEOUT", "LIMIT"))):
+        return "1"
+    return "x"
+
+
+def _detect_ts_env_parity(a):
+    """Populate a._ts_subpkg_nm and a._ts_env_vars from the SOURCE tree. Best
+    effort: any failure leaves the field empty so the scaffold is never worse
+    off than before this feature. --repo only (nothing to inspect otherwise)."""
+    a._ts_subpkg_nm = None
+    a._ts_env_vars = {}
+    if not a.repo:
+        return
+    repo_root = Path(a.repo).expanduser().resolve()
+    try:
+        a._ts_subpkg_nm = _detect_subpackage_nm(a.target, repo_root)
+    except Exception:                      # noqa: BLE001
+        a._ts_subpkg_nm = None
+    try:
+        a._ts_env_vars = _scan_ts_required_env_vars(repo_root / a.target,
+                                                     repo_root)
+    except Exception:                      # noqa: BLE001
+        a._ts_env_vars = {}
+
+
+def _ts_env_parity_addendum(a) -> str:
+    """Per-dispatch shell appended to TS_BOOTSTRAP: (1) a sub-package
+    node_modules symlink pointing at the source copy, mirroring how the root
+    node_modules is linked, and (2) dummy exports for import-time-required env
+    vars. Empty string when there is nothing to add."""
+    lines = []
+    subpkg = getattr(a, "_ts_subpkg_nm", None)
+    if subpkg:
+        rel, src_abs = subpkg
+        q_rel, q_src = shlex.quote(rel), shlex.quote(str(src_abs))
+        lines.append(
+            "\n# --- sub-package node_modules (env parity) ---\n"
+            f"# {a.target} lives under a sub-package with its OWN node_modules "
+            "in the source;\n"
+            "# the repo-root node_modules symlink does not cover it. Link the "
+            "sub-package's\n"
+            "# deps from the source (same HEAD, same lock) -- do NOT clobber an "
+            "existing path.\n"
+            f"if [ ! -e {q_rel} ]; then\n"
+            f"  if [ -d {q_src} ]; then\n"
+            f"    mkdir -p \"$(dirname {q_rel})\"\n"
+            f"    ln -s {q_src} {q_rel} && echo \"  ok: linked {rel} -> "
+            "source\"\n"
+            "  else\n"
+            f"    echo \"  WARN: sub-package deps {q_src} not installed in the "
+            "source -- run npm ci there\"\n"
+            "  fi\n"
+            "else\n"
+            f"  echo \"  ok: {rel} already present\"\n"
+            "fi")
+    env_vars = getattr(a, "_ts_env_vars", None) or {}
+    if env_vars:
+        lines.append(
+            "\n# --- import-time required env vars (DUMMIES for module load "
+            "only) ---\n"
+            "# The target (or a same-repo dep) throws at IMPORT if these are "
+            "unset. These\n"
+            "# placeholders let the module LOAD so the behavioural test can "
+            "run; they are\n"
+            "# NOT real config and prove nothing about runtime behaviour. "
+            "Named in TASK.md.")
+        for v in sorted(env_vars):
+            lines.append(f'export {v}="${{{v}:-{_env_dummy(v)}}}"')
+    return "\n".join(lines)
+
+
+def _ts_test_env_section(a) -> str:
+    """A `## Test environment` block naming every env var verify.sh will export
+    -- the spec-gap check requires each var the verify sets to be NAMED in the
+    task, so auto-exporting them obliges us to auto-name them."""
+    env_vars = getattr(a, "_ts_env_vars", None) or {}
+    if not env_vars:
+        return ""
+    out = ["## Test environment\n",
+           "`verify.sh` exports dummy values for these env vars because the "
+           "target (or a\n"
+           "same-repo dependency) throws at IMPORT time when they are unset. "
+           "They exist so\n"
+           "the module can LOAD for the behavioural test -- they are "
+           "placeholders, NOT real\n"
+           "config. Do NOT add code that depends on their values:\n"]
+    for v in sorted(env_vars):
+        out.append(f"- `{v}` -- required at import time; dummy `{_env_dummy(v)}`")
+    return "\n".join(out) + "\n\n"
+
+
+def mirror_from(root: Path, src: Path, renames, a):
+    """Port a SIBLING dispatch's fixture/refimpl/verify, swapping symbol names.
+
+    Deterministic -- no model. A mirror fix (the Radarr one mirrors Sonarr's)
+    reuses the sibling's adversarial cases almost verbatim; hand-porting them is
+    typing, and typing is where a case gets dropped.
+
+    What this CANNOT do is decide the ported cases are RELEVANT to the new
+    target. A case that was adversarial for Sonarr may be benign for Radarr.
+    So it reports every rename it applied and every OLD symbol still present
+    afterwards -- a leftover is a half-applied port, which is the same failure
+    mode as a model half-applying a multi-site instruction, and it reads as a
+    working fixture right up until it certifies nothing.
+    """
+    ported = []
+    for rel in ("test_fixture.py", "verify.sh", "refimpl.py",
+                "check_literals.py"):
+        s = src / rel
+        if not s.is_file():
+            continue
+        body = s.read_text(errors="replace")
+        for old, new in renames:
+            body = body.replace(old, new)
+        (root / rel).write_text(body)
+        ported.append(rel)
+
+    # UNPORTED SYMBOLS. The first version of this checked whether an OLD name
+    # survived the rename -- dead code, because str.replace replaces every
+    # occurrence, and worse it would have false-fired on a prefix rename
+    # (is_safe -> is_safe_v2 leaves "is_safe" present by construction). The
+    # real risk is the opposite: a symbol the sibling used that you FORGOT to
+    # list in --rename, so the ported fixture calls something the new target
+    # does not define. That is decidable -- parse the target, compare.
+    unported = sorted(_missing_target_attrs(root, a.target))
+    return ported, unported
+
+
+def _missing_target_attrs(root: Path, target_rel: str):
+    """`target.<attr>` referenced by the ported fixture but not defined in the
+    new target. Python only; returns empty for anything it cannot parse."""
+    fx = root / "test_fixture.py"
+    tgt = root / target_rel
+    if not (fx.is_file() and tgt.is_file() and target_rel.endswith(".py")):
+        return set()
+    import ast as _ast
+    try:
+        ftree = _ast.parse(fx.read_text(errors="replace"))
+        ttree = _ast.parse(tgt.read_text(errors="replace"))
+    except SyntaxError:
+        return set()
+    defined = set()
+    for n in ttree.body:
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+            defined.add(n.name)
+        elif isinstance(n, _ast.Assign):
+            for tg in n.targets:
+                if isinstance(tg, _ast.Name):
+                    defined.add(tg.id)
+    used = {n.attr for n in _ast.walk(ftree)
+            if isinstance(n, _ast.Attribute)
+            and isinstance(n.value, _ast.Name) and n.value.id == "target"}
+    return used - defined
+
+def _parse_must_contain_pairs(task_text: str):
+    """(file_or_None, literal) pairs from TASK.md's `## Must contain` block.
+
+    A bullet carrying `in <path>:` pins every backtick-literal on that line to
+    <path>; a bare bullet yields a default-TARGET literal (file None). TODO
+    placeholders are skipped. This MUST match _parse_must_contain embedded in
+    the CHECK_LITERALS template verbatim, or the runtime drift guard false-fires.
+    """
+    m = re.search(r"##+\s*Must contain[^\n]*\n(.*?)(?=\n##\s|\Z)",
+                  task_text, re.S | re.I)
+    if not m:
+        return []
+    out = []
+    for line in m.group(1).splitlines():
+        fm = re.search(r"(?:^|\s)in\s+([^\s:`]+)\s*:", line)
+        f = fm.group(1) if fm else None
+        for lm in re.finditer(r"`([^`\n]{1,200})`", line):
+            lit = lm.group(1)
+            if "TODO" in lit:
+                continue
+            out.append([f, lit])
+    return out
+
+
+def freeze_literals(root: Path):
+    """Copy TASK.md's Must-contain literals into check_literals.py verbatim.
+
+    Mechanical, no judgment -- so it is the generator's job, not yours.
+    """
+    task = (root / "TASK.md").read_text()
+    # Canonical frozen form is a list of [file_or_null, literal] pairs. A bullet
+    # carrying `in <path>:` pins its literal(s) to <path>; a bare bullet is a
+    # default-TARGET literal (file null). This MUST match _parse_must_contain in
+    # the CHECK_LITERALS template verbatim, or the drift guard false-fires.
+    # Bound is {1,200}, not {4,200}: a 2-3 char must-contain literal (`>=`,
+    # `!==`, `??`) was silently dropped from BOTH the freeze and the check by the
+    # old 4-char floor, so the verify never asserted it.
+    pairs = _parse_must_contain_pairs(task)
+    short = [l for _f, l in pairs if len(l) < 4]
+    if short:
+        print("  note: short literal(s) now frozen (were dropped under the old "
+              "4-char floor): " + ", ".join(repr(s) for s in short))
+    perfile = [(fpath, l) for fpath, l in pairs if fpath]
+    if perfile:
+        print("  note: per-file literal(s) frozen (checked in the named file, "
+              "not the default target):")
+        for fpath, l in perfile:
+            print(f"    in {fpath}: {l!r}")
+    f = root / "check_literals.py"
+    if not f.is_file():
+        print(f"no check_literals.py in {root}", file=sys.stderr)
+        return 2
+    body = f.read_text()
+    lits = pairs  # freeze the pairs verbatim
+    # repr, NOT json.dumps: the frozen line is PYTHON source, and a None file
+    # (a default-TARGET literal) must render as `None`, not JSON `null` (which
+    # is a NameError at import). repr escapes embedded quotes safely too.
+    new = re.sub(r"^LITERALS = \[.*?\]$",
+                 "LITERALS = " + repr(lits),
+                 body, count=1, flags=re.M | re.S)
+    # re.sub is a no-op on a miss, and the first version then printed
+    # "froze N literal(s)" over a file it had not changed. The verify does
+    # catch it downstream ("no frozen literals"), but a tool that reports
+    # success for work it did not do sends you to debug the wrong thing.
+    if new == body and lits:
+        print(f"could NOT freeze: no top-level `LITERALS = [...]` line in "
+              f"{f}. Nothing was written.", file=sys.stderr)
+        return 2
+    f.write_text(new)
+    if not lits:
+        print("froze 0 literals -- TASK.md's Must contain list is empty or "
+              "still TODO. The verify will keep failing, correctly.")
+        return 1
+    print(f"froze {len(lits)} literal(s) into check_literals.py:")
+    for fpath, l in lits:
+        where = f" (in {fpath})" if fpath else ""
+        print(f"  {l!r}{where}")
+    return 0
+
+
+def seal_baseline(root: Path):
+    """Commit the (now-authored) harness into the worktree baseline so the
+    launch tree is CLEAN and the harness is TRACKED.
+
+    Run this as the LAST step before preflight, after the cases, TASK.md,
+    literals and refimpl are all authored. It is the fix for the two gate
+    frictions a hand-rolled TS harness hit:
+      (a) the queue recorded a DIRTY launch baseline (untracked harness files),
+          and the gate flagged "started from a dirty tree -- the diff is not
+          attributable to this job"; and
+      (b) a harness file the gate's untracked-exclusion list did not recognise
+          (a `.mts` fixture) rode into `git diff HEAD` as a new file and
+          scope-check flagged "the diff edits the VERIFY".
+    Once committed, the harness is tracked-and-unmodified: it never appears in
+    the model's diff, and `git status` is clean at enqueue. This is the strong
+    form of "register the verify as excluded" -- it removes the harness from the
+    diff rather than depending on a name-matching allowlist. The gate's
+    both-ways refimpl proof (verify RED at this HEAD, GREEN with refimpl
+    applied) is unaffected: the target is committed unmodified.
+
+    Mechanical, no judgment -- so it is the generator's job, not yours.
+    """
+    if not (root / ".git").exists():
+        print(f"{root} is not a git worktree/repo -- nothing to seal.",
+              file=sys.stderr)
+        return 2
+    rc, out, _ = sh(["git", "-C", str(root), "rev-parse",
+                     "--is-inside-work-tree"])
+    if rc != 0 or out.strip() != "true":
+        print(f"{root} is not inside a git work tree.", file=sys.stderr)
+        return 2
+    # The DEFAULT list is a fallback for scaffolds that predate the manifest, and
+    # is intentionally a set of well-known scaffold basenames. It is NOT the
+    # cross-tool harness CONSTANT that preflight/integrate also reference --
+    # reconciling THAT constant across the three tools is semantic and is the
+    # coordinator's job, not this one. This function only seals what THIS scaffold
+    # actually AUTHORED.
+    harness = ["TASK.md", "verify.sh", "verify.test.ts", "verify_impl.mts",
+               "verify_impl.mjs", "verify_impl.js", "test_fixture.py",
+               "check_literals.py", "refimpl.py", "Package.swift"]
+    # The manifest is the authoritative record of everything the scaffold wrote
+    # for THIS dispatch -- crucially including a caller-supplied --test-file path
+    # (which may be nested, e.g. `tests/foo.test.ts`) that the hardcoded list can
+    # never name. Without it those authored files stay UNtracked at launch -> a
+    # dirty launch baseline, the exact friction seal exists to remove.
+    manifest = root / ".dispatch-harness.json"
+    authored = list(harness)
+    if manifest.is_file():
+        try:
+            extra = json.loads(manifest.read_text()).get("authored", [])
+            for h in extra:
+                if h not in authored:
+                    authored.append(h)
+        except (OSError, ValueError):
+            pass  # a corrupt manifest falls back to the default list
+    present = [h for h in authored if (root / h).is_file()]
+    if not present:
+        print("no harness files found to seal.", file=sys.stderr)
+        return 2
+    # The preflight writes .preflight-state.json INTO the tree as a secondary
+    # copy (the authoritative ledger lives outside it). Left visible to git it
+    # shows up as an untracked path at launch, and the queue records a DIRTY
+    # launch baseline -> the gate raises a high-severity "diff not attributable
+    # / verify exit 0 may predate the model's work" false positive on EVERY
+    # dispatch. Exclude it locally (never touches the repo's own .gitignore) so
+    # git ignores it entirely -- not tracked, not "untracked".
+    # LOW-15 note: from a LINKED worktree, `git rev-parse --git-path info/exclude`
+    # resolves to the COMMON git dir (the source repo's .git/info/exclude), shared
+    # by every worktree -- there is no per-worktree info/exclude that git reads, so
+    # this is also the ONLY exclude that takes effect here. The entries we append
+    # (`.preflight-state.json`, `.dispatch-harness.json`) are basenames that only
+    # ever exist inside a dispatch worktree, so polluting the shared exclude has no
+    # effect on the source checkout or non-dispatch worktrees. Idempotent by the
+    # substring guard below.
+    rc, gitpath, _ = sh(["git", "-C", str(root), "rev-parse",
+                         "--git-path", "info/exclude"])
+    if rc == 0 and gitpath.strip():
+        excl = (root / gitpath.strip())
+        try:
+            existing = excl.read_text() if excl.is_file() else ""
+            add = [n for n in (".preflight-state.json", ".dispatch-harness.json")
+                   if n not in existing]
+            if add:
+                excl.parent.mkdir(parents=True, exist_ok=True)
+                with excl.open("a") as fh:
+                    if existing and not existing.endswith("\n"):
+                        fh.write("\n")
+                    for n in add:
+                        fh.write(n + "\n")
+        except OSError:
+            pass  # exclude is best-effort; a tracked commit still seals cleanly
+    sh(["git", "-C", str(root), "add", "--"] + present)
+    # Only the harness -- NOT the target (the model must edit it from HEAD) and
+    # NOT node_modules / build caches.
+    rc, _, err = sh(["git", "-C", str(root), "commit", "-qm",
+                     "seal dispatch harness (clean launch baseline)"])
+    if rc != 0:
+        # Nothing staged (already sealed, or files gitignored) is the common
+        # benign case; report it rather than claiming a commit happened.
+        rc2, st, _ = sh(["git", "-C", str(root), "status", "--porcelain",
+                         "--"] + present)
+        if rc2 == 0 and not st.strip():
+            print("harness already sealed (no changes to commit).")
+            return 0
+        print(f"could not seal baseline: {err.strip()}", file=sys.stderr)
+        return 2
+    print("sealed harness into baseline (clean launch tree): "
+          + ", ".join(present))
+    rc, st, _ = sh(["git", "-C", str(root), "status", "--porcelain"])
+    stray = [l for l in st.splitlines()
+             if l.strip() and "node_modules" not in l
+             and not l.endswith(".tsbuildinfo")]
+    if stray:
+        print("  note: tree still shows -- review before enqueue:")
+        for l in stray:
+            print("    " + l)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# REPO_MAP.md generator (Penn 2026-09-08) -- the highest-leverage diagnosis fix.
+# Live evidence: a 27B model looping a diagnosis was not really "repeating a grep" --
+# it could not LOCALIZE where a value was computed, grepped blind, got walls of hits,
+# and flailed. Anti-thrash stops the identical repeat but not the blind-discovery root
+# cause. Hand the model a map so discovery becomes lookup. Bounded on purpose: this is
+# a SUMMARY, never a dump of the tree.
+# ---------------------------------------------------------------------------
+REPO_MAP_MAX_FILES = 400          # files scanned before we stop walking
+REPO_MAP_MAX_LINES = 600          # hard cap on emitted REPO_MAP.md lines (bounded)
+REPO_MAP_SYMBOLS_PER_FILE = 12    # symbols listed per file before eliding
+REPO_MAP_DIGEST_MAX = 60          # computation-digest hits emitted
+REPO_MAP_MAX_FILE_BYTES = 400_000  # skip a single file bigger than this
+_REPO_MAP_SKIP_DIRS = {
+    ".git", "node_modules", "dist", "build", "out", ".next", ".venv", "venv",
+    "__pycache__", ".mypy_cache", ".pytest_cache", "vendor", "coverage",
+    ".turbo", ".cache", "target", ".ollama-dispatch",
+}
+_REPO_MAP_PY = (".py",)
+_REPO_MAP_TSJS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+
+# Symbol patterns. TS/JS: exported functions/consts/classes/components + default exports.
+_RE_TSJS_SYMBOL = re.compile(
+    r'^\s*export\s+(?:default\s+)?(?:async\s+)?'
+    r'(?:function\s+(?P<fn>[A-Za-z_$][\w$]*)'
+    r'|class\s+(?P<cls>[A-Za-z_$][\w$]*)'
+    r'|(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*))')
+_RE_TSJS_DEFAULT = re.compile(r'^\s*export\s+default\s+(?!function|class)')
+# Python: top-level def/class and UPPER_CASE module constants.
+_RE_PY_DEF = re.compile(r'^(?:async\s+)?def\s+(?P<fn>[A-Za-z_]\w*)')
+_RE_PY_CLASS = re.compile(r'^class\s+(?P<cls>[A-Za-z_]\w*)')
+_RE_PY_CONST = re.compile(r'^(?P<const>[A-Z][A-Z0-9_]{2,})\s*[:=]')
+# Computation digest: where quantities/counts/totals are summed or reduced. The
+# "where is X computed" question is the classic diagnosis. Language-leaning toward
+# JS/Python but the sum/total/count/+= forms catch many languages loosely.
+_RE_DIGEST = re.compile(
+    r'\.reduce\s*\(|\breduce\s*\(|\.length\b|\bsum\s*\(|\bmath\.fsum\b'
+    r'|\+=\s*|\btotal\b|\bsubtotal\b|\bcount\b|\bquantity\b|\bqty\b'
+    r'|\baccumulat|\btally\b', re.IGNORECASE)
+
+
+def _repo_map_iter_files(root: Path):
+    """Yield source files under root (bounded, skipping vendored/build dirs)."""
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _REPO_MAP_SKIP_DIRS
+                       and not d.startswith(".")]
+        for fn in sorted(filenames):
+            suf = Path(fn).suffix
+            if suf not in _REPO_MAP_PY and suf not in _REPO_MAP_TSJS:
+                continue
+            p = Path(dirpath) / fn
+            try:
+                if p.stat().st_size > REPO_MAP_MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            yield p
+            seen += 1
+            if seen >= REPO_MAP_MAX_FILES:
+                return
+
+
+def _repo_map_symbols(path: Path, text: str):
+    """Exported/top-level symbols for one file, capped per file."""
+    suf = path.suffix
+    syms = []
+    lines = text.splitlines()
+    if suf in _REPO_MAP_TSJS:
+        for ln in lines:
+            m = _RE_TSJS_SYMBOL.match(ln)
+            if m:
+                name = m.group("fn") or m.group("cls") or m.group("var")
+                kind = ("fn" if m.group("fn") else
+                        "class" if m.group("cls") else "const")
+                syms.append(f"{name} ({kind})")
+            elif _RE_TSJS_DEFAULT.match(ln):
+                syms.append("default (export)")
+    elif suf in _REPO_MAP_PY:
+        for ln in lines:
+            m = _RE_PY_DEF.match(ln)
+            if m:
+                syms.append(f"{m.group('fn')} (def)")
+                continue
+            m = _RE_PY_CLASS.match(ln)
+            if m:
+                syms.append(f"{m.group('cls')} (class)")
+                continue
+            m = _RE_PY_CONST.match(ln)
+            if m:
+                syms.append(f"{m.group('const')} (const)")
+    # de-dup preserving order, cap
+    out, place = [], set()
+    for s in syms:
+        if s not in place:
+            place.add(s)
+            out.append(s)
+    if len(out) > REPO_MAP_SYMBOLS_PER_FILE:
+        out = out[:REPO_MAP_SYMBOLS_PER_FILE] + [f"...(+{len(out) - REPO_MAP_SYMBOLS_PER_FILE} more)"]
+    return out
+
+
+def build_repo_map(root: Path) -> str:
+    """Build a bounded REPO_MAP.md for `root`: (a) a file->exported-symbols index
+    grouped by directory, and (b) a computation digest (file:line of sums/reduces/
+    totals). Deterministic, no model. Bounded by the REPO_MAP_* caps above so it
+    summarizes rather than dumps the tree."""
+    root = Path(root)
+    index = {}    # dir -> list[(relfile, [symbols])]
+    digest = []   # (relpath, lineno, trimmed line)
+    for p in _repo_map_iter_files(root):
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        rel = p.relative_to(root).as_posix()
+        d = str(Path(rel).parent)
+        syms = _repo_map_symbols(p, text)
+        if syms:
+            index.setdefault(d, []).append((rel, syms))
+        if len(digest) < REPO_MAP_DIGEST_MAX:
+            for i, ln in enumerate(text.splitlines(), 1):
+                if len(digest) >= REPO_MAP_DIGEST_MAX:
+                    break
+                if _RE_DIGEST.search(ln):
+                    trimmed = ln.strip()[:100]
+                    digest.append((rel, i, trimmed))
+
+    out = ["# REPO_MAP",
+           "",
+           "Auto-generated localization aid for this diagnosis. Consult this FIRST to "
+           "find WHERE code lives, then open only the few files you need. Do not grep "
+           "blind -- grep only to confirm a location this map already points to.",
+           ""]
+    out.append("## Symbol index (file -> exported / top-level symbols)")
+    out.append("")
+    for d in sorted(index):
+        out.append(f"### {d if d != '.' else '(root)'}")
+        for rel, syms in sorted(index[d]):
+            out.append(f"- `{rel}`: {', '.join(syms)}")
+            if len(out) >= REPO_MAP_MAX_LINES - 20:
+                out.append("- ...(index truncated -- repo is large; grep to confirm the rest)")
+                break
+        out.append("")
+        if len(out) >= REPO_MAP_MAX_LINES - 20:
+            break
+    out.append("## Computation digest (where quantities/totals/counts are computed)")
+    out.append("")
+    out.append("Grep-built list of sums/reduces/totals -- the classic 'where is X "
+               "computed' hits. file:line -> code.")
+    out.append("")
+    if digest:
+        for rel, i, trimmed in digest:
+            out.append(f"- `{rel}:{i}` -> `{trimmed}`")
+    else:
+        out.append("- (no obvious computation sites matched the digest heuristics)")
+    # Final hard cap so the file is always bounded.
+    if len(out) > REPO_MAP_MAX_LINES:
+        out = out[:REPO_MAP_MAX_LINES] + [
+            "", "...(REPO_MAP truncated at the line cap -- it is a summary, not a full listing)"]
+    return "\n".join(out) + "\n"
+
+
+# Browser-automation markers (Penn 2026-09-09). A code-fix flavour verifies the
+# fix OFFLINE against a static fixture. When the target drives a live browser
+# (Puppeteer/Playwright: page.evaluate, cross-origin frame traversal, $eval),
+# a static-HTML fixture goes GREEN while the real page stays broken -- the worst
+# form of the "benign fixture passes broken work" trap (today's Amazon scraper
+# iframe fix). Detect it and steer to --task diagnosis + live validation.
+_BROWSER_MARKERS = (
+    "page.evaluate", "page.frames", "frame.evaluate",
+    ".$eval(", ".$$eval(", "puppeteer", "playwright",
+)
+
+
+def _browser_markers(text: str):
+    """Markers present in the target's source, lower-cased substring match."""
+    low = text.lower()
+    return [m for m in _BROWSER_MARKERS if m.lower() in low]
+
+
+def _refuse_browser_context(target, hits):
+    """Loud refusal + live-validation checklist for a browser-context target."""
+    b = "!" * 72
+    print(b, file=sys.stderr)
+    print(f"REFUSING code-fix scaffold: {target} is BROWSER-AUTOMATION code.",
+          file=sys.stderr)
+    print(f"  markers found: {', '.join(hits)}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("A code-fix scaffold verifies the fix OFFLINE against a STATIC fixture.",
+          file=sys.stderr)
+    print("For a fix that touches LIVE-PAGE behaviour (cross-origin iframes,",
+          file=sys.stderr)
+    print("page.evaluate, frame traversal) a static-HTML fixture goes GREEN while",
+          file=sys.stderr)
+    print("the real page stays BROKEN -- the fixture certifies nothing. This is the",
+          file=sys.stderr)
+    print("exact 'benign fixture passes broken work' trap the gate exists to stop.",
+          file=sys.stderr)
+    print("", file=sys.stderr)
+    print("DO THIS INSTEAD:", file=sys.stderr)
+    print(f"  * re-run with --task diagnosis to scope WHERE/WHY on the live page,",
+          file=sys.stderr)
+    print("    then validate the fix by hand against a LIVE run:", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  LIVE-VALIDATION CHECKLIST (the fixture cannot do any of these):",
+          file=sys.stderr)
+    print("    [ ] reproduce the ORIGINAL defect on the real page (before the fix)",
+          file=sys.stderr)
+    print("    [ ] run the patched code against the SAME live page/URL",
+          file=sys.stderr)
+    print("    [ ] confirm the target data is now extracted (not just 'no error')",
+          file=sys.stderr)
+    print("    [ ] check the cross-origin/iframe path specifically, not the top frame",
+          file=sys.stderr)
+    print("    [ ] re-run on >=2 distinct live pages -- one page can pass by luck",
+          file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  If this file genuinely has a PURE, offline-testable helper and your fix",
+          file=sys.stderr)
+    print("  touches ONLY that, re-run with --allow-browser-context to override.",
+          file=sys.stderr)
+    print(b, file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Emit a dispatch scaffold. Deliberately NOT gate-passing: "
+                    "you author the adversarial assertions.")
+    ap.add_argument("--freeze-literals", metavar="DIR",
+                    help="copy TASK.md's Must-contain literals into "
+                         "check_literals.py verbatim, then exit. Run this "
+                         "after filling in the Must contain list.")
+    ap.add_argument("--seal-baseline", metavar="DIR",
+                    help="commit the authored harness into the worktree "
+                         "baseline (clean launch tree; harness tracked), then "
+                         "exit. LAST step before preflight, after authoring + "
+                         "--freeze-literals + refimpl.")
+    ap.add_argument("--label")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--repo", help="existing repo -- a git worktree is cut "
+                                    "from its HEAD")
+    src.add_argument("--new-project", help="fresh project dir (git init'd -- "
+                                           "the gate's both-ways proof needs a "
+                                           "revertible baseline)")
+    ap.add_argument("--dest", help="where to put the worktree (default: "
+                                   "~/.ollama-dispatch/worktrees/wt-<label>, a "
+                                   "stable scratch dir -- override with "
+                                   "$OLLAMA_DISPATCH_WORKTREES. NOT $TMPDIR, "
+                                   "which macOS purges after ~3 days.)")
+    ap.add_argument("--lang", choices=LANGS, default="python")
+    ap.add_argument("--target",
+                    help="the ONE file the model is told to edit")
+    ap.add_argument("--kind", choices=("symbol", "expression"), default="symbol",
+                    help="TS/JS target shape. symbol (default): an importable "
+                         "exported function, driven under tsx (needs --symbol). "
+                         "expression: inline JSX / a config or object literal / "
+                         "a ternary -- extracted from source by --anchor and "
+                         "eval'd, no import (needs --anchor).")
+    ap.add_argument("--symbol",
+                    help="function/method name to extract (required for "
+                         "--lang typescript --kind symbol; the fixture imports it)")
+    ap.add_argument("--anchor",
+                    help="a UNIQUE source literal inside the target expression "
+                         "(required for --kind expression). The fixture captures "
+                         "the enclosing { ... } around it and evals that body.")
+    ap.add_argument("--ts-runner", choices=("auto", "tsx", "node-test"),
+                    default="auto",
+                    help="TS/JS symbol-mode verify shape. tsx (default of auto "
+                         "when the repo does not test via node --test): import "
+                         "the single exported --symbol under tsx and drive it. "
+                         "node-test: for a fix spanning MULTIPLE files whose repo "
+                         "runs its own tests under `node --test` "
+                         "(--experimental-strip-types natively, or tsx --test "
+                         "when the repo uses `@/` path aliases). auto: inspect "
+                         "package.json's test script and pick. Ignored for "
+                         "--kind expression.")
+    ap.add_argument("--test-file", action="append", default=[], metavar="FILE",
+                    help="node-test mode: a new/edited test file the fix must "
+                         "make pass (repeatable). Omit to emit a starter "
+                         "verify.test.ts for you to author.")
+    ap.add_argument("--edit-file", action="append", default=[], metavar="FILE",
+                    help="node-test mode: an ADDITIONAL file (beyond --target) "
+                         "the model may edit. A node --test fix spans multiple "
+                         "files; without this the TASK.md scope line names only "
+                         "--target and `scope-respected` false-fails a legitimate "
+                         "multi-file diff. Repeatable.")
+    ap.add_argument("--entry-point", help="file:line of the change site")
+    ap.add_argument("--defect", help="the CONFIRMED symptom + how you saw it")
+    ap.add_argument("--property", help="what the change must satisfy")
+    ap.add_argument("--mirror-from", metavar="DIR",
+                    help="port a sibling dispatch's fixture/refimpl/verify "
+                         "instead of emitting empty stubs. Deterministic, no "
+                         "model. Use with --rename.")
+    ap.add_argument("--rename", action="append", metavar="OLD=NEW", default=[],
+                    help="symbol swap applied to the mirrored files. "
+                         "Repeatable.")
+    ap.add_argument("--force", action="store_true")
+    # --- phase-4 merge-resolution support (generic; used by ollama-dispatch-integrate) ---
+    ap.add_argument("--baseline-ref", metavar="TREEISH",
+                    help="cut the worktree/branch from THIS ref instead of HEAD "
+                         "(--repo mode only). Lets a caller start a dispatch from a "
+                         "PRE-MATERIALISED baseline tree -- e.g. a conflicted merge "
+                         "tree for a merge-resolution dispatch. Everything else "
+                         "(TASK.md, verify.sh, seal_baseline, manifest) is unchanged.")
+    ap.add_argument("--verify-file", metavar="PATH",
+                    help="install this verify.sh VERBATIM instead of generating a "
+                         "flavour verify. The caller owns the verify contract (e.g. "
+                         "the merge-resolution both-tests-green verify).")
+    ap.add_argument("--task", choices=("merge", "diagnosis"),
+                    help="emit a canned TASK.md instead of the flavour one. "
+                         "'merge': a conflict-resolution task -- resolve the "
+                         "conflict markers in --target, edit ONLY --target, both "
+                         "behavioural tests must pass. 'diagnosis': a READ-ONLY "
+                         "investigation -- read the repo, write findings to "
+                         "DIAGNOSIS.md; emits a SEARCH PLAN with a STOP condition + "
+                         "read budget and generates REPO_MAP.md into the worktree so "
+                         "the model localizes code instead of grepping blind.")
+    ap.add_argument("--task-file", metavar="PATH",
+                    help="install this TASK.md VERBATIM (overrides --task and the "
+                         "generated flavour TASK).")
+    ap.add_argument("--allow-browser-context", action="store_true",
+                    help="override the browser-automation refusal: proceed with a "
+                         "code-fix scaffold even though --target contains Puppeteer/"
+                         "Playwright markers. Use ONLY for a genuinely pure, "
+                         "offline-testable helper in such a file -- a fix that "
+                         "touches live-page behaviour (iframes, page.evaluate, "
+                         "frame traversal) CANNOT be validated by a static fixture.")
+    a = ap.parse_args()
+    if a.freeze_literals:
+        return freeze_literals(Path(a.freeze_literals).expanduser().resolve())
+    if a.seal_baseline:
+        return seal_baseline(Path(a.seal_baseline).expanduser().resolve())
+    if not a.label:
+        ap.error("--label is required")
+    a.fixture_rel = "test_fixture.py"
+
+    # ---- where -----------------------------------------------------------
+    if not (a.repo or a.new_project):
+        ap.error("one of --repo / --new-project is required")
+    if not a.target:
+        ap.error("--target is required")
+    if a.baseline_ref and not a.repo:
+        ap.error("--baseline-ref is only valid with --repo (it changes which ref "
+                 "the worktree is cut from)")
+    if a.verify_file:
+        vf = Path(a.verify_file).expanduser()
+        if not vf.is_file():
+            ap.error(f"--verify-file {a.verify_file} does not exist")
+    if a.task_file:
+        tf = Path(a.task_file).expanduser()
+        if not tf.is_file():
+            ap.error(f"--task-file {a.task_file} does not exist")
+    a.lang = LANG_ALIASES.get(a.lang, a.lang)
+    if a.kind == "expression" and a.lang != "typescript":
+        ap.error("--kind expression is only valid with --lang ts/js/typescript")
+    if a.lang == "typescript":
+        if a.kind == "expression" and not a.anchor:
+            ap.error("--anchor is required for --lang typescript --kind expression")
+        # Resolve --ts-runner auto from the source repo's package.json test
+        # script: a repo that runs `node --test` (native strip-types or via tsx)
+        # wants the node-test verify shape; everything else the tsx symbol harness.
+        if a.kind == "symbol" and a.ts_runner == "auto":
+            a.ts_runner = "tsx"
+            if a.repo:
+                pj = Path(a.repo).expanduser().resolve() / "package.json"
+                try:
+                    scripts = json.loads(pj.read_text()).get("scripts", {})
+                    test_script = str(scripts.get("test", ""))
+                    if re.search(r"(^|\s)node\b.*--test|--experimental-strip-types",
+                                 test_script):
+                        a.ts_runner = "node-test"
+                except Exception:  # noqa: BLE001  -- no/invalid package.json
+                    pass
+        # --symbol is required only for the tsx single-import harness; node-test
+        # drives the repo's own test file(s) for a multi-file fix, no import.
+        if (a.kind == "symbol" and a.ts_runner != "node-test" and not a.symbol
+                and a.task != "diagnosis"):
+            ap.error("--symbol is required for --lang typescript --kind symbol "
+                     "with the tsx runner (or use --ts-runner node-test for a "
+                     "multi-file fix, or --kind expression --anchor <literal>)")
+        if a.test_file and not (a.kind == "symbol"
+                                and a.ts_runner == "node-test"):
+            ap.error("--test-file is only valid with --ts-runner node-test "
+                     "(--lang ts --kind symbol)")
+        if a.edit_file and not (a.kind == "symbol"
+                                and a.ts_runner == "node-test"):
+            ap.error("--edit-file (multi-file scope) is only valid with "
+                     "--ts-runner node-test (--lang ts --kind symbol)")
+    elif a.edit_file:
+        ap.error("--edit-file is only valid with --lang ts --ts-runner node-test")
+    # _wt_cleanup is set once a worktree exists, so ANY failure after creation
+    # (a build_* raise, a mirror error) can remove the leaked worktree before
+    # exiting -- otherwise the registered worktree wedges every --force retry.
+    _wt_cleanup = None
+    branch = None
+    if a.repo:
+        repo = Path(a.repo).expanduser().resolve()
+        if not (repo / ".git").exists():
+            ap.error(f"{repo} is not a git repo")
+        # --- validate BEFORE creating the worktree (HIGH-2): a target typo or a
+        # bad input must not leave a leaked worktree behind. In --repo mode the
+        # target MUST already exist (MED-8): expression mode extracts from it, and
+        # for symbol mode a typo'd path would otherwise silently seed a STUB and
+        # dispatch against a bogus file with a green "parses" check. A genuine
+        # creation task uses --new-project.
+        if not (repo / a.target).exists():
+            ap.error(f"--target {a.target} does not exist in {repo} "
+                     "(--repo mode edits an EXISTING file; use --new-project to "
+                     "create one). Check for a typo -- a bad path would seed a "
+                     "stub and dispatch against a file that is not the real one.")
+        # Browser-context guard (see _browser_markers): refuse a code-fix flavour
+        # against Puppeteer/Playwright code, where a static fixture cannot prove
+        # the fix. Only the code-fix flavour is affected -- merge/diagnosis (and
+        # --allow-browser-context) skip it. Runs BEFORE worktree creation so a
+        # refusal leaks nothing.
+        _is_codefix = (a.task is None)
+        if _is_codefix and not a.allow_browser_context:
+            try:
+                _tgt_src = (repo / a.target).read_text(errors="replace")
+            except OSError:
+                _tgt_src = ""
+            _hits = _browser_markers(_tgt_src)
+            if _hits:
+                _refuse_browser_context(a.target, _hits)
+                return 2
+        dest = Path(a.dest).expanduser().resolve() if a.dest else \
+            _worktree_scratch_default(a.label)
+        branch = _safe_branch(a.label)
+        if dest.exists() and not a.force:
+            ap.error(f"{dest} exists (use --force)")
+        # --force RECOVERY: proactively remove a prior worktree + branch so the
+        # `git worktree add` below cannot fail with "already exists".
+        if a.force:
+            _remove_worktree(repo, dest, branch)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Real branch (HIGH-3), not a detached HEAD: seal_baseline and the fix
+        # commit need a reachable ref, and integrate assumes `dispatch/<slug>`.
+        # -B (force-create/reset) under --force so a leftover branch name is
+        # handled gracefully; -b otherwise so an existing branch errors loudly.
+        # --baseline-ref: start the worktree/branch from a caller-supplied treeish
+        # (e.g. a pre-materialised conflicted merge tree) instead of the repo HEAD.
+        base_ref = a.baseline_ref or "HEAD"
+        addcmd = ["git", "-C", str(repo), "worktree", "add",
+                  ("-B" if a.force else "-b"), branch, str(dest), base_ref]
+        rc, out, err = sh(addcmd)
+        if rc != 0:
+            # An existing branch name is the common non-force failure -- say so.
+            hint = ""
+            if "already exists" in err and not a.force:
+                hint = (f"\n  branch {branch!r} already exists -- re-run with "
+                        "--force to reset it, or choose a different --label.")
+            print(f"git worktree add failed: {err.strip()}{hint}",
+                  file=sys.stderr)
+            return 2
+        _wt_cleanup = (repo, dest, branch)
+        root, mode = dest, f"worktree of {repo.name} on {branch}"
+    else:
+        root = Path(a.new_project).expanduser().resolve()
+        if root.exists() and any(root.iterdir()) and not a.force:
+            ap.error(f"{root} exists and is not empty (use --force)")
+        root.mkdir(parents=True, exist_ok=True)
+        mode = "fresh project"
+
+    # ---- files -----------------------------------------------------------
+    # Everything past the worktree creation is wrapped so a failure removes the
+    # leaked worktree (HIGH-2). BaseException catches SystemExit from ap.error /
+    # build_* raises too. On the way out we re-raise so the exit code/message is
+    # unchanged; only the cleanup is added.
+    mirrored, leftovers = [], {}
+    try:
+        {"swift": build_swift, "typescript": build_ts}.get(
+            a.lang, build_python)(root, a)
+        # A diagnosis has no adversarial-case verify (its verify.sh checks
+        # DIAGNOSIS.md structure only), so check_literals.py / refimpl.py /
+        # the test fixture are all meaningless -- and sealing them into the
+        # baseline just clutters the review diff. Skip the code-fix harness
+        # entirely for the diagnosis flavour.
+        is_diag = (a.task == "diagnosis" and not a.task_file)
+        if not is_diag:
+            (root / "check_literals.py").write_text(
+                CHECK_LITERALS.format(target=a.target))
+        if a.mirror_from:
+            msrc = Path(a.mirror_from).expanduser().resolve()
+            if not msrc.is_dir():
+                ap.error(f"--mirror-from {msrc} is not a directory")
+            pairs = []
+            for r in a.rename:
+                if "=" not in r:
+                    ap.error(f"--rename expects OLD=NEW, got {r!r}")
+                o, n = r.split("=", 1)
+                pairs.append((o, n))
+            mirrored, leftovers = mirror_from(root, msrc, pairs, a)
+        # --verify-file: install the caller's verify.sh verbatim, replacing the
+        # flavour verify the build_* step wrote. The caller owns the contract.
+        if a.verify_file:
+            (root / "verify.sh").write_text(
+                Path(a.verify_file).expanduser().read_text())
+        # TASK.md: caller-supplied verbatim (--task-file) > canned (--task) > flavour.
+        if a.task_file:
+            (root / "TASK.md").write_text(
+                Path(a.task_file).expanduser().read_text())
+        elif a.task == "merge":
+            (root / "TASK.md").write_text(merge_task_md(a))
+        elif a.task == "diagnosis":
+            # Diagnosis: emit the SEARCH-PLAN/STOP-condition TASK and generate the
+            # localization map into the worktree so the model looks code up instead of
+            # grepping blind (the root cause of the diagnosis thrash).
+            (root / "TASK.md").write_text(diagnosis_task_md(a))
+            (root / "REPO_MAP.md").write_text(build_repo_map(root))
+            # A diagnosis writes DIAGNOSIS.md, not code -- so its verify must check
+            # that deliverable, not the code-fix contract (--lang already emitted).
+            # Overwrite the generic verify with the diagnosis-shaped one.
+            (root / "verify.sh").write_text(DIAGNOSIS_VERIFY)
+            # build_* emitted a code-fix test fixture (test_fixture.py /
+            # verify.test.ts / verify_impl.mts). The diagnosis verify.sh never
+            # references it, so drop it rather than seal a meaningless fixture
+            # into the baseline.
+            if a.fixture_rel:
+                (root / a.fixture_rel).unlink(missing_ok=True)
+            print(f"  GENERATED REPO_MAP.md ({(root / 'REPO_MAP.md').stat().st_size} bytes) "
+                  "-- localization aid for the diagnosis")
+        else:
+            (root / "TASK.md").write_text(task_md(a))
+        # HIGH-1: do NOT clobber a mirrored refimpl with the stub. mirror_from
+        # ports refimpl.py from the sibling (its both-ways proof); an
+        # unconditional stub write here silently replaced it with a TODO while
+        # the output still printed "MIRRORED ...: refimpl.py".
+        if "refimpl.py" not in mirrored and not is_diag:
+            (root / "refimpl.py").write_text(
+                REFIMPL_STUB.format(label=a.label, target=a.target))
+        os.chmod(root / "verify.sh", 0o755)
+
+        # Manifest of everything THIS scaffold authored, so --seal-baseline (a
+        # separate later invocation, with no access to these args) seals exactly
+        # this set -- crucially any --test-file/--edit-file path the hardcoded
+        # default list cannot name (HIGH-4). Excluded from git via info/exclude
+        # in seal_baseline. NOT the target (the model edits it).
+        authored = ["TASK.md", "verify.sh", "check_literals.py", "refimpl.py",
+                    a.fixture_rel]
+        if a.lang == "swift" and (root / "Package.swift").is_file():
+            authored.append("Package.swift")
+        if a.lang == "python" and not a.repo:
+            authored.append("requirements.txt")
+        if a.task == "diagnosis":
+            authored.append("REPO_MAP.md")  # seal the localization aid into the baseline
+        for extra in (a.test_file or []):
+            authored.append(extra)
+        authored = sorted({h for h in authored
+                           if h and (root / h).is_file()})
+        (root / ".dispatch-harness.json").write_text(
+            json.dumps({"authored": authored}, indent=2))
+
+        # A fresh project needs a baseline commit, or there is nothing for
+        # baseline-clean to compare against and no revert for the refimpl.
+        if a.new_project:
+            if not (root / ".git").exists():
+                sh(["git", "init", "-q", "-b", "main"], cwd=root)
+                sh(["git", "config", "user.email", "dispatch@local"], cwd=root)
+                sh(["git", "config", "user.name", "dispatch"], cwd=root)
+            sh(["git", "add", a.target], cwd=root)
+            if a.lang == "swift":
+                sh(["git", "add", "Package.swift"], cwd=root)
+            elif a.lang == "typescript":
+                pass  # the target is the only baseline artifact for a TS scaffold
+            elif (root / "requirements.txt").is_file():
+                sh(["git", "add", "requirements.txt"], cwd=root)
+            sh(["git", "commit", "-qm", f"baseline for {a.label}"], cwd=root)
+    except BaseException:
+        if _wt_cleanup:
+            print("  (removing the leaked worktree so a retry is clean)",
+                  file=sys.stderr)
+            _remove_worktree(*_wt_cleanup)
+        raise
+
+    # NOTE a --repo worktree's harness is NOT committed here. The emitted files
+    # still have TODO cases; the operator authors them next. Committing an empty
+    # harness now, then authoring into the tracked files, would re-dirty the
+    # tree and put the authored harness edits into `git diff HEAD` at gate time
+    # -- the exact frictions this is meant to remove. Sealing is a LATE step:
+    # `--seal-baseline DIR`, run after authoring + --freeze-literals + refimpl,
+    # immediately before preflight. See seal_baseline().
+
+    todo = sum(1 for p in (root / "TASK.md").read_text().splitlines()
+               if "TODO" in p)
+    print(f"\nscaffolded: {root}")
+    print(f"  {mode}, lang={a.lang}")
+    print("-" * 72)
+    if is_diag:
+        listed = ["TASK.md", "verify.sh", "REPO_MAP.md"]
+    else:
+        listed = ["TASK.md", "verify.sh", a.fixture_rel, "check_literals.py",
+                  "refimpl.py"]
+    for rel in listed:
+        print(f"  {rel}")
+    print("-" * 72)
+    nm = getattr(a, "_ts_node_modules", None)
+    if nm:
+        print(f"  node_modules: {nm}")
+    if a.lang == "typescript":
+        # Make the resolved verify shape visible: --ts-runner auto silently flips
+        # tsx<->node-test from package.json, and --symbol is ignored under
+        # node-test -- print it so the operator is not surprised by the harness.
+        print(f"  ts-runner: {a.ts_runner} (kind={a.kind})")
+        if a.ts_runner == "node-test" and a.symbol:
+            print("  note: --symbol is ignored under --ts-runner node-test "
+                  "(the fix drives repo test file(s), it does not import a symbol)")
+    if a.mirror_from and not mirrored:
+        # mirror_from only recognises the Python harness filenames -- a TS sibling
+        # (verify_impl.mts, etc.) ports NOTHING and the empty-stub scaffold is
+        # emitted instead. Warn rather than let it read as a successful mirror.
+        print(f"  !! --mirror-from {a.mirror_from} ported NOTHING -- it only "
+              "knows the Python harness (test_fixture.py/refimpl.py/verify.sh/\n"
+              "     check_literals.py). A TS/Swift sibling has none of those; the "
+              "empty-stub scaffold was emitted. Port those cases by hand.")
+    if mirrored:
+        print(f"MIRRORED from {a.mirror_from}: " + ", ".join(mirrored))
+        for o, n in [tuple(r.split("=", 1)) for r in a.rename]:
+            print(f"    {o}  ->  {n}")
+        if leftovers:
+            print("\n  !! PARTIAL PORT -- the ported fixture calls these, and "
+                  f"{a.target} does not define them:")
+            print("       " + ", ".join(leftovers))
+            print("     You probably missed a --rename. A half-ported fixture "
+                  "raises rather than\n     asserting, and a raising case "
+                  "counts as a failure, so the verify looks\n     "
+                  "discriminating while testing nothing.")
+        print("\n  The cases are REAL but their RELEVANCE is not ported: a case "
+              "that was\n  adversarial for the sibling may be benign for this "
+              "target. Read every one\n  against the new property before you "
+              "gate.\n")
+    if is_diag:
+        # A diagnosis has no adversarial cases and no reference impl -- the
+        # code-fix "NOT READY / author cases / write refimpl" footer does not
+        # apply. Its deliverable is DIAGNOSIS.md, and its verify only checks
+        # that file's STRUCTURE (a green diagnosis is UNVERIFIED, not proven).
+        print(f"NOT READY -- {todo} TODO(s) in TASK.md (fill the ONE question "
+              "this diagnosis must answer).")
+        print("This is a READ-ONLY investigation: the model writes DIAGNOSIS.md, "
+              "it does not\nedit source. verify.sh checks that deliverable's "
+              "STRUCTURE only -- a green\ndiagnosis is UNVERIFIED, not proven.\n")
+        print("NEXT:")
+        _n = 0
+        def _step(msg):
+            nonlocal _n
+            _n += 1
+            print(f"  {_n}. {msg}")
+        _step(f"fill the TODOs in {root}/TASK.md")
+        if a.repo:
+            _step("ollama-dispatch-scaffold --seal-baseline "
+                  f"{shlex.quote(str(root))}   # commit TASK.md/verify.sh/REPO_MAP.md -> clean launch tree")
+        _step("(optional) ~/bin/ollama-dispatch-preflight "
+              f"{shlex.quote(str(root))} --no-refimpl   # verify-timing only; a diagnosis has no refimpl")
+        _step("enqueue with the diagnosis num_ctx floor:\n"
+              f"       ~/bin/ollama-queue.py enqueue {shlex.quote(str(root))} "
+              "--num-ctx 49152 --task-kind coding")
+        _step("after it completes, "
+              f"`ollama-dispatch-preflight {shlex.quote(str(root))} --review`")
+        return 0
+    print(f"NOT READY -- {todo} TODO(s) in TASK.md"
+          + ("" if mirrored else f", and {a.fixture_rel} has NO adversarial "
+                                 "cases."))
+    print("The gate WILL NO-GO until you author them. That is the generator "
+          "working:\na scaffold that passed the gate would let you skip the "
+          "one step nothing can\nmechanise -- deciding what makes the verify "
+          "RELEVANT, not merely discriminating.\n")
+    print("NEXT:")
+    print(f"  1. fill the TODOs in {root}/TASK.md")
+    print(f"  2. author >= 3 adversarial cases in {root}/{a.fixture_rel}")
+    print(f"  2b. ollama-dispatch-scaffold --freeze-literals "
+          f"{shlex.quote(str(root))}   # after the Must-contain list is real")
+    print(f"  3. write the reference impl in {root}/refimpl.py")
+    if a.repo:
+        print(f"  3b. ollama-dispatch-scaffold --seal-baseline "
+              f"{shlex.quote(str(root))}   # commit the harness -> clean launch tree")
+    print(f"  4. ~/bin/ollama-dispatch-preflight {shlex.quote(str(root))} \\")
+    print(f"       --refimpl-cmd {shlex.quote(f'python3 refimpl.py {root}')} \\")
+    print("       --require '<a literal your TASK.md edit added>'")
+    print("  5. enqueue only on GO; after it completes, "
+          f"`ollama-dispatch-preflight {shlex.quote(str(root))} --review`")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

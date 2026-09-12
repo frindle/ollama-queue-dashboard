@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal HTTP API + frontend for ollama-queue.py, meant to sit behind the
-existing "Penn Only" Cloudflare Access policy (see ollama-queue.penndalton.com) --
+existing access policy (e.g. Cloudflare Access) on your reverse proxy --
 this process trusts every request that reaches it, since Access already
 authenticated it before the tunnel connector ever proxies here. Do not expose
 this port directly to the LAN/internet without Access in front of it.
