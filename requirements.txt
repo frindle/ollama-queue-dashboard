@@ -1,0 +1,14 @@
+# The queue daemon, worker, and HTTP API/dashboard are pure Python 3.12
+# standard library -- there are NO required third-party dependencies, so this
+# file is intentionally (almost) empty and the Docker image installs nothing.
+#
+# The optional extras below are ONLY used by the coding/research dispatch path
+# (ollama-worker.py's web_fetch / PDF tooling). They are NOT needed for the
+# dashboard, job routing, or the OpenAI-compatible /v1 LLM proxy -- the features
+# that work out of the box in the container. Install them only if you also run
+# in-container research dispatches (which additionally need target repos mounted;
+# see "Known limitations" in the README).
+#
+# trafilatura
+# pypdf
+# pdfplumber

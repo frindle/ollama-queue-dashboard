@@ -1,0 +1,30 @@
+services:
+  ollama-queue:
+    build: .
+    # Or use a prebuilt image instead of build:
+    # image: ghcr.io/YOURNAME/ollama-queue-dashboard:latest
+    container_name: ollama-queue
+    ports:
+      - "7684:7684"                 # dashboard + API + /v1 LLM endpoint
+    environment:
+      # Set a token to require Authorization: Bearer <token> (or X-Api-Token)
+      # on every request. Leave unset only on a trusted network / behind a proxy.
+      QUEUE_API_TOKEN: "${QUEUE_API_TOKEN:-}"
+    volumes:
+      - ./config:/config            # servers.json (edited via the Settings page)
+      - queue-data:/data            # queue state, logs, live logs (persisted)
+    # Lets the container reach an Ollama running on the Docker HOST as
+    # http://host.docker.internal:11434. Remote LAN hosts (e.g.
+    # http://192.0.2.10:11434) are reached directly and need no special config.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+    # --- Alternative: host networking -------------------------------------
+    # If you prefer the container to share the host's network stack (so
+    # 127.0.0.1:11434 on the host is reachable and no port mapping is needed),
+    # comment out `ports:` and `extra_hosts:` above and uncomment:
+    # network_mode: host
+
+volumes:
+  queue-data:

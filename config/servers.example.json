@@ -1,0 +1,10 @@
+{
+  "studio": {
+    "url": "http://host.docker.internal:11434",
+    "usable_bytes": 47244640256
+  },
+  "gpu-box": {
+    "url": "http://192.0.2.10:11434",
+    "usable_bytes": 10307921510
+  }
+}

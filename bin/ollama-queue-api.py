@@ -32,7 +32,14 @@ from datetime import datetime, timezone
 
 QUEUE_PATH = Path(__file__).resolve().parent / "ollama-queue.py"
 TASKS_DIR = Path.home() / "bin" / "ollama-queue-logs" / "web-tasks"
-PORT = 7684
+PORT = int(os.environ.get("QUEUE_API_PORT", "7684"))
+
+# Optional shared-secret gate. Historically this process trusted every request
+# (Cloudflare Access sat in front). For a standalone/Docker deployment without
+# Access, set QUEUE_API_TOKEN and every request must carry it as
+# `Authorization: Bearer <token>` or `X-Api-Token: <token>`. Unset => open, as
+# before (backward compatible).
+API_TOKEN = os.environ.get("QUEUE_API_TOKEN") or None
 
 # Tailed out of each job's log file for the dashboard -- ollama-worker.py logs
 # these lines itself (added 2026-08-28: "--- iteration N/M ---" always did,
@@ -1044,7 +1051,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         return json.loads(raw or b"{}")
 
+    def _auth_ok(self):
+        """True when no token is configured (open) or the request presents it."""
+        if not API_TOKEN:
+            return True
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Bearer ") and header[7:] == API_TOKEN:
+            return True
+        return self.headers.get("X-Api-Token") == API_TOKEN
+
+    def _reject_unauthorized(self):
+        self.send_response(401)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("WWW-Authenticate", "Bearer")
+        self.end_headers()
+        self.wfile.write(b"unauthorized")
+
     def do_GET(self):
+        if not self._auth_ok():
+            return self._reject_unauthorized()
         if self.path == "/" or self.path == "/index.html":
             self._html(FRONTEND_HTML)
         elif self.path == "/api/jobs":
@@ -1101,6 +1126,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._json({"content": "\n".join(lines), "truncated": truncated})
 
     def do_POST(self):
+        if not self._auth_ok():
+            return self._reject_unauthorized()
         if self.path == "/api/jobs":
             self._enqueue()
         elif self.path == "/api/hosts":
@@ -1123,6 +1150,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text("not found", 404)
 
     def do_DELETE(self):
+        if not self._auth_ok():
+            return self._reject_unauthorized()
         if self.path.startswith("/api/hosts/"):
             self._delete_host(urllib.parse.unquote(self.path[len("/api/hosts/"):]))
         elif self.path.startswith("/api/jobs/"):
