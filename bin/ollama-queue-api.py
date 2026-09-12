@@ -24,11 +24,13 @@ import socketserver
 import sys
 import time
 import urllib.request
+import urllib.parse
+import urllib.error
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
-QUEUE_PATH = Path.home() / "bin" / "ollama-queue.py"
+QUEUE_PATH = Path(__file__).resolve().parent / "ollama-queue.py"
 TASKS_DIR = Path.home() / "bin" / "ollama-queue-logs" / "web-tasks"
 PORT = 7684
 
@@ -43,6 +45,54 @@ _LOG_TAIL_BYTES = 16_384  # comfortably more than one iteration's log output
 spec = importlib.util.spec_from_file_location("ollama_queue_lib", QUEUE_PATH)
 q = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(q)
+
+# Config-driven server registry -- same module ollama-worker.py loads. Lives in
+# bin/ next to this file. Loading it here (rather than only via q.worker()) lets
+# the settings endpoints load/save servers.json without importing the whole
+# heavy worker module, and reflects edits immediately (worker caches its copy at
+# import time in each dispatch subprocess).
+_sc_spec = importlib.util.spec_from_file_location(
+    "servers_config", str(Path(__file__).resolve().parent / "servers_config.py"))
+servers_config = importlib.util.module_from_spec(_sc_spec)
+_sc_spec.loader.exec_module(servers_config)
+
+
+def _servers_file_url(name_or_url):
+    """Resolve a server identifier (a configured name, or an explicit URL) to a
+    base URL, or None if a name isn't configured."""
+    if not name_or_url:
+        return None
+    if "://" in name_or_url:
+        return name_or_url.rstrip("/")
+    servers = servers_config.load_servers()
+    spec = servers.get(name_or_url)
+    return spec["url"].rstrip("/") if spec else None
+
+
+def _host_reachable(url, timeout=2):
+    try:
+        req = urllib.request.Request(f"{url}/api/tags")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _pick_v1_host(preferred=None):
+    """Choose an Ollama base URL for /v1 proxying. `preferred` (a configured
+    name or an explicit URL) wins if reachable; otherwise the first reachable
+    configured host; otherwise the first configured host (so the caller still
+    gets a real upstream error rather than a silent None)."""
+    if preferred:
+        url = _servers_file_url(preferred)
+        if url and _host_reachable(url):
+            return url
+    servers = servers_config.load_servers()
+    urls = [spec["url"].rstrip("/") for spec in servers.values() if spec.get("url")]
+    for url in urls:
+        if _host_reachable(url):
+            return url
+    return urls[0] if urls else None
 
 FRONTEND_HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Ollama Queue</title>
@@ -169,6 +219,25 @@ FRONTEND_HTML = r"""<!doctype html>
 
 <h2>Loaded right now</h2>
 <div id="hosts"></div>
+
+<h2>Settings — Ollama servers</h2>
+<p style="font-size:.85rem; color:#8888;">These are the remote Ollama hosts the queue routes to. Edits are saved to
+<code>config/servers.json</code> and picked up by new dispatches immediately.
+<code>usable_bytes</code> is the VRAM/memory budget used for model-fit routing
+(0 = unknown).</p>
+<table id="serversTbl">
+  <thead><tr><th>Name</th><th>URL</th><th>usable_bytes</th><th></th></tr></thead>
+  <tbody id="serversBody"></tbody>
+</table>
+<form id="serverForm" style="max-width:640px;">
+  <div style="display:flex; gap:.5rem; flex-wrap:wrap;">
+    <input id="srvName" placeholder="name (e.g. gpu-box)" style="flex:1; min-width:120px;">
+    <input id="srvUrl" placeholder="http://192.0.2.10:11434" style="flex:2; min-width:200px;">
+    <input id="srvBytes" placeholder="usable_bytes (optional)" style="flex:1; min-width:120px;">
+    <button type="submit">Add / update</button>
+  </div>
+  <div id="srvErr" style="color:#c0392b;"></div>
+</form>
 
 <script>
 const tbody = document.querySelector('#jobs tbody');
@@ -670,6 +739,57 @@ setInterval(refreshWebSearchUsage, 5000);
 refreshHandoff();
 setInterval(refreshHandoff, 5000);
 
+// ---- Settings: Ollama server registry -----------------------------------
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+async function refreshServers() {
+  try {
+    const res = await fetch('/api/servers');
+    const data = await res.json();
+    const body = document.getElementById('serversBody');
+    body.innerHTML = (data.servers || []).map(s => `
+      <tr>
+        <td>${escapeHtml(s.name)}</td>
+        <td><code>${escapeHtml(s.url)}</code></td>
+        <td>${s.usable_bytes || 0}</td>
+        <td><button class="iconbtn" data-edit='${escapeHtml(JSON.stringify(s))}'>edit</button>
+            <button class="iconbtn" data-del="${escapeHtml(s.name)}">delete</button></td>
+      </tr>`).join('');
+    body.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async () => {
+      const name = b.getAttribute('data-del');
+      if (!confirm(`Remove server "${name}"?`)) return;
+      await fetch('/api/hosts/' + encodeURIComponent(name), {method: 'DELETE'});
+      refreshServers();
+    }));
+    body.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => {
+      const s = JSON.parse(b.getAttribute('data-edit'));
+      document.getElementById('srvName').value = s.name;
+      document.getElementById('srvUrl').value = s.url;
+      document.getElementById('srvBytes').value = s.usable_bytes || '';
+    }));
+  } catch (e) { /* settings panel is best-effort */ }
+}
+document.getElementById('serverForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const err = document.getElementById('srvErr');
+  err.textContent = '';
+  const name = document.getElementById('srvName').value.trim();
+  const url = document.getElementById('srvUrl').value.trim();
+  const bytesRaw = document.getElementById('srvBytes').value.trim();
+  const payload = {name, url, usable_bytes: bytesRaw ? parseInt(bytesRaw, 10) : 0};
+  const res = await fetch('/api/hosts', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+  if (!res.ok) { err.textContent = await res.text(); return; }
+  document.getElementById('srvName').value = '';
+  document.getElementById('srvUrl').value = '';
+  document.getElementById('srvBytes').value = '';
+  refreshServers();
+});
+refreshServers();
+setInterval(refreshServers, 10000);
+
 // Add a global mouseup handler to ensure drag state is cleared even if drop handlers don't fire properly
 document.addEventListener('mouseup', () => {
   // Clear drag state on any mouseup event, but only if we have an active dragId
@@ -737,9 +857,12 @@ def _hosts_summary():
     nothing is currently dispatched (an idle lane can still have a model
     sitting loaded from keep_alive, which is exactly the state that caused
     tonight's OOM incidents)."""
-    w = q.worker()
-    studio_url = w.KNOWN_OLLAMA_HOSTS["studio"]["url"]
-    unraid_url = w.KNOWN_OLLAMA_HOSTS["unraid"]["url"]
+    # Read straight from the servers file so edits made via the settings UI show
+    # up without restarting the API. Defensive .get(): a config that renames or
+    # removes "studio"/"unraid" must not 500 this legacy occupancy panel.
+    servers = servers_config.load_servers()
+    studio_url = servers.get("studio", {}).get("url", "http://127.0.0.1:11434")
+    unraid_url = servers.get("unraid", {}).get("url", "")
     bypass_up = False
     bypass_url = getattr(q, "LLAMA_SERVER_QWEN38_URL", None)
     if bypass_url:
@@ -930,6 +1053,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json([_job_summary(j) for j in state["jobs"]])
         elif self.path == "/api/hosts":
             self._json(_hosts_summary())
+        elif self.path == "/api/servers":
+            # Config-driven registry for the settings UI: [{name, url, usable_bytes}]
+            servers = servers_config.load_servers()
+            self._json({"servers": [
+                {"name": n, "url": s.get("url", ""), "usable_bytes": s.get("usable_bytes", 0)}
+                for n, s in servers.items()]})
+        elif self.path == "/v1/models" or self.path.startswith("/v1/models?"):
+            self._v1_models()
         elif self.path == "/api/web-search-usage":
             self._json(_web_search_usage())
         elif self.path == "/api/handoff":
@@ -972,6 +1103,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/jobs":
             self._enqueue()
+        elif self.path == "/api/hosts":
+            self._add_or_update_host()
+        elif self.path == "/v1/chat/completions" or self.path.startswith("/v1/chat/completions?"):
+            self._v1_chat()
         elif self.path == "/api/jobs/move":
             self._move()
         elif self.path.startswith("/api/jobs/") and self.path.endswith("/kill"):
@@ -988,7 +1123,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text("not found", 404)
 
     def do_DELETE(self):
-        if self.path.startswith("/api/jobs/"):
+        if self.path.startswith("/api/hosts/"):
+            self._delete_host(urllib.parse.unquote(self.path[len("/api/hosts/"):]))
+        elif self.path.startswith("/api/jobs/"):
             self._cancel(self.path[len("/api/jobs/"):])
         else:
             self._text("not found", 404)
@@ -1170,6 +1307,153 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 
         except Exception as e:
             self._text(f"error: {e}", 500)
+
+    # ---- Settings: server registry CRUD -------------------------------------
+
+    def _add_or_update_host(self):
+        """POST /api/hosts -- add or update one server. Body:
+        {name, url, usable_bytes?}. Persists via servers_config.save_servers and
+        refreshes the worker's cached table."""
+        try:
+            data = self._read_json_body()
+        except Exception as e:
+            return self._text(f"bad JSON: {e}", 400)
+        name = (data.get("name") or "").strip()
+        url = (data.get("url") or "").strip()
+        if not name:
+            return self._text("name is required", 400)
+        if "://" not in url:
+            return self._text("url must be a full http(s) URL", 400)
+        try:
+            usable_bytes = int(data.get("usable_bytes") or 0)
+        except (TypeError, ValueError):
+            return self._text("usable_bytes must be an integer", 400)
+        servers = servers_config.load_servers()
+        servers[name] = {"url": url.rstrip("/"), "usable_bytes": usable_bytes}
+        try:
+            servers_config.save_servers(servers)
+        except OSError as e:
+            return self._text(f"could not save servers file: {e}", 500)
+        self._refresh_worker_hosts()
+        self._json({"ok": True, "name": name, "servers": servers})
+
+    def _delete_host(self, name):
+        """DELETE /api/hosts/<name> -- remove one server from the registry."""
+        name = (name or "").strip()
+        servers = servers_config.load_servers()
+        if name not in servers:
+            return self._text(f"no such server: {name}", 404)
+        del servers[name]
+        try:
+            servers_config.save_servers(servers)
+        except OSError as e:
+            return self._text(f"could not save servers file: {e}", 500)
+        self._refresh_worker_hosts()
+        self._json({"ok": True, "removed": name, "servers": servers})
+
+    @staticmethod
+    def _refresh_worker_hosts():
+        """Best-effort: if the worker module is already loaded in this process,
+        refresh its in-memory host table so the live occupancy panel and any
+        in-process routing see the edit without a restart. New dispatch
+        subprocesses re-read the file at import time regardless."""
+        try:
+            w = q.worker()
+            if hasattr(w, "reload_known_hosts"):
+                w.reload_known_hosts()
+        except Exception:
+            pass
+
+    # ---- OpenAI-compatible LLM proxy ----------------------------------------
+
+    def _v1_host_from_query(self):
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        vals = qs.get("host") or qs.get("server")
+        return vals[0] if vals else None
+
+    def _v1_models(self):
+        """GET /v1/models -- aggregate models across reachable configured hosts,
+        deduped by id, in OpenAI list shape. ?host=<name|url> restricts to one."""
+        preferred = self._v1_host_from_query()
+        servers = servers_config.load_servers()
+        if preferred:
+            url = _servers_file_url(preferred)
+            urls = [url] if url else []
+        else:
+            urls = [s["url"].rstrip("/") for s in servers.values() if s.get("url")]
+        seen, data = set(), []
+        for url in urls:
+            try:
+                req = urllib.request.Request(f"{url}/v1/models")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    payload = json.loads(resp.read())
+            except Exception:
+                continue
+            for m in payload.get("data", []):
+                mid = m.get("id")
+                if mid and mid not in seen:
+                    seen.add(mid)
+                    data.append(m)
+        self._json({"object": "list", "data": data})
+
+    def _v1_chat(self):
+        """POST /v1/chat/completions -- forward to a chosen/available Ollama host
+        (Ollama is natively OpenAI-compatible). Non-streaming buffers and
+        returns; streaming passes chunks straight through. ?host=<name|url>
+        selects a host, else auto (first reachable configured host)."""
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError as e:
+            return self._text(f"bad JSON: {e}", 400)
+        preferred = self._v1_host_from_query()
+        host = _pick_v1_host(preferred)
+        if not host:
+            return self._text("no ollama hosts configured -- add one in Settings", 503)
+        streaming = bool(body.get("stream"))
+        req = urllib.request.Request(
+            f"{host}/v1/chat/completions", data=raw, method="POST",
+            headers={"Content-Type": "application/json"})
+        # Forward an Authorization header if the caller supplied one.
+        auth = self.headers.get("Authorization")
+        if auth:
+            req.add_header("Authorization", auth)
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+        except urllib.error.HTTPError as e:
+            detail = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type", e.headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(detail)))
+            self.end_headers()
+            self.wfile.write(detail)
+            return
+        except Exception as e:
+            return self._text(f"upstream error contacting {host}: {e}", 502)
+        with resp:
+            if streaming:
+                self.send_response(200)
+                self.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream"))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    while True:
+                        chunk = resp.read(1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            else:
+                data = resp.read()
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
 
     def log_message(self, fmt, *args):
         sys.stderr.write(f"[queue-api] {self.address_string()} {fmt % args}\n")
