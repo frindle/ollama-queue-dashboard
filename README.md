@@ -22,7 +22,7 @@ checkout** on the Mac, not from Docker:
 | `src/dashboard_chat.py` | `/chat` + `/api/chat/*` |
 | `src/runstatus_retention.py` | run-status retention predicate (also used by `qctl runs-clear` via HTTP) |
 | `chat/chat.html` | chat front end (served from `~/.ollama-dispatch/chat/chat.html`, a symlink to this file) |
-| `tests/test-*.py` | dashboard tests (`test-bundle-history`, `test-dashboard-b`, `test-dashboard-chat`, `test-dashboard-slice-child-indent`, `test-runstatus-retention-api`) |
+| `tests/test-*.py` | dashboard tests (`test-bundle-history`, `test-dashboard-b`, `test-dashboard-chat`, `test-dashboard-layout`, `test-dashboard-slice-child-indent`, `test-runstatus-retention-api`) |
 
 The shared **pipeline** (`ollama-queue.py`, `handoff-emit.py`, `dispatch_progress.py`,
 worker, gates, preflight) stays in `~/bin` and is **not** part of this repo's runtime;
@@ -50,11 +50,23 @@ replaces the file instead of writing through would break the symlink).
 override with `DASHBOARD_SRC` / `OLLAMA_PIPELINE_BIN`):
 
 ```bash
-for t in tests/test-bundle-history.py tests/test-dashboard-b.py tests/test-dashboard-chat.py \
+for t in tests/test-bundle-history.py tests/test-dashboard-b.py tests/test-dashboard-chat.py tests/test-dashboard-layout.py \
          tests/test-dashboard-slice-child-indent.py tests/test-runstatus-retention-api.py; do
   python3 "$t" || echo "FAIL $t"; done
 python3 tests/test-runstatus-retention-api.py --revert-check
 ```
+
+**Page layout** (top to bottom): a summary strip (running now with model/host/elapsed/tok/s,
+queue depth, needs-attention count); **Needs attention** (stuck bundles and jobs: failed,
+parked/held, blocked, each with a one-line reason and its most useful action); **Queue**
+(active bundles with a done/total progress bar, current step and status chip; every
+reorder/pause/hold/cancel control is in the row's `...` menu); **Finished bundles**
+(collapsed, grouped by day, failures named in the summary); then Run Status, web search,
+loaded models and host settings. A bundle that is still running or has pending work stays
+in the Queue even when an earlier run failed (amber note); it moves to Needs attention
+only when nothing of it is running or waiting. System fonts only, light/dark via
+`prefers-color-scheme`, no horizontal scroll at phone width. `tests/test-dashboard-layout.py`
+renders the page in headless Chrome against fixtures (`--shots DIR` saves screenshots).
 
 See [docs/DEPLOY.md](docs/DEPLOY.md) for the deploy/sync rules.
 

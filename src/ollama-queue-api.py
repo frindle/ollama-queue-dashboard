@@ -1356,227 +1356,288 @@ FRONTEND_HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Ollama Queue</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: -apple-system, system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.3rem; }
-  table { width: 100%; border-collapse: collapse; margin-bottom: 2rem; }
-  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #8884; font-size: .85rem; }
-  /* Actions cell (always last) wrapped to a second line whenever a row happened to
-     show more buttons than another (varies by position/status -- resume, promote-
-     front, send-to-top, etc. show/hide per row), changing that row's height on every
-     poll re-render and visibly shifting everything below it. nowrap forces a single
-     line regardless of button count, trading a wider table for a stable layout. */
-  td:last-child { white-space: nowrap; }
+  /* Layout (2026-10-05 redesign): one centred column, max 1200px. Top to bottom:
+     summary strip (running now / queue / needs attention), Needs attention, Queue
+     (active bundles + standalone jobs), Finished bundles (collapsed, by day), then the
+     reference panels (Run Status, web search, hosts, settings). Every queue table has
+     the same 5 columns -- caret | what | status | time | actions -- and the per-row
+     controls live in one overflow menu, so nothing is ever wider than the screen. */
+  :root {
+    --bg: #f5f6f8; --surface: #ffffff; --surface-2: #eef1f4; --line: #dde2e8;
+    --fg: #17202b; --muted: #5b6676; --accent: #0e6a75;
+    --run: #18794a; --run-bg: #e2f3e9; --warn: #8f5600; --warn-bg: #fcefd8;
+    --bad: #b42318; --bad-bg: #fde7e4; --info: #38598a; --info-bg: #e6edf7;
+    --bar: #d6dce4; --tint: rgba(56,89,138,0.07); --shadow: rgba(0,0,0,0.18);
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg: #0f1318; --surface: #161b22; --surface-2: #1c232c; --line: #2a323d;
+    --fg: #e5e9ef; --muted: #97a2b0; --accent: #5bbcc8;
+    --run: #56c690; --run-bg: #11301f; --warn: #f0b452; --warn-bg: #33260e;
+    --bad: #ff8172; --bad-bg: #3b1714; --info: #93b2e8; --info-bg: #1a2639;
+    --bar: #2c3540; --tint: rgba(147,178,232,0.07); --shadow: rgba(0,0,0,0.5);
+    color-scheme: dark; } }
+  :root[data-theme="dark"] {
+    --bg: #0f1318; --surface: #161b22; --surface-2: #1c232c; --line: #2a323d;
+    --fg: #e5e9ef; --muted: #97a2b0; --accent: #5bbcc8;
+    --run: #56c690; --run-bg: #11301f; --warn: #f0b452; --warn-bg: #33260e;
+    --bad: #ff8172; --bad-bg: #3b1714; --info: #93b2e8; --info-bg: #1a2639;
+    --bar: #2c3540; --tint: rgba(147,178,232,0.07); --shadow: rgba(0,0,0,0.5);
+    color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 var(--sans); }
+  .wrap { max-width: 1200px; margin: 0 auto; padding-inline: 16px; padding-block: 20px 56px;
+          display: grid; gap: 22px; }
+  .wrap > * { min-width: 0; }
+  a { color: var(--accent); }
+  h1 { font-size: 1.25rem; margin: 0; letter-spacing: -.01em; }
+  h2 { font-size: .98rem; margin: 0; }
+  code { font-family: var(--mono); font-size: .85em; }
+  header.top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+  header.top .spacer { flex: 1; }
+  .upd { color: var(--muted); font-size: .8rem; font-variant-numeric: tabular-nums; }
+  button { cursor: pointer; font: inherit; color: inherit; }
+  .btn, .wrap > section button:not(.mi), #hostSettings button {
+    font-size: .84rem; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--surface); color: var(--fg); white-space: nowrap; }
+  .btn:hover { background: var(--surface-2); }
+  .btn.primary, .wrap > section button.btn.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  button:focus-visible, summary:focus-visible, a:focus-visible, input:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; }
+  input, select, textarea { font: inherit; padding: .35rem; background: var(--surface);
+    color: var(--fg); border: 1px solid var(--line); border-radius: 5px; }
+  form { display: grid; gap: .5rem; max-width: 600px; }
+  #err { color: var(--bad); white-space: pre-wrap; }
+
+  /* ---- summary strip ---- */
+  .strip { display: grid; grid-template-columns: minmax(0, 2.3fr) minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+          padding: 12px 14px; min-width: 0; }
+  .tile .k { font-size: .7rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); font-weight: 650; }
+  .tile .v { font-size: 1.6rem; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.2; }
+  .tile .s { color: var(--muted); font-size: .82rem; }
+  .tile.attn.has { border-color: var(--bad); }
+  .tile.attn.has .v { color: var(--bad); }
+  .now-job { font-weight: 600; overflow-wrap: anywhere; margin-top: 3px; }
+  .now-meta { display: flex; flex-wrap: wrap; gap: 3px 14px; color: var(--muted); font-size: .83rem;
+              font-variant-numeric: tabular-nums; margin-top: 4px; overflow-wrap: anywhere; }
+  .now-meta b { color: var(--fg); font-weight: 600; }
+  .now-more { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); font-size: .82rem; color: var(--muted); }
+  .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--run);
+           margin-right: 6px; vertical-align: 1px; animation: slicepulse 1.6s ease-in-out infinite; }
+  .idle-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--bar); margin-right: 6px; vertical-align: 1px; }
+
+  /* ---- sections + the shared 5-column queue table ---- */
+  section.panel { display: grid; gap: 8px; min-width: 0; }
+  .panel-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+  .panel-head .count { color: var(--muted); font-size: .85rem; }
+  .panel-head .tools { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .list { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+  .list.attn { border-color: var(--bad); }
+  .empty { color: var(--muted); font-size: .86rem; padding: 12px 14px; }
+  table.q { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  table.q col.c0 { width: 34px; } table.q col.c2 { width: 120px; }
+  table.q col.c3 { width: 84px; } table.q col.c4 { width: 176px; }
+  table.q td { padding: 8px 10px; border-top: 1px solid var(--line); vertical-align: top;
+               font-size: .86rem; overflow-wrap: anywhere; text-align: left; }
+  table.q tbody tr:first-child td { border-top: 0; }
+  table.q td:first-child { color: var(--muted); text-align: center; padding-inline: 4px; white-space: nowrap; }
+  table.q td.when { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .8rem; }
+  table.q td.acts { text-align: right; white-space: nowrap; overflow: visible; }
+  .sub { color: var(--muted); font-size: .79rem; margin-top: 2px; display: flex; flex-wrap: wrap;
+         gap: 1px 10px; align-items: center; }
+  .reason { font-size: .84rem; margin-top: 3px; }
+  .reason.bad { color: var(--bad); }
+  .proj-name { font-weight: 650; }
   tr[draggable="true"] { cursor: grab; }
   tr.dragging { opacity: .4; }
-  .status-pending { color: #b8860b; } .status-running { color: #2e8b57; font-weight: 600; }
-  .status-warming { color: #cc7a00; font-weight: 600; }
-  .status-done { color: #4682b4; } .status-failed { color: #c0392b; } .status-paused { color: #9b59b6; }
-  .status-done_unconverged { color: #cc7a00; font-weight: 600; }
-  /* A retired slice: finished business, but nothing ran and nothing passed -- so it
-     is deliberately NOT the same colour as a done slice. */
-  .status-skipped { color: #888; font-style: italic; }
-  .verdict-pass { color: #2e8b57; font-weight: 600; }
-  .verdict-fail { color: #c0392b; font-weight: 600; }
-  .verdict-concerns { color: #cc7a00; font-weight: 600; }
-  .verdict-skipped, .verdict-pending, .verdict-unknown { color: #888; }
-  button { cursor: pointer; }
-  button.iconbtn { font-size: .8rem; padding: .1rem .4rem; margin: 0 .1rem; }
-  /* True FIFO position badge. Deliberately muted: it is a reference point for the
-     reorder arrows, not an action. See the qpos comment in the row builder. */
-  span.qpos { font-size: .72rem; opacity: .55; margin-right: .35rem;
-              font-variant-numeric: tabular-nums; white-space: nowrap; cursor: help; }
-  span.qpos.qpos-adrift { opacity: .95; color: #d08f2e; font-weight: 600; }
-  form { display: grid; gap: .5rem; max-width: 600px; }
-  input, select, textarea { font: inherit; padding: .4rem; }
-  textarea { min-height: 6rem; }
-  #err { color: #c0392b; white-space: pre-wrap; }
-  .toolbar { margin-bottom: .5rem; }
-  .drop-target-hover { background: #fff3cd !important; outline: 2px dashed #d4a017; }
-  tr.drop-indicator-above { box-shadow: inset 0 2px 0 0 #2e8b57; }
-  tr.drop-indicator-below { box-shadow: inset 0 -2px 0 0 #2e8b57; }
-  /* Exit-codes legend. Default: in normal flow (mobile-safe -- a fixed legend overlapped
-     content on narrow screens). Only pin it to the top-left corner once the viewport is wide
-     enough that a left:1rem fixed box clears the centered 1000px column (1000 + ~2*160 margin). */
-  .exit-legend { display:inline-block; margin:0 0 .6rem 0; font-size:.8rem; color:#555;
-    background:rgba(128,128,128,0.12); border-radius:6px; padding:.6rem .8rem; line-height:1.6; }
-  @media (min-width: 1320px) {
-    .exit-legend { position:fixed; top:1rem; left:1rem; margin:0; z-index:10; }
-  }
-  /* Sliced-job parent/child rollup in the Run Status panel. A parent row rolls a
-     whole project/dispatch into one line; its slice rows expand underneath, indented
-     and hung off a left rail so it reads as "these jobs belong together". */
-  tr.run-parent { cursor: pointer; background: rgba(70,130,180,0.10); }
-  tr.run-parent:hover { background: rgba(70,130,180,0.18); }
-  tr.run-parent td { font-size: .85rem; }
-  tr.run-parent .proj-name { font-weight: 600; }
-  tr.run-parent .proj-summary { color: #666; font-size: .8rem; }
-  /* A sub-plan is a LABEL inside its batch, not a second card: no pointer, no hover
-     affordance, nothing to click (the user 2026-09-19: "one click on the bundle reveals
-     everything"). Quiet divider styling so it reads as a sub-heading over the rows
-     that follow it, not as another collapsed thing hiding work. */
-  tr.run-subplan { background: rgba(70,130,180,0.045); cursor: default; }
-  tr.run-subplan td { font-size: .8rem; border-top: 1px solid rgba(70,130,180,0.25); }
-  tr.run-subplan .proj-name { font-weight: 600; color: #4a6b8a; }
-  tr.run-subplan .proj-summary { color: #777; font-size: .78rem; }
-  tr.run-project { cursor: pointer; background: rgba(70,130,180,0.20); }
-  tr.run-project:hover { background: rgba(70,130,180,0.28); }
-  tr.run-project td { font-size: .88rem; }
-  tr.run-project .proj-name { font-weight: 700; }
-  tr.run-project .proj-summary { color: #555; font-size: .8rem; }
-  /* Severity, not one alarming red for everything: "awaiting sign-off" (please OK
-     this) must not look like "blocked -- did not run". */
-  .eyes-badge { font-weight: 600; }
-  .eyes-badge.eyes-ok { color: #1e8449; }
-  .eyes-badge.eyes-warn { color: #b9770e; }
-  .eyes-badge.eyes-bad { color: #c0392b; }
-  .blocked-why { color: #888; font-size: .78rem; }
-  .verdict-blocked { color: #c0392b; font-weight: 600; }
-  tr.run-child td:nth-child(2) { padding-left: 1.8rem; border-left: 3px solid rgba(70,130,180,0.35); }
-  /* QUEUE panel plan rollup -- deliberately the SAME visual language as the Run
-     Status parent/child rows above (the user 2026-09-18: "like it does down below"). */
-  tr.queue-parent { cursor: pointer; background: rgba(70,130,180,0.10); }
-  tr.queue-parent:hover { background: rgba(70,130,180,0.18); }
-  tr.queue-parent td { font-size: .85rem; }
-  tr.queue-parent .proj-name { font-weight: 600; }
-  tr.queue-parent .proj-summary { color: #666; font-size: .8rem; }
-  /* Which slice is actually being worked, named on the parent line. Same green as
-     .status-running so "something here is running" reads at a glance. */
-  tr.queue-parent .plan-lead { color: #2e8b57; font-weight: 600; font-size: .8rem; }
-  /* X/Y: how far the plan has got. Prominent -- it is the number the user scans for. */
-  tr.queue-parent .plan-frac { font-weight: 700; font-variant-numeric: tabular-nums;
-    background: rgba(70,130,180,0.18); border-radius: 4px; padding: .05rem .35rem; }
-  /* A queue row in this bundle did not succeed. Deliberately the HEAVIEST thing on the
-     line: solid fill, not a tint, because it sits immediately next to .plan-frac -- a
-     bold "4/5 slices" chip -- and a tint loses that contest. White-on-#c0392b is the
-     same red as .status-failed and is legible under `color-scheme: light dark` either
-     way round, so it needs no dark-mode variant. nowrap so the count and its status
-     never split across lines in the phone card layout. */
-  tr.queue-parent .plan-alert { font-weight: 700; font-size: .8rem; white-space: nowrap;
-    color: #fff; background: #c0392b; border-radius: 4px; padding: .05rem .35rem; }
-  /* ...and the ROW is tinted too, so a failure is findable while scanning a collapsed
-     queue, not only once the eye has landed on that one line. */
-  tr.queue-parent.queue-parent-alert { background: rgba(192,57,43,0.13); }
-  tr.queue-parent.queue-parent-alert:hover { background: rgba(192,57,43,0.22); }
-  tr.queue-child td:nth-child(2) { padding-left: 1.8rem; border-left: 3px solid rgba(70,130,180,0.35); }
-  /* A slice the plan already finished: its queue row is pruned, so it is rendered
-     from the plan's run state to keep the bundle whole. Greyed -- nothing to act on. */
-  tr.queue-done { opacity: .55; }
-  tr.finished-head td { padding-top: 1rem; border-top: 2px solid rgba(70,130,180,0.35); font-size: .85rem; }
-  tr.finished-bundle { background: rgba(70,130,180,0.05); }
-  /* Dashboard B: one line per slice (live phase), its history under it */
-  tr.slice-line td:nth-child(2) { padding-left: 1.8rem; border-left: 3px solid rgba(70,130,180,0.35); }
-  tr.slice-hist td:nth-child(2) { padding-left: 3.2rem; opacity: .8; font-size: .9em; }
-  tr.queue-child.slice-live td:nth-child(2) { padding-left: 3.2rem; }
-  .ph { font-weight: 600; }
-  .ph-coding, .ph-gate, .ph-regate { color: #15803d; }
-  .ph-authoring, .ph-refining, .ph-preflight, .ph-self-heal, .ph-escalation-review, .ph-second-opinion { color: #b45309; }
-  .ph-queued, .ph-pending { opacity: .7; }
-  .slice-dot { color: #15803d; animation: slicepulse 1.4s ease-in-out infinite; }
-  @keyframes slicepulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
-  .ph-escalated, .ph-failed { color: #b91c1c; }
-  .ph-done { opacity: .6; }
-  .wait-reason { opacity: .6; font-size: .8em; display: block; }
-  tr.live-activity td { font-size: .85em; background: rgba(21,128,61,0.07); }
+  .drop-target-hover { background: var(--run-bg) !important; outline: 2px dashed var(--run); }
+  tr.drop-indicator-above { box-shadow: inset 0 2px 0 0 var(--run); }
+  tr.drop-indicator-below { box-shadow: inset 0 -2px 0 0 var(--run); }
 
-  /* ---- PHONE (2026-09-19, the user on an iPhone on the LAN) -----------------
-     Three separate defects, measured in a 390x844 viewport before the fix:
-       1. #hosts had NO scroll wrapper, so its 549px-wide table pushed the BODY
-          out: document.scrollWidth 566 vs a 375px viewport. The whole PAGE
-          scrolled sideways, which is why swiping the queue dragged everything.
-       2. The two wrapped tables laid out 997px and 740px wide inside a 343px
-          box. They could scroll, but nothing said so and the columns that
-          matter (label/status) scrolled away with the rest.
-       3. Nothing truncated cleanly: the `model` cell measured 107px starting at
-          x=319, so `qwen3.8:27b-q4_K_M` was simply cut off by the screen edge
-          mid-word -- exactly the "qwen3.8:27..." in the user's screenshot.
-     The fix is to make the table FIT rather than to make it scroll better: the
-     columns a phone cannot use (progress, tok/s, lane, pid, exit -- and
-     host/files/when in Run Status) are dropped, the survivors wrap instead of
-     clipping, and their values stay reachable via the cell's title attribute.
-     Column hiding is by nth-child, which is safe against the bundle rows from
-     8ef51f3: those carry 5 cells, not 11, so the 6th-10th selectors match
-     nothing on them, and their colspan is clamped to the columns that remain. */
+  /* status chips: colour by meaning; only a real failure is red */
+  .chip { display: inline-block; font-size: .73rem; font-weight: 650; padding: 1px 8px; border-radius: 999px;
+          white-space: nowrap; background: var(--surface-2); color: var(--muted); line-height: 1.5; }
+  .chip.running, .chip.ph-coding, .chip.ph-gate, .chip.ph-regate, .chip.ph-authoring, .chip.ph-refining,
+  .chip.ph-preflight, .chip.ph-self-heal, .chip.ph-escalation-review, .chip.ph-second-opinion { background: var(--run-bg); color: var(--run); }
+  .chip.warming { background: var(--warn-bg); color: var(--warn); }
+  .chip.pending, .chip.planned, .chip.queued, .chip.ph-queued, .chip.ph-pending { background: var(--info-bg); color: var(--info); }
+  .chip.held, .chip.paused, .chip.blocked, .chip.parked, .chip.warn, .chip.done_unconverged { background: var(--warn-bg); color: var(--warn); }
+  .chip.failed, .chip.bad, .chip.ph-failed, .chip.ph-escalated { background: var(--bad-bg); color: var(--bad); }
+  .chip.done, .chip.ph-done, .chip.skipped { background: var(--surface-2); color: var(--muted); }
+  .m-chip { display: none; margin-left: 6px; vertical-align: 1px; }
+  /* legacy status/verdict text colours (Run Status table, slice history lines) */
+  .status-running { color: var(--run); font-weight: 600; } .status-warming { color: var(--warn); font-weight: 600; }
+  .status-pending { color: var(--info); } .status-done { color: var(--muted); }
+  .status-failed { color: var(--bad); } .status-paused { color: var(--warn); }
+  .status-done_unconverged { color: var(--warn); font-weight: 600; }
+  .status-skipped { color: var(--muted); font-style: italic; }
+  .verdict-pass { color: var(--run); font-weight: 600; }
+  .verdict-fail, .verdict-blocked { color: var(--bad); font-weight: 600; }
+  .verdict-concerns { color: var(--warn); font-weight: 600; }
+  .verdict-skipped, .verdict-pending, .verdict-unknown { color: var(--muted); }
+  /* An unresolved failure INSIDE a bundle that is still moving: amber note, not an alarm.
+     A bundle that is stuck goes to Needs attention instead, which is where red lives. */
+  .plan-alert { font-weight: 650; font-size: .76rem; white-space: nowrap; color: var(--warn); }
+  .needs-attn .plan-alert { color: var(--bad); }
+  .plan-lead { color: var(--run); font-weight: 600; }
+  .ph { font-weight: 600; }
+  .slice-dot { color: var(--run); animation: slicepulse 1.4s ease-in-out infinite; }
+  @keyframes slicepulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .slice-dot, .pulse { animation: none; } }
+  .wait-reason { color: var(--muted); font-size: .79rem; display: block; margin-top: 2px; }
+  span.qpos { font-size: .72rem; color: var(--muted); margin-right: 6px; font-variant-numeric: tabular-nums;
+              white-space: nowrap; cursor: help; }
+  span.qpos.qpos-adrift { color: var(--warn); font-weight: 650; }
+  .rerun { color: var(--muted); font-size: .85em; font-weight: 500; }
+
+  /* progress bar: done/total slices */
+  .prog { display: inline-flex; align-items: center; gap: 7px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .bar { width: 110px; height: 6px; border-radius: 3px; background: var(--bar); overflow: hidden; display: inline-block; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .plan-frac { font-weight: 650; color: var(--fg); }
+
+  /* overflow menu (one per row; every reorder/pause/hold/cancel control lives here) */
+  details.menu { position: relative; display: inline-block; text-align: left; }
+  details.menu > summary { list-style: none; cursor: pointer; padding: 2px 9px; border-radius: 6px;
+    border: 1px solid var(--line); color: var(--muted); font-weight: 700; letter-spacing: .1em; user-select: none;
+    white-space: nowrap; display: inline-block; line-height: 1.4; }
+  details.menu > summary::-webkit-details-marker { display: none; }
+  details.menu[open] > summary { background: var(--surface-2); color: var(--fg); }
+  .menu-pop { position: absolute; right: 0; top: calc(100% + 4px); z-index: 50; width: max-content;
+    min-width: 210px; max-width: min(320px, calc(100vw - 32px)); background: var(--surface); border: 1px solid var(--line);
+    border-radius: 8px; box-shadow: 0 8px 24px var(--shadow); padding: 4px; display: grid; white-space: normal; }
+  .menu-pop .mi { font-size: .86rem; text-align: left; background: none; border: 0; color: var(--fg);
+    padding: 7px 10px; border-radius: 5px; }
+  .menu-pop .mi:hover { background: var(--surface-2); }
+  .menu-pop .mi.danger { color: var(--bad); }
+  .menu-pop hr { border: 0; border-top: 1px solid var(--line); margin: 3px 2px; width: auto; }
+
+  /* rows inside an expanded bundle */
+  tr.queue-parent { cursor: pointer; }
+  tr.queue-parent:hover > td { background: var(--tint); }
+  tr.queue-child > td { background: var(--surface-2); border-top-color: transparent; font-size: .82rem; padding-block: 5px; }
+  tr.queue-child td:nth-child(2) { padding-left: 1.8rem; }
+  tr.slice-line td:nth-child(2) { padding-left: 1.8rem; }
+  tr.slice-hist td:nth-child(2) { padding-left: 3.2rem; }
+  tr.queue-child.slice-live td:nth-child(2) { padding-left: 3.2rem; }
+  tr.queue-done { opacity: .62; }
+  tr.live-activity td { font-size: .85em; background: var(--run-bg); }
+  .stage-h { font-size: .74rem; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 650; }
+
+  /* finished bundles: collapsed by default, grouped by day */
+  details.fin > summary { cursor: pointer; list-style: none; display: flex; flex-wrap: wrap; gap: 4px 12px;
+    align-items: baseline; padding: 11px 14px; }
+  details.fin > summary::-webkit-details-marker { display: none; }
+  details.fin > summary::before { content: "\25B8"; color: var(--muted); }
+  details.fin[open] > summary::before { content: "\25BE"; }
+  details.fin[open] > summary { border-bottom: 1px solid var(--line); }
+  .fin-tools { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 14px; border-bottom: 1px solid var(--line); }
+  tr.day-head td { background: var(--surface-2); font-size: .7rem; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); font-weight: 650; padding-block: 5px; text-align: left !important; }
+  .fail-list { color: var(--bad); font-size: .82rem; }
+
+  /* reference panels */
+  .ref-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .ref-grid > div { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+  .ref-grid h2 { margin-bottom: 8px; }
   .tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  @media (max-width: 640px) {
-    /* CARD REFLOW. Hiding columns was not enough: the rows of this table have
-       three different shapes (11-cell job rows, 5-cell bundle parents and tick
-       rows with colspan cells, and full-width section headers), so at 390px the
-       columns fight each other no matter how they are sized. Measured, in order:
-       squeezing them let `label` fall to 40px and set itself "bg-brok/ers";
-       `table-layout: fixed` was worse, resolving label to 13px and rows to
-       1116px, because fixed layout cannot reconcile the colspan rows. So at
-       phone width the table stops being a table: every row becomes a small card
-       and the cells flow inside it. Nothing then competes for a column, the
-       colspan cells become irrelevant, and no value can be clipped or broken
-       mid-word. 8ef51f3's bundle nesting survives as a left rail on the card. */
-    body { margin: 1rem auto; padding: 0 .5rem; }
-    h1 { font-size: 1.1rem; }
-    /* NB: .tablewrap keeps its overflow-x:auto here. Neutralising it globally was
-       tried and broke #hosts, which is still a real table and still 551px wide at
-       390px -- it needs the scroller it was given. */
-    #jobs, #jobs tbody, #runStatus, #runStatus tbody { display: block; width: 100%; }
-    #jobs thead, #runStatus thead { display: none; }   /* a card labels itself */
-    #jobs tr, #runStatus tr {
-      display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .45rem;
-      padding: .45rem .1rem; border-bottom: 1px solid #8884; }
-    #jobs td, #runStatus td {
-      display: block; border: none; padding: 0; font-size: .78rem;
-      /* A flex item defaults to min-width:auto and so REFUSES to shrink below its
-         content -- which is how the Run Status section-header cell (one colspan=8
-         cell of running text) laid out 660px wide in a 390px viewport and put the
-         sideways scroll back on the whole page. */
-      min-width: 0;
-      /* only a genuinely long token needs to break; see the button/status opt-outs
-         further down -- this is the cell that used to clip `qwen3.8:27b-q4_K_M` */
+  .wrap table:not(.q) { width: 100%; border-collapse: collapse; }
+  .wrap table:not(.q) th, .wrap table:not(.q) td { text-align: left; padding: .35rem .5rem;
+    border-bottom: 1px solid var(--line); font-size: .82rem; }
+  .wrap table:not(.q) th { color: var(--muted); font-weight: 600; font-size: .74rem; text-transform: uppercase; letter-spacing: .05em; }
+  #runStatus td:last-child { white-space: nowrap; }
+  .iconbtn { font-size: .78rem !important; padding: 1px 7px !important; margin: 0 1px; }
+  details.legend { font-size: .8rem; color: var(--muted); }
+  details.legend > summary { cursor: pointer; }
+  details.legend .legend-body { line-height: 1.6; padding: 6px 0 0 14px; }
+  /* Run Status parent/child rows (same visual language as before, on theme tokens) */
+  tr.run-parent { cursor: pointer; background: var(--tint); }
+  tr.run-parent:hover, tr.run-project:hover { background: var(--surface-2); }
+  tr.run-parent .proj-summary, tr.run-project .proj-summary, tr.run-subplan .proj-summary { color: var(--muted); font-size: .8rem; }
+  tr.run-subplan { cursor: default; }
+  tr.run-subplan td { font-size: .8rem; }
+  tr.run-project { cursor: pointer; background: var(--surface-2); }
+  tr.run-project .proj-name { font-weight: 700; }
+  .eyes-badge { font-weight: 600; }
+  .eyes-badge.eyes-ok { color: var(--run); } .eyes-badge.eyes-warn { color: var(--warn); }
+  .eyes-badge.eyes-bad { color: var(--bad); }
+  .blocked-why { color: var(--muted); font-size: .78rem; }
+  tr.run-child td:nth-child(2) { padding-left: 1.8rem; border-left: 3px solid var(--line); }
+  #livelogModal { background: var(--surface) !important; color: var(--fg) !important; border-color: var(--line) !important;
+    color-scheme: inherit !important; border-radius: 10px; overflow: hidden; }
+  #livelogModal > div { background: var(--surface) !important; border-color: var(--line) !important; }
+  #livelogContent { font-family: var(--mono); background: var(--bg); color: var(--fg); }
+
+  /* ---- phone ---- */
+  @media (max-width: 760px) {
+    body { font-size: 14px; }
+    .strip { grid-template-columns: 1fr 1fr; }
+    .strip .tile.now { grid-column: 1 / -1; }
+    table.q col.c0 { width: 26px; } table.q col.c2, table.q col.c3 { width: 0; }
+    table.q col.c4 { width: 86px; }
+    table.q td:nth-child(3), table.q td:nth-child(4) { display: none; }
+    table.q td.acts { white-space: normal; line-height: 2; }
+    table.q td.acts .btn { padding: 2px 7px; font-size: .76rem; }
+    span.qpos { margin-right: 3px; }
+    table.q td { padding: 8px 6px; }
+    .m-chip { display: inline-block; }
+    .bar { width: 72px; }
+    tr.queue-child td:nth-child(2), tr.slice-line td:nth-child(2) { padding-left: .8rem; }
+    #runStatus, #runStatus tbody { display: block; width: 100%; }
+    #runStatus thead { display: none; }
+    #runStatus tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .45rem;
+      padding: .45rem .1rem; border-bottom: 1px solid var(--line); }
+    #runStatus td { display: block; border: none; padding: 0; font-size: .78rem; min-width: 0;
       overflow-wrap: anywhere; word-break: break-word; }
-    /* The label owns its own line and reads first; the actions get the last line,
-       full width, so every button stays reachable (the user confirmed these were the
-       thing that was unusable before). Everything between them -- status, elapsed,
-       model -- flows inline on the line in the middle. */
-    /* calc, not 100%: the drag grip / expand caret is the cell BEFORE this one and
-       is only ~1.6rem wide, so a flat 100% basis pushed the label onto its own line
-       and left the caret sitting alone above it. This keeps them on one line. */
-    #jobs td:nth-child(2) { flex: 1 1 calc(100% - 2.2rem); font-weight: 600; }
-    #jobs td:last-child, #runStatus td:last-child {
-      flex: 1 1 100%; white-space: normal; margin-top: .15rem; }
     #runStatus td:nth-child(2) { flex: 1 1 calc(100% - 5rem); font-weight: 600; }
-    /* An empty cell in a flex row would still eat a gap; collapse them. */
-    #jobs td:empty, #runStatus td:empty { display: none; }
-    /* Short values must never break: without this the buttons rendered p/a/u/s/e
-       and h/o/l/d stacked vertically (seen at 390px in real WebKit). */
-    td button { white-space: nowrap; word-break: keep-all; overflow-wrap: normal; }
-    #jobs td:nth-child(3), #jobs td:nth-child(4), #runStatus td:nth-child(1) {
-      white-space: nowrap; word-break: keep-all; overflow-wrap: normal; }
-    button.iconbtn { font-size: .75rem; padding: .1rem .35rem; margin: 0 .05rem; }
-    /* Columns a phone cannot act on: still dropped, now from the card. */
-    #jobs td:nth-child(n+6):nth-child(-n+10) { display: none; }
+    #runStatus td:last-child { flex: 1 1 100%; white-space: normal; margin-top: .15rem; }
+    #runStatus td:empty { display: none; }
     #runStatus td:nth-child(n+4):nth-child(-n+6) { display: none; }
-    /* The bundle rail, as a card border rather than a cell padding. */
-    tr.queue-child, tr.run-child {
-      border-left: 3px solid rgba(70,130,180,0.35); padding-left: .6rem; }
-    tr.queue-child td:nth-child(2), tr.run-child td:nth-child(2) { padding-left: 0; }
-    .exit-legend { display: block; }
+    td button { white-space: nowrap; word-break: keep-all; overflow-wrap: normal; }
+    tr.run-child { border-left: 3px solid var(--line); padding-left: .6rem; }
+    tr.run-child td:nth-child(2) { padding-left: 0; border-left: 0; }
   }
 </style></head>
 <body>
-<h1>Ollama Queue</h1>
-<div class="toolbar"><a href="/chat">Chat &rarr;</a></div>
-<div class="toolbar"><button id="clearFinished">Clear finished (done/failed)</button></div>
-<div class="exit-legend">
-  <strong>Exit Codes:</strong><br>
-  0 - Converged<br>
-  1 - Verify Failed<br>
-  2 - Iteration Cap<br>
-  3 - Paused, Resumable<br>
-  4 - Refused to Start<br>
-  5 - Done, Unconverged
+<div class="wrap">
+<header class="top">
+  <h1>Ollama Queue</h1>
+  <a href="/chat">Chat &rarr;</a>
+  <span class="spacer"></span>
+  <span class="upd" id="updated">loading&hellip;</span>
+  <button class="btn" id="clearFinished" title="Remove every done/failed row from the queue state">Clear finished</button>
+</header>
+
+<div class="strip" id="summary">
+  <div class="tile now" id="sumNow"><div class="k"><span class="idle-dot"></span>Running now</div><div class="s">loading&hellip;</div></div>
+  <div class="tile" id="sumQueue"><div class="k">Queue</div><div class="v">&ndash;</div></div>
+  <div class="tile attn" id="sumAttn"><div class="k">Needs attention</div><div class="v">&ndash;</div></div>
 </div>
-<div class="tablewrap">
-<table id="jobs"><thead><tr>
-  <th></th><th>label</th><th>status</th><th>elapsed</th><th>model</th><th>progress</th><th>tok/s</th><th>lane</th><th>pid</th><th>exit</th><th></th>
-</tr></thead><tbody></tbody></table>
-</div>
+
+<section class="panel" id="attnPanel">
+  <div class="panel-head"><h2>Needs attention</h2><span class="count" id="attnCount"></span></div>
+  <div class="list attn" id="attnList"><table class="q" id="attnTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table></div>
+  <div class="list" id="attnEmpty" hidden><div class="empty">Nothing is stuck. Failed, parked and blocked work shows up here.</div></div>
+</section>
+
+<section class="panel" id="activePanel">
+  <div class="panel-head"><h2>Queue</h2><span class="count" id="activeCount"></span>
+    <span class="tools"><details class="legend"><summary>Exit codes</summary><div class="legend-body exit-legend">
+      0 - Converged<br>1 - Verify Failed<br>2 - Iteration Cap<br>3 - Paused, Resumable<br>4 - Refused to Start<br>5 - Done, Unconverged</div></details></span></div>
+  <div class="list"><table class="q" id="jobs"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  <div class="empty" id="activeEmpty" hidden>The queue is empty.</div></div>
+</section>
+
+<section class="panel" id="finishedPanel">
+  <div class="list"><details class="fin" id="finishedDetails">
+    <summary id="finishedSummary"><b>Finished bundles</b></summary>
+    <div class="fin-tools" id="finishedTools"></div>
+    <table class="q" id="finishedTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  </details></div>
+</section>
 
 <!-- UNIFIED run-status list (2026-09-17, the user: "complete jobs and handoff should
      essentially be the same one list when qwen is done that shows the run status
@@ -1589,12 +1650,14 @@ FRONTEND_HTML = r"""<!doctype html>
      still AWAITING SIGN-OFF refuses a plain clear and asks for an override reason.
      Backed by /api/runs; /api/jobs/completed and /api/handoff still exist for other
      consumers but the dashboard no longer renders their two separate tables. -->
-<h2>Run Status <span style="font-weight:normal; font-size:.75rem; color:#888;">(qwen finished -- verdict + run status; clear once handled)</span></h2>
-<div class="tablewrap">
+<section class="panel" id="runPanel">
+<div class="panel-head"><h2>Run Status</h2><span class="count">qwen finished: verdict + run status; clear once handled</span></div>
+<div class="list tablewrap">
 <table id="runStatus"><thead><tr>
   <th>verdict</th><th>label</th><th>model</th><th>host</th><th>files</th><th>when</th><th>flags</th><th></th>
 </tr></thead><tbody></tbody></table>
 </div>
+</section>
 
 <div id="livelogBackdrop" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.4); z-index:999;"></div>
 <div id="livelogModal" style="display:none; flex-direction:column; position:fixed; top:5%; left:5%; right:5%; bottom:5%; background:#fff; color:#111827; color-scheme:light; border:2px solid #333; z-index:1000; box-shadow:0 4px 20px rgba(0,0,0,.3);">
@@ -1609,8 +1672,8 @@ FRONTEND_HTML = r"""<!doctype html>
      here was the SECOND of the two overlapping surfaces; it is gone. In-flight work
      is the live queue table at the top of the page, and finished work (with its
      clear action) is the unified Run Status table above. -->
-<div style="display:flex; flex-wrap:wrap; gap:2rem;">
-  <div style="flex:1; min-width:300px;">   <!-- Web Search Usage -->
+<div class="ref-grid">
+  <div>   <!-- Web Search Usage -->
     <h2>Web Search Usage</h2>
     <div id="webSearchUsage">
       <table style="width: auto; border-collapse: collapse; margin-bottom: 1rem;">
@@ -1628,7 +1691,7 @@ FRONTEND_HTML = r"""<!doctype html>
       </table>
     </div>
   </div>
-  <div style="flex:1; min-width:300px;">   <!-- Loaded right now -->
+  <div>   <!-- Loaded right now -->
     <!-- Moved INSIDE this flex row 2026-09-26 (was stacked full-width below it):
          the two panels are both narrow, and side-by-side keeps the queue table
          above the fold. Rendered compactly (small font, tight padding, models
@@ -1636,7 +1699,7 @@ FRONTEND_HTML = r"""<!doctype html>
     <h2>Loaded right now</h2>
     <div id="hosts" class="tablewrap"></div>
   </div>
-  <div style="flex:1; min-width:300px;">   <!-- Settings: Ollama hosts -->
+  <div>   <!-- Settings: Ollama hosts -->
     <h2>Settings &mdash; Ollama hosts</h2>
     <div style="font-size:.78rem; opacity:.65; margin-bottom:.4rem;">
       Persisted to <code id="hostsCfgPath"></code>. Live: no restart needed.
@@ -1657,9 +1720,16 @@ FRONTEND_HTML = r"""<!doctype html>
     </div>
   </div>
 </div>
+</div><!-- .wrap -->
 
 <script>
-const tbody = document.querySelector('#jobs tbody');
+// The queue renders into THREE tables (Needs attention / Queue / Finished bundles).
+// `tbody` is the one currently being written; refresh() points it at the right one
+// before each bundle or row, so every row builder below appends exactly as before.
+const activeBody = document.querySelector('#jobs tbody');
+const attnBody = document.querySelector('#attnTable tbody');
+const finBody = document.querySelector('#finishedTable tbody');
+let tbody = activeBody;
 let dragId = null;
 let dragStartedAt = null;
 // Bundle (parent-row) drag reordering (the user 2026-09-18). Kept SEPARATE from dragId so a
@@ -1962,6 +2032,144 @@ function checkFrontendVersion(res) {
   } catch (e) { /* header unreadable -- never break the poll over this */ }
 }
 
+// ---- layout helpers (2026-10-05 redesign) ------------------------------------
+// One overflow menu per row. `items` are ready-made <button class="mi" data-...>
+// strings (plus '<hr>' separators); the data-* hooks are what the handlers bind to.
+function menuHtml(items, key) {
+  const body = (items || []).filter(Boolean);
+  if (!body.some(x => x !== '<hr>')) return '';
+  return `<details class="menu" data-menu="${escapeHtml(key)}"><summary title="More actions" aria-label="More actions">&middot;&middot;&middot;</summary>`
+    + `<div class="menu-pop" role="menu">${body.join('')}</div></details>`;
+}
+// done/total as a bar plus the numbers (the bar is decoration; the numbers are the fact).
+function progHtml(through, total, unit, title) {
+  const pct = total ? Math.max(0, Math.min(100, Math.round(100 * (through || 0) / total))) : 0;
+  return `<span class="prog"${title ? ` title="${escapeHtml(title)}"` : ''}><span class="bar"><i style="width:${pct}%"></i></span>`
+    + `<span><span class="plan-frac">${through || 0}/${total}</span> ${escapeHtml(unit || 'slices')}</span></span>`;
+}
+function dayLabel(ts) {
+  if (!ts) return 'Earlier';
+  const d = new Date(ts * 1000), now = new Date();
+  const key = x => x.getFullYear() + '-' + x.getMonth() + '-' + x.getDate();
+  const yest = new Date(now); yest.setDate(now.getDate() - 1);
+  if (key(d) === key(now)) return 'Today';
+  if (key(d) === key(yest)) return 'Yesterday';
+  return d.toLocaleDateString([], {weekday: 'short', month: 'short', day: 'numeric'});
+}
+const EXIT_NAMES = {0: 'converged', 1: 'verify failed', 2: 'iteration cap', 3: 'paused, resumable',
+                    4: 'refused to start', 5: 'done, unconverged'};
+// One line on why a job failed, from the most specific field the server gave us.
+function failReason(j) {
+  let t = j.failure_detail || j.terminal_reason || j.error || j.failure_class || '';
+  if (!t && j.exit_code != null) t = 'exit ' + j.exit_code + (EXIT_NAMES[j.exit_code] ? ' (' + EXIT_NAMES[j.exit_code] + ')' : '');
+  t = String(t || 'failed').replace(/\s+/g, ' ').trim();
+  if (j.failure_class && t !== j.failure_class && !t.includes(j.failure_class)) t = j.failure_class + ': ' + t;
+  return t.length > 180 ? t.slice(0, 177) + '...' : t;
+}
+// A standalone (bundle-less) row that needs a person: failed, held, or blocked.
+// paused stays in the queue: it keeps its queue position and has its own Resume button.
+function jobAttentionKind(j) {
+  if (j.status === 'failed') return 'failed';
+  if (j.status === 'held') return 'parked';
+  if (j.status === 'blocked') return 'blocked';
+  return null;
+}
+// The one-line reason (and the run whose log explains it) for a stuck bundle.
+function bundleAttention(g, view, kind) {
+  const kids = g.children || [];
+  if (kind === 'parked') {
+    const c = kids.find(x => x.status === 'held' || x.status === 'paused') || {};
+    const n = kids.filter(x => x.status === 'held' || x.status === 'paused').length;
+    return {reason: c.wait_reason || `${n} slice${n === 1 ? '' : 's'} ${c.status || 'held'}; resume to put ${n === 1 ? 'it' : 'them'} back in the queue.`};
+  }
+  const bad = view ? (view.slices || []).filter(x => x.attention) : [];
+  if (bad.length) {
+    const sl = bad[0];
+    const hist = (sl.history || []).filter(h => h.id);
+    const h = [...hist].reverse().find(x => /fail|escalat|error/i.test(String(x.status) + ' ' + String(x.result))) || hist[hist.length - 1];
+    const what = String(sl.detail || sl.phase || 'failed').replace(/\s+/g, ' ').trim();
+    let reason = `${sl.sid}: ${what}`;
+    if (reason.length > 170) reason = reason.slice(0, 167) + '...';
+    if (bad.length > 1) reason += ` (+${bad.length - 1} more slice${bad.length > 2 ? 's' : ''})`;
+    return {reason, logId: h ? h.id : null, logLabel: h ? h.label : null};
+  }
+  const c = kids.find(x => x.needs_attention) || kids.find(x => x.status === 'failed' || x.status === 'blocked');
+  if (!c) return {reason: ''};
+  if (kind === 'blocked') return {reason: c.wait_reason || (c.label + ' is blocked'), logId: null};
+  return {reason: `${c.label}: ${failReason(c)}`, logId: c.id, logLabel: c.label};
+}
+// Summary strip: running now / queue depth / needs attention, plus section counts.
+function renderSummary(jobs, acts, attnStats, q) {
+  const gpu = (acts || []).filter(a => a.kind === 'gpu');
+  const other = (acts || []).filter(a => a.kind !== 'gpu');
+  const runningJobs = jobs.filter(j => j.status === 'running');
+  const now = document.getElementById('sumNow');
+  const first = gpu[0] || (runningJobs[0] ? {id: runningJobs[0].id, label: runningJobs[0].label,
+    model: runningJobs[0].model, host: runningJobs[0].lane || runningJobs[0].host_pref,
+    elapsed_s: runningJobs[0].elapsed_s, group_key: runningJobs[0].bundle ? runningJobs[0].group_key : null} : null);
+  const fmtAct = a => a.kind === 'gpu'
+    ? `&#9654; ${escapeHtml(a.display || a.label || a.id)} <span style="opacity:.75">(${escapeHtml(a.model || '')} @ ${escapeHtml(a.host || '')}, ${formatElapsed(a.elapsed_s)})</span>${a.group_key ? ' <span style="opacity:.8">[bundle: <b>' + escapeHtml(a.group_key) + '</b>]</span>' : ''}`
+    : `&#9881; ${escapeHtml(a.what || a.tool)} <span style="opacity:.75">(${escapeHtml(a.wt || '')}, ${formatElapsed(a.elapsed_s)})</span>`;
+  if (first) {
+    const j = jobs.find(x => x.id === first.id) || {};
+    const meta = [
+      `<span>model <b>${escapeHtml(first.model || j.model || '?')}</b></span>`,
+      `<span>host <b>${escapeHtml(first.host || j.lane || j.host_pref || '?')}</b></span>`,
+      `<span>elapsed <b>${formatElapsed(first.elapsed_s != null ? first.elapsed_s : j.elapsed_s)}</b></span>`,
+      j.tok_s != null ? `<span><b>${j.tok_s.toFixed(1)}</b> tok/s</span>` : '',
+      (j.iteration != null && j.max_iters != null) ? `<span>iter <b>${j.iteration}/${j.max_iters}</b></span>` : '',
+      first.group_key ? `<span>bundle <b>${escapeHtml(first.group_key)}</b></span>` : ''].join('');
+    const rest = [...gpu.slice(1), ...other];
+    now.innerHTML = `<div class="k"><span class="pulse"></span>Running now</div>
+      <div class="now-job">${escapeHtml(first.display || first.label || first.id)}</div>
+      <div class="now-meta">${meta}</div>
+      ${rest.length ? `<div class="now-more">Also live now: ${rest.map(fmtAct).join(' &middot; ')}</div>` : ''}`;
+    now.style.cursor = 'pointer';
+    now.onclick = () => openLivelog(first.id, first.label || first.id);
+    now.title = 'Open the live log';
+  } else {
+    now.innerHTML = `<div class="k"><span class="idle-dot"></span>Running now</div>
+      <div class="now-job" style="color:var(--muted);font-weight:500">Nothing on the GPU</div>
+      ${other.length ? `<div class="now-more">Off-GPU, live now: ${other.map(fmtAct).join(' &middot; ')}</div>` : ''}`;
+    now.style.cursor = ''; now.onclick = null; now.title = '';
+  }
+  const cnt = st => jobs.filter(j => j.status === st).length;
+  const pend = cnt('pending'), paused = cnt('paused'), planned = cnt('planned');
+  document.getElementById('sumQueue').innerHTML = `<div class="k">Queue</div>
+    <div class="v">${pend + paused + planned}</div>
+    <div class="s">${pend} pending${paused ? ' &middot; ' + paused + ' paused' : ''} &middot; ${planned} planned</div>`;
+  const nA = attnStats.failed + attnStats.parked + attnStats.blocked;
+  const brk = ['failed', 'parked', 'blocked'].filter(k => attnStats[k]).map(k => attnStats[k] + ' ' + k).join(' &middot; ');
+  const at = document.getElementById('sumAttn');
+  at.classList.toggle('has', nA > 0);
+  at.innerHTML = `<div class="k">Needs attention</div><div class="v">${nA}</div>
+    <div class="s">${nA ? brk : 'nothing stuck'}</div>`;
+  document.getElementById('attnCount').textContent = nA ? String(nA) : '';
+  document.getElementById('attnList').hidden = !nA;
+  document.getElementById('attnEmpty').hidden = !!nA;
+  document.getElementById('activeCount').textContent =
+    `${q.bundles} bundle${q.bundles === 1 ? '' : 's'} · ${q.jobs} job${q.jobs === 1 ? '' : 's'}`;
+  document.getElementById('activeEmpty').hidden = !!(q.bundles || q.jobs);
+  document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString() + ' · refreshes every 4s';
+}
+// Menus: one open at a time; a click elsewhere, Escape, or picking an item closes it.
+// While one is open the 4s re-render waits (up to 20s) so it cannot snap shut under you.
+let menuOpenedAt = 0;
+document.addEventListener('toggle', e => {
+  const d = e.target;
+  if (!d || !d.classList || !d.classList.contains('menu') || !d.open) return;
+  menuOpenedAt = Date.now();
+  document.querySelectorAll('details.menu[open]').forEach(o => { if (o !== d) o.open = false; });
+}, true);
+document.addEventListener('click', e => {
+  const inMenu = e.target.closest ? e.target.closest('details.menu') : null;
+  document.querySelectorAll('details.menu[open]').forEach(o => { if (o !== inMenu) o.open = false; });
+  if (inMenu && e.target.closest('.menu-pop button')) inMenu.open = false;
+}, true);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.querySelectorAll('details.menu[open]').forEach(o => { o.open = false; });
+});
+
 async function refresh() {
   // A live drag is in progress -- don't let a poll-driven re-render wipe out the
   // in-progress visual reorder below. Bounded: if dragId has been stuck for more
@@ -1981,6 +2189,7 @@ async function refresh() {
       dragStartedAt = null;
     }
   }
+  if (document.querySelector('details.menu[open]') && Date.now() - menuOpenedAt < 20000) return;
   // finished bundles change slowly: refetch at most every 15s (or right after a control)
   const wantFinished = Date.now() - finishedFetchedAt > 15000;
   const [res, bvRes, fbRes] = await Promise.all([fetch('/api/jobs'),
@@ -2060,20 +2269,18 @@ async function refresh() {
   // instant, which can shorten the document and make the browser clamp scrollY.
   // Restore it only when it actually moved (no-op in the common case).
   const _scrollY = window.scrollY;
-  tbody.innerHTML = '';
+  // An open overflow menu survives the re-render (same key => reopened below).
+  const _openMenu = (document.querySelector('details.menu[open]') || {dataset: {}}).dataset.menu;
+  activeBody.innerHTML = ''; attnBody.innerHTML = ''; finBody.innerHTML = '';
+  tbody = activeBody;
   // LIVE ACTIVITY (Dashboard B): what is happening RIGHT NOW, GPU or not -- the
   // running job(s) and every off-GPU step (preflight, verify-relevance mutants), so
-  // a committed bundle between GPU jobs never reads as hung.
+  // a committed bundle between GPU jobs never reads as hung. Drawn in the summary
+  // strip's "Running now" tile (renderSummary), each job naming ITS OWN bundle.
   const acts = (bundleViews.activity || []);
-  if (acts.length) {
-    const atr = document.createElement('tr');
-    atr.className = 'live-activity';
-    atr.innerHTML = `<td>&#9679;</td><td colspan="10"><b>live now:</b> ` + acts.map(a => a.kind === 'gpu'
-      ? `&#9654; ${escapeHtml(a.display || a.label || a.id)} <span style="opacity:.6">(${escapeHtml(a.model || '')} @ ${escapeHtml(a.host || '')}, ${formatElapsed(a.elapsed_s)})</span>${a.group_key ? ' <span style="opacity:.7">[bundle: <b>' + escapeHtml(a.group_key) + '</b>]</span>' : ''}`
-      : `&#9881; ${escapeHtml(a.what || a.tool)} <span style="opacity:.6">(${escapeHtml(a.wt || '')}, ${formatElapsed(a.elapsed_s)})</span>`
-    ).join(' &middot; ') + '</td>';   // each job names ITS OWN bundle (a.group_key), never the focused one
-    tbody.appendChild(atr);
-  }
+  // Needs-attention bookkeeping, filled while the bundles render below.
+  const attnStats = {failed: 0, parked: 0, blocked: 0};
+  let activeBundles = 0, activeJobs = 0;
   // ONE definition of a queue row, used for both a top-level (standalone) row and a
   // plan's child row -- the child only differs by an indent class, so every per-row
   // action (drag, promote, up/down, bottom, resume, remove, pause) keeps working
@@ -2084,7 +2291,7 @@ async function refresh() {
     tr.dataset.id = j.id;
     tr.style.cursor = 'pointer';
     tr.addEventListener('click', e => {
-      if (e.target.tagName === 'BUTTON') return;
+      if (e.target.closest('button, details, a')) return;   // a control, not the row
       openLivelog(j.id, j.label);
     });
     const isPending = j.status === 'pending' || j.status === 'paused';
@@ -2098,7 +2305,7 @@ async function refresh() {
       tr.addEventListener('dragstart', () => { dragId = j.id; dragStartedAt = Date.now(); tr.classList.add('dragging'); });
       tr.addEventListener('dragend', () => {
         tr.classList.remove('dragging');
-        tbody.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
+        document.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
           el.classList.remove('drop-indicator-above', 'drop-indicator-below'));
         dragId = null;
         dragStartedAt = null;
@@ -2113,7 +2320,7 @@ async function refresh() {
         // fast drag, so multi-row moves got dropped or landed inconsistently. This
         // computes the final position once, at drop time, from whichever row you were
         // last actually over -- robust regardless of how many rows you crossed to get there.
-        tbody.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
+        document.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
           el.classList.remove('drop-indicator-above', 'drop-indicator-below'));
         const rect = tr.getBoundingClientRect();
         const before = (e.clientY - rect.top) < rect.height / 2;
@@ -2128,7 +2335,7 @@ async function refresh() {
         const beforeId = before ? j.id : (pendingIds[pos + 1] || null);
         const movedId = dragId;
         dragId = null;
-        tbody.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
+        document.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
           el.classList.remove('drop-indicator-above', 'drop-indicator-below'));
         moveJob(movedId, beforeId);
       });
@@ -2170,67 +2377,58 @@ async function refresh() {
         delete transitioning[j.id];
       }
     }
-    if (j.wait_reason && !_t) statusLabel += `<span class="wait-reason">${escapeHtml(j.wait_reason)}</span>`;
+    // The wait reason is a sentence: it reads under the label, never inside the status chip.
+    const waitHtml = (j.wait_reason && !_t) ? `<span class="wait-reason">${escapeHtml(j.wait_reason)}</span>` : '';
     const toks = j.tok_s != null ? j.tok_s.toFixed(1) : '';
     // 0:00 for pending (elapsed_s null); live wall-time for running (recomputed
     // server-side from log ctime each refresh); frozen final duration once terminal.
     // ACTIVE runtime (paused time excluded); paused time, when material, shown beside it.
     const elapsed = formatElapsed(j.elapsed_s) + (j.paused_s != null && j.paused_s >= 60
       ? ` <span style="opacity:.55; font-size:.85em" title="time spent paused (preempted), not counted as runtime">+${formatElapsed(j.paused_s)} paused</span>` : '');
-    let actions = '';
+    // Controls: at most ONE inline button (the thing you would most likely do next), and
+    // everything else in the row's overflow menu. Same data-* hooks and handlers as ever.
+    let actions = '', primary = '';
+    const items = [];
     if (isPending) {
       const pos = pendingIds.indexOf(j.id);
-      // TRUE queue position, rendered before the arrows. The arrows are computed from
-      // pendingIds (real FIFO, what the daemon iterates) while the ROW ORDER is
-      // plan-grouped, so without this the two contradict each other on screen: a row
-      // sitting just under `running` that offers only "up" (it is really last), or a
-      // row well down the table offering the "run me now" single-up (it is really
-      // first). Rather than re-sorting the table -- the plan grouping is deliberate,
-      // unit-tested, and keeps a plan's slices readable as one block -- state the real
-      // position so the arrows become self-explanatory. Highlighted when the row's
-      // visual rank is far from its true rank, i.e. exactly when the table misleads.
+      // TRUE queue position, rendered before the menu. The menu's moves act on pendingIds
+      // (real FIFO, what the daemon iterates) while the ROW ORDER is plan-grouped, so
+      // state the real position; highlighted when the visual rank is far from it.
       const vrank = visualPendingRank[j.id];
       const adrift = vrank != null && Math.abs(vrank - pos) >= 3;
-      actions += `<span class="qpos${adrift ? ' qpos-adrift' : ''}" title="True queue position ${pos + 1} of ${pendingIds.length} pending${adrift ? ` -- but it is drawn ${vrank + 1}${vrank < pos ? ' (higher than it really is)' : ' (lower than it really is)'} because the table groups each plan's rows at the position of that plan's earliest slice. The arrows act on the TRUE position.` : '. Table rows are grouped by plan, so row order is not queue order.'}">${pos + 1}/${pendingIds.length}</span>`;
-      // Up: move before the pending job currently two slots earlier (i.e.
-      // ahead of the one directly preceding this one). Down: move before the
-      // pending job currently two slots later, or to the end if none.
-      if (pos > 0) actions += `<button class="iconbtn" data-top title="Send to top of queue">&uarr;&uarr;</button>`;
-      // Whole-job promote (2026-09-18, the user: a multi-slice job took one click per
-      // slice). Only shown when this row's logical job actually HAS more than one
-      // pending slice -- otherwise it would duplicate the plain send-to-top button.
-      // Monochrome &uarr;&uarr; (single-line doubled up arrow), same .iconbtn as every
-      // other action: one consistent arrow family across the dashboard (the user 2026-09-18),
-      // no emoji glyph here, deliberately.
-      if (j.group_pending > 1) actions += `<button class="iconbtn" data-promote-group title="Promote the WHOLE job &quot;${j.group_key}&quot; (${j.group_pending} pending slices) to the top, keeping slice order">&uarr;&uarr;</button>`;
-      if (pos > 0) actions += `<button class="iconbtn" data-up>&uarr;</button>`;
-      if (pos === 0) actions += `<button class="iconbtn" data-promote-front title="Pause whatever is running and run this one now">&uarr;</button>`;
-      if (pos < pendingIds.length - 1) actions += `<button class="iconbtn" data-down>&darr;</button>`;
-      // Send to bottom (2026-09-18, the user): reuses the existing move endpoint with
-      // before_id: null, which _reorder_job already treats as "append to the end" --
-      // no new endpoint needed. Hidden once a row is already last (nothing to do).
-      if (pos < pendingIds.length - 1) actions += `<button class="iconbtn" data-bottom title="Send to bottom of queue">&darr;&darr;</button>`;
+      actions += `<span class="qpos${adrift ? ' qpos-adrift' : ''}" title="True queue position ${pos + 1} of ${pendingIds.length} pending${adrift ? ` -- but it is drawn ${vrank + 1}${vrank < pos ? ' (higher than it really is)' : ' (lower than it really is)'} because the table groups each plan's rows at the position of that plan's earliest slice. The moves act on the TRUE position.` : '. Table rows are grouped by plan, so row order is not queue order.'}">#${pos + 1}</span>`;
+      if (pos > 0) items.push(`<button class="mi" data-top title="Send to top of queue">&uarr;&uarr; Send to top</button>`);
+      // Whole-job promote: only when this row's logical job HAS more than one pending slice.
+      if (j.group_pending > 1) items.push(`<button class="mi" data-promote-group title="Promote the WHOLE job &quot;${j.group_key}&quot; (${j.group_pending} pending slices) to the top, keeping slice order">&uarr;&uarr; Send whole job to top (${j.group_pending})</button>`);
+      if (pos > 0) items.push(`<button class="mi" data-up>&uarr; Move up one</button>`);
+      if (pos === 0) items.push(`<button class="mi" data-promote-front title="Pause whatever is running and run this one now">&#9654; Run now (pauses current job)</button>`);
+      if (pos < pendingIds.length - 1) items.push(`<button class="mi" data-down>&darr; Move down one</button>`);
+      // Send to bottom: the existing move endpoint with before_id: null.
+      if (pos < pendingIds.length - 1) items.push(`<button class="mi" data-bottom title="Send to bottom of queue">&darr;&darr; Send to bottom</button>`);
     }
-    if (j.status === 'paused') actions += `<button class="iconbtn" data-resume>resume</button>`;
-    if (isRemovable) actions += `<button class="iconbtn" data-remove>remove</button>`;
-    // ONE pause control. A second data-kill button drawn as "&darr;" used to follow
-    // this one with the identical title and action -- a stray duplicate that read as a
-    // reorder arrow (every other &darr; on the page means "move down") but paused the
-    // job instead.
-    if (j.status === 'running') actions += `<button class="iconbtn" data-kill title="Gracefully pauses the job (SIGTERM) -- it saves state and can be resumed, this does not discard work">pause</button>`;
+    if (j.status === 'paused') primary = `<button class="btn primary" data-resume>Resume</button>`;
+    // ONE pause control (graceful SIGTERM; state saved, resumable).
+    if (j.status === 'running') items.push(`<button class="mi" data-kill title="Gracefully pauses the job (SIGTERM) -- it saves state and can be resumed, this does not discard work">&#10074;&#10074; Pause (keeps its work)</button>`);
+    if (j.status === 'failed' && !primary) primary = `<button class="btn primary" data-log>View log</button>`;
+    else items.push(`<button class="mi" data-log>View log</button>`);
+    if (isRemovable) items.push(`<hr><button class="mi danger" data-remove>Remove from queue</button>`);
+    actions += primary + menuHtml(items, 'job:' + j.id);
+    // What used to be six mostly-empty columns: one quiet line under the label.
+    const meta = [j.model ? escapeHtml(j.model) : '', escapeHtml(j.lane || j.host_pref || ''),
+      progress ? 'iter ' + progress : '', toks ? toks + ' tok/s' : '',
+      j.pid != null ? 'pid ' + j.pid : '', j.exit_code != null ? 'exit ' + j.exit_code : '']
+      .filter(Boolean).map(x => `<span>${x}</span>`).join('');
+    const why = j.status === 'failed' ? failReason(j) : '';
+    const stCls = j.phase === 'warming' ? 'warming' : j.status;
     tr.innerHTML = `
       <td${isPending ? ' title="Drag to reorder, or drop onto the running job to run this one now"' : ''}>${isPending ? '☰' : ''}</td>
-      <td>${escapeHtml(j.label || '')}${j.rerun ? ` <span style="opacity:.6;font-size:.85em" title="${escapeHtml(j.rerun.cause || '')}">#${escapeHtml(String(j.rerun.n))}</span>` : ''}</td>
-      <td class="status-${j.phase === 'warming' ? 'warming' : j.status}">${statusLabel}</td>
-      <td>${elapsed}</td>
-      <td>${j.model}</td>
-      <td>${progress}</td>
-      <td>${toks}</td>
-      <td>${j.lane || j.host_pref}</td>
-      <td>${j.pid ?? ''}</td>
-      <td>${j.exit_code ?? ''}</td>
-      <td>${actions}</td>
+      <td>${escapeHtml(j.label || '')}${j.rerun ? ` <span class="rerun" title="${escapeHtml(j.rerun.cause || '')}">#${escapeHtml(String(j.rerun.n))}</span>` : ''}<span class="chip m-chip ${escapeHtml(stCls)}">${statusLabel}</span>${meta ? `<div class="sub">${meta}</div>` : ''}${why ? `<div class="reason bad">${escapeHtml(why)}</div>` : ''}${waitHtml}</td>
+      <td class="st"><span class="chip status-${escapeHtml(stCls)} ${escapeHtml(stCls)}">${statusLabel}</span></td>
+      <td class="when">${j.elapsed_s == null && !isRunning ? '' : elapsed}</td>
+      <td class="acts">${actions}</td>
     `;
+    const logBtn = tr.querySelector('[data-log]');
+    if (logBtn) logBtn.addEventListener('click', () => openLivelog(j.id, j.label));
     const topBtn = tr.querySelector('[data-top]');
     if (topBtn) topBtn.addEventListener('click', async () => {
       // Robust send-to-top: hit the server-side promote endpoint, which inserts
@@ -2409,12 +2607,12 @@ async function refresh() {
       str.className = 'queue-child slice-line' + (sl.phase === 'done' ? ' queue-done' : '');
       str.style.cursor = 'pointer';
       str.dataset.open = open ? '1' : '0';
+      const sDetail = (sl.detail || '').replace(/^refining \(round \d+\)( -- )?/, '');
       str.innerHTML = `
         <td class="slice-caret">${sl.history && sl.history.length ? (open ? '&#9662;' : '&#9656;') : ''}</td>
-        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}</td>
-        <td class="ph ph-${sl.phase}">${sl.phase}</td>
-        <td>${escapeHtml(sliceSuffix(sl))}</td>
-        <td colspan="6" style="opacity:.75">${escapeHtml((sl.detail || '').replace(/^refining \(round \d+\)( -- )?/, ''))}</td>
+        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sl.phase}">${sl.phase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}</td>
+        <td class="st"><span class="chip ph ph-${sl.phase}">${sl.phase}</span></td>
+        <td class="when">${escapeHtml(sliceSuffix(sl))}</td>
         <td></td>`;
       str.addEventListener('click', () => {
         sliceExpanded[skey] = !open; saveExpandState(); refresh();
@@ -2435,7 +2633,7 @@ async function refresh() {
           if (lc && lc.firstChild && lc.firstChild.nodeType === 3) {
             r.title = live.label || '';
             lc.firstChild.textContent = stageLabel(h.kind, live.label);
-            const rr = lc.querySelector('span');
+            const rr = lc.querySelector('.rerun');
             if (rr) rr.remove();      // the "#N" rerun counter is noise under a slice
           }
           return r;
@@ -2448,10 +2646,9 @@ async function refresh() {
         const when = h.start ? new Date(h.start * 1000).toLocaleTimeString() : '';
         htr.innerHTML = `
           <td></td>
-          <td${indent ? ' style="padding-left:5.2rem"' : ''}>${escapeHtml(stageLabel(h.kind, h.label))}${h.id ? ' <span style="opacity:.5">' + h.id + '</span>' : ''}</td>
-          <td class="status-${escapeHtml(h.status || '')}">${escapeHtml(h.status || '')}</td>
-          <td>${h.duration_s != null ? formatElapsed(h.duration_s) : ''}</td>
-          <td colspan="6">${escapeHtml(h.result || '')} <span style="opacity:.5">${when}</span></td>
+          <td${indent ? ' style="padding-left:5.2rem"' : ''}>${escapeHtml(stageLabel(h.kind, h.label))}${h.id ? ' <span style="opacity:.5">' + h.id + '</span>' : ''}${h.result ? '<div class="sub">' + escapeHtml(h.result) + '</div>' : ''}</td>
+          <td class="st"><span class="chip status-${escapeHtml(h.status || '')} ${escapeHtml(h.status || '')}">${escapeHtml(h.status || '')}</span></td>
+          <td class="when" title="${escapeHtml(when)}">${h.duration_s != null ? formatElapsed(h.duration_s) : ''}</td>
           <td></td>`;
         return htr;
       };
@@ -2461,7 +2658,7 @@ async function refresh() {
         fr.className = 'queue-child ' + cls;
         fr.style.cursor = 'pointer';
         fr.dataset.open = isOpen ? '1' : '0';
-        fr.innerHTML = `<td class="slice-caret">${isOpen ? '&#9662;' : '&#9656;'}</td><td colspan="9" style="opacity:.75;padding-left:${SLICE_KID}">${escapeHtml(text)}</td><td></td>`;
+        fr.innerHTML = `<td class="slice-caret">${isOpen ? '&#9662;' : '&#9656;'}</td><td colspan="3" style="color:var(--muted);padding-left:${SLICE_KID}">${escapeHtml(text)}</td><td></td>`;
         fr.addEventListener('click', () => { sliceExpanded[key] = !isOpen; saveExpandState(); refresh(); });
         return fr;
       };
@@ -2511,7 +2708,7 @@ async function refresh() {
           const sh = document.createElement('tr');
           sh.className = 'queue-child slice-stage';
           sh.style.cursor = 'pointer';
-          sh.innerHTML = `<td></td><td colspan="9" style="padding-left:${b0}"><span class="slice-caret" style="display:inline-block;width:1em">${so ? '&#9662;' : '&#9656;'}</span><span style="font-size:.8em;letter-spacing:.04em;text-transform:uppercase;opacity:.7">${stg.st[0]} &middot; ${stg.st[1]}</span> <span style="opacity:.55">&mdash; ${escapeHtml(sum)}</span></td><td></td>`;
+          sh.innerHTML = `<td></td><td colspan="3" style="padding-left:${b0}"><span class="slice-caret" style="display:inline-block;width:1em">${so ? '&#9662;' : '&#9656;'}</span><span class="stage-h">${stg.st[0]} &middot; ${stg.st[1]}</span> <span style="opacity:.6">&mdash; ${escapeHtml(sum)}</span></td><td></td>`;
           sh.addEventListener('click', () => { sliceExpanded[stk] = !so; saveExpandState(); refresh(); });
           tbody.appendChild(sh);
           const startLen = tbody.children.length;
@@ -2552,7 +2749,7 @@ async function refresh() {
         if (n === cur) {
           const dv = document.createElement('tr');
           dv.className = 'queue-child slice-attempt';
-          dv.innerHTML = `<td></td><td colspan="10" style="opacity:.6;font-size:.85em;padding-top:6px;padding-left:${SLICE_KID}">&#9472;&#9472; attempt ${cur} of ${cur} &#9472;&#9472;</td><td></td>`;
+          dv.innerHTML = `<td></td><td colspan="3" style="color:var(--muted);font-size:.85em;padding-top:6px;padding-left:${SLICE_KID}">&#9472;&#9472; attempt ${cur} of ${cur} &#9472;&#9472;</td><td></td>`;
           tbody.appendChild(dv);
           renderAttemptRows(ga.by[n], ak, ATTEMPT_KID_N);
           continue;
@@ -2580,7 +2777,17 @@ async function refresh() {
     // live -- still nests under its bundle instead of floating as a lone "one-off" row
     // at the bottom (the user 2026-09-18). A keyless standalone row still renders flat.
     if (!g.key) {
-      for (const c of g.children) tbody.appendChild(buildQueueRow(c, false));
+      for (const c of g.children) {
+        // A standalone job that failed or is parked goes to Needs attention, with its
+        // reason on the row; everything else is ordinary queue work.
+        const kind = jobAttentionKind(c);
+        if (kind) attnStats[kind]++; else activeJobs++;
+        tbody = kind ? attnBody : activeBody;
+        const r = buildQueueRow(c, false);
+        if (kind) r.classList.add('needs-attn');
+        tbody.appendChild(r);
+      }
+      tbody = activeBody;
       continue;
     }
     // --- plan fields, read across the WHOLE bundle, never off children[0] --------
@@ -2662,18 +2869,39 @@ async function refresh() {
     // toggle. The per-row arrows use exactly this index arithmetic (before the
     // previous one / before the one two later, i.e. after the next one).
     const mpos = movablePlans.indexOf(g);
-    let pacts = '';
-    // Button order (the user 2026-09-18): upup, up, down, downdown, hold, cancel -- and
-    // all arrows one consistent single-line family (&uarr;/&darr;, doubled for the
-    // ends) rather than mixing a double-line chevron (&uArr;) with single arrows.
-    if (pending.length) pacts += `<button class="iconbtn" data-plan-promote title="Run this bundle FIRST (send &quot;${g.key}&quot;'s ${pending.length} pending slices to the front of the queue, keeping slice order)">&uarr;&uarr;</button>`;
-    if (mpos > 0) pacts += `<button class="iconbtn" data-plan-up title="Run this bundle one place EARLIER (before &quot;${movablePlans[mpos - 1].key}&quot;) -- slice order inside the bundle is untouched">&uarr;</button>`;
-    if (mpos >= 0 && mpos < movablePlans.length - 1) pacts += `<button class="iconbtn" data-plan-down title="Run this bundle one place LATER (after &quot;${movablePlans[mpos + 1].key}&quot;) -- slice order inside the bundle is untouched">&darr;</button>`;
-    if (mpos >= 0 && mpos < movablePlans.length - 1) pacts += `<button class="iconbtn" data-plan-last title="Run this bundle LAST (send it to the end of the queue)">&darr;&darr;</button>`;
-    if (running.length || pending.length) pacts += `<button class="iconbtn" data-plan-pause title="Pause the WHOLE bundle: gracefully stop its running slice (state saved, resumable) and hold its ${pending.length} pending slice(s), so it vacates the GPU and another bundle can run">pause</button>`;
-    if (pending.length) pacts += `<button class="iconbtn" data-plan-hold title="Hold every pending slice of this plan (parks them out of execution; resume per row)">hold</button>`;
-    if (resumable.length) pacts += `<button class="iconbtn" data-plan-resume title="Resume every paused/held slice of this plan (${resumable.length}) -- they become pending again, and the reorder arrows come back so you can reposition the bundle">resume</button>`;
-    if (cancellable.length) pacts += `<button class="iconbtn" data-plan-cancel title="Cancel every not-running slice of this plan">cancel</button>`;
+    // --- where this bundle belongs: Needs attention or the Queue -----------------
+    // Stuck = nothing of it is running or waiting to run. Stuck AND carrying an
+    // unresolved failure => "failed"; stuck because it was held/paused => "parked";
+    // only blocked rows => "blocked". A bundle that is still MOVING keeps its failure
+    // as a quiet amber note in the Queue: a retry in flight is not an emergency.
+    const liveNow = !!(counts.running || counts.pending || counts.queued);
+    const hasAlert = alertSummary.alerts.length > 0 || badSlices > 0;
+    const attnKind = (!liveNow && (counts.held || counts.paused)) ? 'parked'
+      : (!liveNow && hasAlert) ? 'failed'
+      : (!liveNow && counts.blocked) ? 'blocked' : null;
+    const attnInfo = attnKind ? bundleAttention(g, badView, attnKind) : null;
+    // Button order (the user 2026-09-18): upup, up, down, downdown, hold, cancel -- kept,
+    // now as one overflow menu with words beside the arrows.
+    let pprimary = '';
+    const pitems = [];
+    if (pending.length) pitems.push(`<button class="mi" data-plan-promote title="Run this bundle FIRST (send &quot;${g.key}&quot;'s ${pending.length} pending slices to the front of the queue, keeping slice order)">&uarr;&uarr; Run this bundle next</button>`);
+    if (mpos > 0) pitems.push(`<button class="mi" data-plan-up title="Run this bundle one place EARLIER (before &quot;${movablePlans[mpos - 1].key}&quot;) -- slice order inside the bundle is untouched">&uarr; Move earlier</button>`);
+    if (mpos >= 0 && mpos < movablePlans.length - 1) pitems.push(`<button class="mi" data-plan-down title="Run this bundle one place LATER (after &quot;${movablePlans[mpos + 1].key}&quot;) -- slice order inside the bundle is untouched">&darr; Move later</button>`);
+    if (mpos >= 0 && mpos < movablePlans.length - 1) pitems.push(`<button class="mi" data-plan-last title="Run this bundle LAST (send it to the end of the queue)">&darr;&darr; Move to end</button>`);
+    if (pitems.length) pitems.push('<hr>');
+    if (running.length || pending.length) pitems.push(`<button class="mi" data-plan-pause title="Pause the WHOLE bundle: gracefully stop its running slice (state saved, resumable) and hold its ${pending.length} pending slice(s), so it vacates the GPU and another bundle can run">&#10074;&#10074; Pause bundle</button>`);
+    if (pending.length) pitems.push(`<button class="mi" data-plan-hold title="Hold every pending slice of this plan (parks them out of execution; resume per row)">Hold pending slices (${pending.length})</button>`);
+    const resumeBtnHtml = cls => `<button class="${cls}" data-plan-resume title="Resume every paused/held slice of this plan (${resumable.length}) -- they become pending again, and the reorder arrows come back so you can reposition the bundle">Resume${cls === 'mi' ? ' (' + resumable.length + ')' : ''}</button>`;
+    if (resumable.length && attnKind === 'parked') pprimary = resumeBtnHtml('btn primary');
+    else if (resumable.length) pitems.push(resumeBtnHtml('mi'));
+    if (attnInfo && attnInfo.logId) {
+      const lb = `data-plan-log="${escapeHtml(attnInfo.logId)}" data-log-label="${escapeHtml(attnInfo.logLabel || attnInfo.logId)}"`;
+      if (!pprimary) pprimary = `<button class="btn primary" ${lb}>View log</button>`;
+      else pitems.push(`<button class="mi" ${lb}>View log of the failed run</button>`);
+    }
+    if (cancellable.length) pitems.push(`<hr><button class="mi danger" data-plan-cancel title="Cancel every slice of this plan (a running one is stopped)">Cancel bundle&hellip;</button>`);
+    while (pitems.length && pitems[pitems.length - 1] === '<hr>') pitems.pop();
+    const pacts = pprimary + menuHtml(pitems, 'plan:' + g.key);
     // X/Y = how far the WHOLE plan has got: slices already enqueued/done over the
     // plan's total slice count, read server-side from the slicer's own run state
     // (~/.ollama-dispatch/slice-runs/<plan>.json), NOT from the live rows -- slices
@@ -2716,18 +2944,24 @@ async function refresh() {
     // (the user 2026-09-18, the Ollama Queue panel on bg-eraser).
     const summary = (total ? '' : `${g.children.length} slices &middot; `)
       + (total && parts.length ? 'queue rows: ' : '') + parts.join(' &middot; ');
+    const chipTxt = attnKind || leadStatus;
+    // The waiting bundle says WHY it waits (its head row's server-side wait_reason).
+    const headWait = (g.children.find(c => c.wait_reason && ['pending', 'planned', 'queued'].includes(c.status)) || {}).wait_reason;
     const ptr = document.createElement('tr');
-    ptr.className = 'queue-parent' + alertSummary.rowClass;
+    ptr.className = 'queue-parent' + alertSummary.rowClass + (attnKind ? ' needs-attn' : '');
     ptr.innerHTML = `
       <td>${mpos >= 0 ? `<span class="bundle-grip" draggable="true" title="Drag to reorder this bundle in the queue" style="cursor:grab;margin-right:4px;opacity:0.55">&#10303;</span>` : ''}${expanded ? '&#9662;' : '&#9656;'}</td>
-      <td><span class="proj-name">${g.key}</span> ${lead}${frac}${alertSummary.badge}${sliceBadge}
-          <span class="proj-summary">${summary}</span></td>
-      <td class="status-${leadStatus}">${leadStatus}</td>
-      <td colspan="7"></td>
-      <td>${pacts}</td>`;
+      <td><span class="proj-name">${escapeHtml(g.key)}</span><span class="chip m-chip ${chipTxt}">${chipTxt}</span>
+          <div class="sub">${total ? progHtml(through, total, unitName, fracTitle) : ''}${lead}${alertSummary.badge}${sliceBadge}</div>
+          ${summary ? `<div class="sub proj-summary">${summary}</div>` : ''}
+          ${attnInfo && attnInfo.reason ? `<div class="reason${attnKind === 'failed' ? ' bad' : ''}">${escapeHtml(attnInfo.reason)}</div>`
+            : (headWait && !counts.running ? `<span class="wait-reason">${escapeHtml(headWait)}</span>` : '')}</td>
+      <td class="st"><span class="chip status-${chipTxt} ${chipTxt}">${chipTxt}</span></td>
+      <td class="when">${curSlice && curSlice.elapsed_s != null ? formatElapsed(curSlice.elapsed_s) : ''}</td>
+      <td class="acts">${pacts}</td>`;
     ptr.addEventListener('click', e => {
       // The grip is for dragging, not toggling; a click on it must not expand/collapse.
-      if (e.target.tagName === 'BUTTON' || e.target.classList.contains('bundle-grip')) return;
+      if (e.target.closest('button, details, a') || e.target.classList.contains('bundle-grip')) return;
       planExpanded[g.key] = !expanded;
       saveExpandState();
       refresh();
@@ -2744,7 +2978,7 @@ async function refresh() {
       });
       grip.addEventListener('dragend', () => {
         ptr.classList.remove('dragging');
-        tbody.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
+        document.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
           el.classList.remove('drop-indicator-above', 'drop-indicator-below'));
         dragBundleKey = null; dragStartedAt = null; refresh();
       });
@@ -2753,7 +2987,7 @@ async function refresh() {
       ptr.addEventListener('dragover', e => {
         if (!dragBundleKey || dragBundleKey === g.key) return;  // ignore job drags + self
         e.preventDefault();
-        tbody.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
+        document.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
           el.classList.remove('drop-indicator-above', 'drop-indicator-below'));
         const rect = ptr.getBoundingClientRect();
         const before = (e.clientY - rect.top) < rect.height / 2;
@@ -2770,7 +3004,7 @@ async function refresh() {
         const beforeGroup = before ? g : (movablePlans[tpos + 1] || null);
         const dragged = movablePlans.find(e2 => e2.key === dragBundleKey);
         dragBundleKey = null;
-        tbody.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
+        document.querySelectorAll('.drop-indicator-above, .drop-indicator-below').forEach(el =>
           el.classList.remove('drop-indicator-above', 'drop-indicator-below'));
         if (dragged && dragged !== beforeGroup) moveBundle(dragged, beforeGroup);
       });
@@ -2857,6 +3091,12 @@ async function refresh() {
       }
       refresh();
     });
+    const planLogBtn = ptr.querySelector('[data-plan-log]');
+    if (planLogBtn) planLogBtn.addEventListener('click', () =>
+      openLivelog(planLogBtn.dataset.planLog, planLogBtn.dataset.logLabel || planLogBtn.dataset.planLog));
+    // Route the bundle (header + everything under it) to its section.
+    if (attnKind) attnStats[attnKind]++; else activeBundles++;
+    tbody = attnKind ? attnBody : activeBody;
     tbody.appendChild(ptr);
     if (expanded && view && view.slices && view.slices.length) {
       renderSliceLines(g, view);
@@ -2890,9 +3130,9 @@ async function refresh() {
           : (skipped ? '<span class="verdict-skipped">retired &mdash; nothing dispatched</span>' : '');
         dtr.innerHTML = `
           <td></td>
-          <td>${skipped ? '&#8856;' : '&#10003;'} ${d.label}</td>
-          <td class="status-${skipped ? 'skipped' : 'done'}">${skipped ? 'skipped' : 'done'}</td>
-          <td colspan="7">${gtag}</td>
+          <td>${skipped ? '&#8856;' : '&#10003;'} ${d.label}${gtag ? '<div class="sub">' + gtag + '</div>' : ''}</td>
+          <td class="st"><span class="chip ${skipped ? 'skipped' : 'done'}">${skipped ? 'skipped' : 'done'}</span></td>
+          <td></td>
           <td></td>`;
         tbody.appendChild(dtr);
       }
@@ -2910,54 +3150,74 @@ async function refresh() {
         dtr.innerHTML = `
           <td></td>
           <td>&#9675; ${d.label}</td>
-          <td class="status-${d.status || 'planned'}">${d.status || 'planned'}</td>
-          <td colspan="7"></td>
+          <td class="st"><span class="chip ${d.status || 'planned'}">${d.status || 'planned'}</span></td>
+          <td></td>
           <td></td>`;
         tbody.appendChild(dtr);
       }
     }
+    tbody = activeBody;
   }
+  tbody = finBody;
   renderFinishedBundles(renderSliceLines);
+  tbody = activeBody;
+  renderSummary(jobs, acts, attnStats, {bundles: activeBundles, jobs: activeJobs});
+  if (_openMenu) {
+    const m = document.querySelector(`details.menu[data-menu="${CSS.escape(_openMenu)}"]`);
+    if (m) m.open = true;
+  }
   if (window.scrollY !== _scrollY) window.scrollTo(0, _scrollY);
 
-  // FINISHED bundles: below the live queue, one collapsed line per bundle (newest
-  // activity first); open it for the same per-slice lines + full history the live
-  // bundles get (author, refine rounds, coding, gate, regate, 2nd opinion,
-  // escalation review, landed). Read-only: no job is live, so there is nothing to act on.
+  // FINISHED bundles: below the live queue, collapsed by default (one <details>),
+  // grouped by the day of their last activity, newest first; any bundle with a failed
+  // slice is named in the collapsed summary so it is never hidden. Open a bundle for
+  // the same per-slice lines + full history the live bundles get. Read-only.
   function renderFinishedBundles(renderSlices) {
     const fb = finishedBundles || {};
     const views = fb.views || [];
-    const htr = document.createElement('tr');
-    htr.className = 'finished-head';
     const age = finishedDays ? `last ${finishedDays} days` : 'all ages';
-    htr.innerHTML = `<td></td><td colspan="9"><b>Finished bundles</b>
-      <span style="opacity:.65">&mdash; ${age}, newest first, ${views.length} of ${fb.total || 0}</span>
-      <button class="iconbtn" data-fb-age>${finishedDays ? 'show all ages' : 'last 3 days only'}</button>
-      ${fb.has_more ? '<button class="iconbtn" data-fb-more>show more</button>' : ''}
-      ${finishedLimit > 20 ? '<button class="iconbtn" data-fb-less>show fewer</button>' : ''}</td><td></td>`;
+    const failedViews = views.filter(v => (v.slices || []).some(x => x.attention));
+    document.getElementById('finishedSummary').innerHTML = `<b>Finished bundles</b>
+      <span class="count" style="color:var(--muted)">${views.length} of ${fb.total || 0} &middot; ${age}, newest first</span>
+      ${failedViews.length ? `<span class="chip bad">${failedViews.length} with failed slices</span>
+        <span class="fail-list">${failedViews.slice(0, 4).map(v => escapeHtml(v.key)).join(', ')}${failedViews.length > 4 ? ', &hellip;' : ''}</span>` : ''}`;
+    const tools = document.getElementById('finishedTools');
+    tools.innerHTML = `<button class="btn" data-fb-age>${finishedDays ? 'show all ages' : 'last 3 days only'}</button>
+      ${fb.has_more ? '<button class="btn" data-fb-more>show more</button>' : ''}
+      ${finishedLimit > 20 ? '<button class="btn" data-fb-less>show fewer</button>' : ''}`;
     const reload = () => { finishedFetchedAt = 0; refresh(); };
-    htr.querySelector('[data-fb-age]').addEventListener('click', () => {
+    tools.querySelector('[data-fb-age]').addEventListener('click', () => {
       finishedDays = finishedDays ? 0 : 3; finishedLimit = 20; reload(); });
-    const more = htr.querySelector('[data-fb-more]');
+    const more = tools.querySelector('[data-fb-more]');
     if (more) more.addEventListener('click', () => { finishedLimit += 20; reload(); });
-    const less = htr.querySelector('[data-fb-less]');
+    const less = tools.querySelector('[data-fb-less]');
     if (less) less.addEventListener('click', () => { finishedLimit = 20; reload(); });
-    tbody.appendChild(htr);
+    let lastDay = null;
+    const perDay = {};
+    for (const v of views) { const d = dayLabel(v.last_activity); perDay[d] = (perDay[d] || 0) + 1; }
     for (const view of views) {
+      const day = dayLabel(view.last_activity);
+      if (day !== lastDay) {
+        lastDay = day;
+        const dh = document.createElement('tr');
+        dh.className = 'day-head';
+        dh.innerHTML = `<td colspan="5">${escapeHtml(day)} &middot; ${perDay[day]}</td>`;
+        tbody.appendChild(dh);
+      }
       const fkey = 'finished:' + view.key;
       const open = !!planExpanded[fkey];
       const bad = (view.slices || []).filter(x => x.attention).length;
-      const when = view.last_activity ? new Date(view.last_activity * 1000).toLocaleString() : '';
+      const when = view.last_activity ? new Date(view.last_activity * 1000) : null;
       const ftr = document.createElement('tr');
-      ftr.className = 'queue-parent finished-bundle' + (bad ? ' queue-parent-alert' : '');
+      ftr.className = 'queue-parent finished-bundle' + (bad ? ' queue-parent-alert needs-attn' : '');
       ftr.innerHTML = `
         <td>${open ? '&#9662;' : '&#9656;'}</td>
-        <td><span class="proj-name">${escapeHtml(view.key)}</span>
-          <span class="plan-frac">${view.through}/${view.total} ${escapeHtml(view.unit || 'slices')}</span>
+        <td><span class="proj-name">${escapeHtml(view.key)}</span><span class="chip m-chip ${bad ? 'failed' : 'done'}">${bad ? 'failed' : 'done'}</span>
+          <div class="sub">${progHtml(view.through, view.total, view.unit || 'slices', '')}
           ${bad ? `<span class="plan-alert">&#9888; ${bad} failed</span>` : ''}
-          <span class="proj-summary">${view.runs || 0} runs &middot; last activity ${escapeHtml(when)}</span></td>
-        <td class="status-${bad ? 'failed' : 'done'}">${bad ? 'failed' : 'done'}</td>
-        <td colspan="7"></td><td></td>`;
+          <span class="proj-summary">${view.runs || 0} runs</span></div></td>
+        <td class="st"><span class="chip status-${bad ? 'failed' : 'done'} ${bad ? 'failed' : 'done'}">${bad ? 'failed' : 'done'}</span></td>
+        <td class="when" title="${when ? escapeHtml(when.toLocaleString()) : ''}">${when ? when.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : ''}</td><td></td>`;
       ftr.addEventListener('click', () => { planExpanded[fkey] = !open; saveExpandState(); refresh(); });
       tbody.appendChild(ftr);
       if (open && view.slices && view.slices.length) renderSlices({key: view.key, children: []}, view);
@@ -3175,6 +3435,12 @@ function loadExpandState() {
   } catch (e) { /* unreadable/corrupt -- defaults are correct, never block the render */ }
 }
 loadExpandState();
+// Finished bundles start collapsed; an open/close by hand is remembered.
+(() => {
+  const fd = document.getElementById('finishedDetails');
+  fd.open = !!planExpanded['__finishedOpen'];
+  fd.addEventListener('toggle', () => { planExpanded['__finishedOpen'] = fd.open; saveExpandState(); });
+})();
 function renderRunRow(r, handled, isChild) {
   const tr = document.createElement('tr');
   if (isChild) tr.classList.add('run-child');
@@ -7470,8 +7736,7 @@ console.log(JSON.stringify({
     check("the sub-plan divider has no click handler and no pointer cursor",
           ("onclick" not in FRONTEND_HTML.split("function renderSubPlanDivider")[1]
                                          .split("function renderSubPlanRuns")[0]
-           and "tr.run-subplan { background: rgba(70,130,180,0.045); cursor: default; }"
-           in FRONTEND_HTML), True)
+           and "tr.run-subplan { cursor: default; }" in FRONTEND_HTML), True)
     check("the divider still names the slice and its own X/Y (grouping, not hiding)",
           ("&#8627; ${g.slice_id}" in FRONTEND_HTML
            and "${s.slicesDone}/${s.total} slices done" in FRONTEND_HTML), True)
