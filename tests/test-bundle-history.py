@@ -32,7 +32,11 @@ import tempfile
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+# Layout: dashboard code in <repo>/src, shared pipeline (ollama-queue.py, dispatch_progress.py,
+# handoff-emit.py, .bak files) in ~/bin. Override with DASHBOARD_SRC / OLLAMA_PIPELINE_BIN.
+SRC_DIR = Path(os.environ.get("DASHBOARD_SRC") or Path(__file__).resolve().parent.parent / "src")
+PIPELINE_BIN = Path(os.environ.get("OLLAMA_PIPELINE_BIN") or Path.home() / "bin")
+HERE = SRC_DIR
 FAILS = []
 
 
@@ -172,16 +176,16 @@ def run(api_src):
 
 def main():
     if "--revert-check" in sys.argv:
-        baks = sorted(HERE.glob("ollama-queue-api.py.bak-*-history"))
-        bvb = sorted(HERE.glob("bundle_view.py.bak-*-history"))
+        baks = sorted(PIPELINE_BIN.glob("ollama-queue-api.py.bak-*-history"))
+        bvb = sorted(PIPELINE_BIN.glob("bundle_view.py.bak-*-history"))
         if not baks or not bvb:
             print("no pre-fix .bak-*-history files to revert to")
             return 2
         d = Path(tempfile.mkdtemp())
         shutil.copy(baks[-1], d / "ollama-queue-api.py")
         shutil.copy(bvb[-1], d / "bundle_view.py")
-        for f in ("runstatus_retention.py", "dispatch_progress.py"):
-            shutil.copy(HERE / f, d / f)
+        shutil.copy(SRC_DIR / "runstatus_retention.py", d / "runstatus_retention.py")
+        shutil.copy(PIPELINE_BIN / "dispatch_progress.py", d / "dispatch_progress.py")
         r = subprocess.run([sys.executable, __file__, "--api", str(d / "ollama-queue-api.py")],
                            capture_output=True, text=True)
         print(r.stdout[-3000:])

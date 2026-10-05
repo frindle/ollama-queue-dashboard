@@ -10,6 +10,61 @@ It is pure Python 3.12 **standard library** — no framework, no external runtim
 dependencies — and ships as a Docker container designed to run on a NAS/server
 such as **Unraid**.
 
+## Live deployment (the Mac) — this repo IS the runtime
+
+The dashboard that actually serves the queue today runs **straight from this
+checkout** on the Mac, not from Docker:
+
+| Path | What |
+|---|---|
+| `src/ollama-queue-api.py` | HTTP API + dashboard page (port 7684). **Source of truth.** |
+| `src/bundle_view.py` | per-slice bundle views + finished-bundle history |
+| `src/dashboard_chat.py` | `/chat` + `/api/chat/*` |
+| `src/runstatus_retention.py` | run-status retention predicate (also used by `qctl runs-clear` via HTTP) |
+| `chat/chat.html` | chat front end (served from `~/.ollama-dispatch/chat/chat.html`, a symlink to this file) |
+| `tests/test-*.py` | dashboard tests (`test-bundle-history`, `test-dashboard-b`, `test-dashboard-chat`, `test-dashboard-slice-child-indent`, `test-runstatus-retention-api`) |
+
+The shared **pipeline** (`ollama-queue.py`, `handoff-emit.py`, `dispatch_progress.py`,
+worker, gates, preflight) stays in `~/bin` and is **not** part of this repo's runtime;
+the API loads `~/bin/ollama-queue.py` and `~/bin/handoff-emit.py` by absolute path and
+finds `dispatch_progress` on `~/bin` (searched after `src/`).
+
+**How it runs:** launchd `com.penn.ollama-queue-api`
+(`~/Library/LaunchAgents/com.penn.ollama-queue-api.plist`) runs
+`/opt/homebrew/bin/python3 <repo>/src/ollama-queue-api.py`, KeepAlive, log at
+`/tmp/ollama-queue-api.log`. Restart **only** the API (never the queue daemon):
+
+```bash
+U=gui/$(id -u)
+launchctl bootout $U/com.penn.ollama-queue-api
+launchctl bootstrap $U ~/Library/LaunchAgents/com.penn.ollama-queue-api.plist
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7684/
+```
+
+**Compatibility symlinks in `~/bin`:** `ollama-queue-api.py`, `bundle_view.py`,
+`dashboard_chat.py`, `runstatus_retention.py` and the five `test-*.py` above point
+into this repo, so old paths keep working. Edit the repo copy (an editor that
+replaces the file instead of writing through would break the symlink).
+
+**Tests** (run from the repo; they load `src/` and the real `~/bin` pipeline;
+override with `DASHBOARD_SRC` / `OLLAMA_PIPELINE_BIN`):
+
+```bash
+for t in tests/test-bundle-history.py tests/test-dashboard-b.py tests/test-dashboard-chat.py \
+         tests/test-dashboard-slice-child-indent.py tests/test-runstatus-retention-api.py; do
+  python3 "$t" || echo "FAIL $t"; done
+python3 tests/test-runstatus-retention-api.py --revert-check
+```
+
+See [docs/DEPLOY.md](docs/DEPLOY.md) for the deploy/sync rules.
+
+### Docker fork (`bin/`, `Dockerfile`, compose)
+
+`bin/` is a separate, scrubbed **productization fork** for Docker/Unraid (config-driven
+servers, `/v1` proxy, token auth, HTTP enqueue). It has diverged a long way from the
+live `src/` dashboard and is not what runs on the Mac; everything below this section
+describes that container build.
+
 ## Architecture — the queue moves, Ollama stays put
 
 ```
