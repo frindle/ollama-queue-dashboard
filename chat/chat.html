@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Dispatch Chat</title>
+<style>
+:root{--bg:#f4f5f7;--surf:#fff;--ink:#16202c;--mut:#617083;--line:#d3d9e0;--acc:#2563eb;--accink:#fff;--me:#e3ecff;--job:#fff4dc}
+@media (prefers-color-scheme:dark){:root{--bg:#0e141c;--surf:#16202c;--ink:#e6edf5;--mut:#8b9bb0;--line:#2a3a4d;--acc:#5b92f5;--accink:#08101c;--me:#1b2e4d;--job:#3a2f12}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif;display:flex;flex-direction:column}
+header{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--surf)}
+header a{color:var(--acc);text-decoration:none;font-weight:600}
+header h1{font-size:17px;margin:0;flex:1}
+select,button,textarea,input{font:inherit;color:var(--ink);background:var(--surf);border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+button{cursor:pointer}button.pri{background:var(--acc);color:var(--accink);border-color:var(--acc);font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+#log{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:min(760px,100%);padding:9px 12px;border-radius:12px;border:1px solid var(--line);white-space:pre-wrap;overflow-wrap:anywhere}
+.msg.user{align-self:flex-end;background:var(--me)}
+.msg.assistant{align-self:flex-start;background:var(--surf)}
+.msg.assistant.job{background:var(--job)}
+.meta{font-size:12px;color:var(--mut);margin-bottom:3px}
+.msg img{max-width:100%;max-height:200px;display:block;margin-top:6px;border-radius:6px}
+#empty{color:var(--mut);margin:auto;text-align:center}
+form{display:flex;flex-direction:column;gap:8px;padding:10px 16px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line);background:var(--surf)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+textarea{flex:1;min-width:0;min-height:64px;resize:vertical}
+#files{flex:1;min-width:140px}
+#err{color:#c0392b;font-size:13px;min-height:1em}
+</style></head>
+<body>
+<header>
+  <a href="/">&larr; Queue</a>
+  <h1>Dispatch Chat</h1>
+  <select id="project" aria-label="Project"></select>
+  <select id="sessions" aria-label="Session"></select>
+  <button id="new" type="button">New chat</button>
+</header>
+<div id="log"><div id="empty">Pick a project and ask a question. Coding or investigation requests are queued as jobs; plain questions get a direct answer.</div></div>
+<form id="f">
+  <div id="err"></div>
+  <div class="row">
+    <textarea id="text" placeholder="Message (Enter to send, Shift+Enter for new line)" required></textarea>
+  </div>
+  <div class="row">
+    <select id="mode" aria-label="Mode"><option value="">Auto</option><option value="chat">Chat (direct)</option><option value="job">Job (queued)</option></select>
+    <input id="files" placeholder="Project files, comma separated (optional)">
+    <input id="img" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple>
+    <button class="pri" id="send" type="submit">Send</button>
+  </div>
+</form>
+<script>
+(function(){
+var $=function(i){return document.getElementById(i)},sid=null,timer=null;
+function api(m,p,b){return fetch(p,{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined}).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||r.status);return j})})}
+function err(e){$('err').textContent=e?String(e.message||e):''}
+function render(s){
+  var log=$('log');log.textContent='';
+  if(!s||!s.messages.length){var e=document.createElement('div');e.id='empty';e.textContent='No messages yet.';log.appendChild(e);return}
+  var busy=false;
+  s.messages.forEach(function(m){
+    var d=document.createElement('div');d.className='msg '+m.role+(m.mode==='job'?' job':'');
+    var meta=document.createElement('div');meta.className='meta';
+    meta.textContent=m.role==='user'?'You':'Assistant'+(m.mode?' · '+m.mode:'')+(m.status&&m.status!=='done'?' · '+m.status:'');
+    d.appendChild(meta);
+    var t=document.createElement('div');t.textContent=m.content||(m.status==='queued'?'Queued — waiting on the dispatch queue…':m.status==='running'?'Thinking…':'');
+    d.appendChild(t);
+    log.appendChild(d);
+    if(m.role==='assistant'&&(m.status==='running'||m.status==='queued'))busy=true;
+  });
+  log.scrollTop=log.scrollHeight;
+  clearTimeout(timer);if(busy)timer=setTimeout(refresh,2500);
+}
+function refresh(){if(!sid)return;api('GET','/api/chat/sessions/'+sid).then(render).catch(err)}
+function loadSessions(sel){
+  return api('GET','/api/chat/sessions').then(function(a){
+    var s=$('sessions');s.textContent='';
+    a.sort(function(x,y){return (y.created||'').localeCompare(x.created||'')});
+    a.forEach(function(x){var o=document.createElement('option');o.value=x.id;var first=(x.messages[0]||{}).content||'(empty)';o.textContent=x.project+' — '+first.slice(0,40);s.appendChild(o)});
+    if(sel){s.value=sel}else if(a.length){s.value=a[0].id}
+    sid=s.value||null;if(sid)refresh();else render(null);
+  })
+}
+$('text').addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();if($('f').reportValidity())$('f').requestSubmit()}});
+$('sessions').onchange=function(){sid=this.value;refresh()};
+$('new').onclick=function(){
+  var p=$('project').value;if(!p){err('No project available');return}
+  api('POST','/api/chat/sessions',{project:p}).then(function(s){return loadSessions(s.id)}).catch(err)};
+function readImg(f){return new Promise(function(ok){var r=new FileReader();r.onload=function(){ok({data_base64:String(r.result).split(',')[1]})};r.readAsDataURL(f)})}
+$('f').onsubmit=function(ev){
+  ev.preventDefault();err('');
+  var go=function(){
+    var body={text:$('text').value};
+    var fl=$('files').value.split(',').map(function(x){return x.trim()}).filter(Boolean);if(fl.length)body.files=fl;
+    if($('mode').value)body.mode=$('mode').value;
+    return Promise.all(Array.prototype.map.call($('img').files,readImg)).then(function(im){
+      if(im.length)body.images=im;
+      $('send').disabled=true;
+      return api('POST','/api/chat/sessions/'+sid+'/messages',body)
+    }).then(function(){$('text').value='';$('img').value='';refresh()}).catch(err).then(function(){$('send').disabled=false});
+  };
+  if(!sid){var p=$('project').value;if(!p){err('No project available');return}
+    return api('POST','/api/chat/sessions',{project:p}).then(function(s){sid=s.id;return loadSessions(s.id)}).then(go).catch(err)}
+  go();
+};
+api('GET','/api/chat/projects').then(function(a){a.forEach(function(p){var o=document.createElement('option');o.value=p.name;o.textContent=p.name;$('project').appendChild(o)})}).catch(err).then(function(){return loadSessions()}).catch(err);
+})();
+</script></body></html>

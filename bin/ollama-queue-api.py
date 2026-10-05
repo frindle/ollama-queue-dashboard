@@ -155,6 +155,7 @@ FRONTEND_HTML = r"""<!doctype html>
 </style></head>
 <body>
 <h1>Ollama Queue</h1>
+<div class="toolbar"><a href="/chat">Chat &rarr;</a></div>
 <div class="toolbar"><button id="clearFinished">Clear finished (done/failed)</button></div>
 <div class="exit-legend">
   <strong>Exit Codes:</strong><br>
@@ -1039,6 +1040,17 @@ def _web_search_usage():
     return {"total": total_counts, "today": today_counts, "last7d": last7d_counts}
 
 
+_CHAT_DIR = os.path.dirname(os.path.abspath(__file__))  # dashboard_chat.py lives beside this file
+
+
+def _chat_module():
+    """Import dashboard_chat lazily so a missing/broken module only disables chat."""
+    import importlib
+    if _CHAT_DIR not in sys.path:
+        sys.path.insert(0, _CHAT_DIR)
+    return importlib.import_module("dashboard_chat")
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, obj, status=200):
         body = json.dumps(obj).encode()
@@ -1091,9 +1103,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"unauthorized")
 
+    def _chat(self, method):
+        """Delegate /chat and /api/chat/* to dashboard_chat.handle (server-independent
+        router in ~/Desktop/GitHub Projects/dashboard-chat). Any failure is a 5xx
+        here, never an exception that could take the queue API's handler down."""
+        try:
+            import urllib.parse
+            u = urllib.parse.urlsplit(self.path)
+            query = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+            mod = _chat_module()
+            status, headers, out = mod.handle(method, u.path, query, body)
+        except Exception as e:  # noqa: BLE001
+            return self._text("chat unavailable: %s" % type(e).__name__, 503)
+        self.send_response(status)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(out)
+
     def do_GET(self):
         if not self._auth_ok():
             return self._reject_unauthorized()
+        if self.path == "/chat" or self.path.startswith("/api/chat/"):
+            return self._chat("GET")
         if self.path == "/" or self.path == "/index.html":
             self._html(FRONTEND_HTML)
         elif self.path == "/api/jobs":
@@ -1155,6 +1191,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._auth_ok():
             return self._reject_unauthorized()
+        if self.path.startswith("/api/chat/"):
+            return self._chat("POST")
         if self.path == "/api/jobs":
             self._enqueue()
         elif self.path == "/api/hosts":
