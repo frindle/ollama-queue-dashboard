@@ -2408,13 +2408,19 @@ async function refresh() {
     }
     if (j.status === 'paused') primary = `<button class="btn primary" data-resume>Resume</button>`;
     // ONE pause control (graceful SIGTERM; state saved, resumable).
-    if (j.status === 'running') items.push(`<button class="mi" data-kill title="Gracefully pauses the job (SIGTERM) -- it saves state and can be resumed, this does not discard work">&#10074;&#10074; Pause (keeps its work)</button>`);
+    const isGpuJob = j.job_kind === 'gpu_exclusive';
+    // A GPU-EXCLUSIVE job is a plain shell command: SIGTERM STOPS it (its runner kills
+    // the command and runs its on-abort cleanup). There is nothing to resume.
+    if (j.status === 'running' && isGpuJob) items.push(`<button class="mi" data-kill title="Stops the exclusive GPU job (SIGTERM): the command is killed and its cleanup runs. It is not resumable.">&#9632; Stop GPU job (not resumable)</button>`);
+    else if (j.status === 'running') items.push(`<button class="mi" data-kill title="Gracefully pauses the job (SIGTERM) -- it saves state and can be resumed, this does not discard work">&#10074;&#10074; Pause (keeps its work)</button>`);
     if (j.status === 'failed' && !primary) primary = `<button class="btn primary" data-log>View log</button>`;
     else items.push(`<button class="mi" data-log>View log</button>`);
     if (isRemovable) items.push(`<hr><button class="mi danger" data-remove>Remove from queue</button>`);
     actions += primary + menuHtml(items, 'job:' + j.id);
     // What used to be six mostly-empty columns: one quiet line under the label.
-    const meta = [j.model ? escapeHtml(j.model) : '', escapeHtml(j.lane || j.host_pref || ''),
+    const meta = [isGpuJob ? `<b title="Non-LLM job with this lane's GPU to itself: resident Ollama models were unloaded first; gates for the lane run before it">GPU-EXCLUSIVE</b> ${escapeHtml(j.gpu_summary || '')}` : '',
+      isGpuJob && j.gpu_wait ? 'waiting: ' + escapeHtml(j.gpu_wait) : '',
+      (j.model && !isGpuJob) ? escapeHtml(j.model) : '', escapeHtml(j.lane || j.host_pref || ''),
       progress ? 'iter ' + progress : '', toks ? toks + ' tok/s' : '',
       j.pid != null ? 'pid ' + j.pid : '', j.exit_code != null ? 'exit ' + j.exit_code : '']
       .filter(Boolean).map(x => `<span>${x}</span>`).join('');
@@ -4163,6 +4169,13 @@ def _job_summary(j, jobs=None):
           # WHY it failed (worker's terminal_reason) and WHOSE fault it is
           # (ollama-queue.py's classify_failure) -- stamped at reap, read here.
           "terminal_reason", "failure_class", "failure_detail")}
+    # GPU-EXCLUSIVE rows (ollama-queue.py `enqueue-gpu`): a non-LLM shell job that has a
+    # lane's GPU to itself. The model field is only a placeholder, so the row carries
+    # its own label: kind + one-line summary + what it is waiting for.
+    if j.get("job_kind") == "gpu_exclusive":
+        d["job_kind"] = "gpu_exclusive"
+        d["gpu_summary"] = (j.get("gpu_job") or {}).get("summary")
+        d["gpu_wait"] = j.get("gpu_wait")
     # The explicit `enqueue --bundle <tag>` stamp. q.job_group_key lets it WIN over
     # label parsing, but only if the row it is handed still carries it: dropping it
     # here made an ad-hoc bundle (mlx-smoke: no slice plan, chain=None) render as N

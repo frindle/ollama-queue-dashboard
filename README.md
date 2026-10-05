@@ -68,6 +68,13 @@ only when nothing of it is running or waiting. System fonts only, light/dark via
 `prefers-color-scheme`, no horizontal scroll at phone width. `tests/test-dashboard-layout.py`
 renders the page in headless Chrome against fixtures (`--shots DIR` saves screenshots).
 
+**GPU-EXCLUSIVE rows** come from `ollama-queue.py enqueue-gpu`: a non-LLM shell job (for
+example a native model-server trial on the Unraid 3080) that has one lane's GPU to itself.
+Its runner (`~/bin/gpu-exclusive-runner.py`) unloads the lane's resident Ollama models
+first. The row shows a **GPU-EXCLUSIVE** label, a one-line summary, and what it is waiting
+for (a busy lane, or a gate for that lane, which always runs first). Its running-row action
+is **Stop GPU job (not resumable)**, not Pause, because the command cannot be resumed.
+
 See [docs/DEPLOY.md](docs/DEPLOY.md) for the deploy/sync rules.
 
 ### Docker fork (`bin/`, `Dockerfile`, compose)
