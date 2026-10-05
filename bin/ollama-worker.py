@@ -111,11 +111,11 @@ ITERATION_LOW_BUDGET_THRESHOLD = 3  # added 2026-08-29, paired with the per-turn
 # separate from CONTEXT_REVIEW_THRESHOLD (a fraction) because this is a small absolute count --
 # the two review gates are independent and can trip at different times.
 
-CONTEXT_REVIEW_THRESHOLD = 0.90  # added 2026-08-28 (Penn's request, "can we do the same for
+CONTEXT_REVIEW_THRESHOLD = 0.90  # added 2026-08-28 (the user's request, "can we do the same for
 # context?" -- paired with request_more_iterations): fraction of --num-ctx at which a dispatch
 # pauses for review (same clean-stop-and-resume shape as the iteration request) rather than
 # risk an actual context overflow or a silently degraded response near the ceiling.
-# Proactive mid-run budget nudges (Penn 2026-09-08): the 0.90 pause above is post-hoc -- by
+# Proactive mid-run budget nudges (the user 2026-09-08): the 0.90 pause above is post-hoc -- by
 # the time it fires the run is already walled. These earlier thresholds warn the model to
 # CONVERGE while it still has room, each firing at most once per run. Kept strictly below
 # CONTEXT_REVIEW_THRESHOLD so the pause always supersedes the top nudge.
@@ -164,7 +164,7 @@ def reload_known_hosts():
 # mapped". A hard cap, not a suggestion: Unraid's spillover check in
 # ensure_model_ready() already aborts on ANY spillover, but only AFTER a
 # real warmup load -- up to several minutes wasted finding out the hard way.
-# This catches it before dispatch even starts. Penn's call 2026-08-28
+# This catches it before dispatch even starts. the user's call 2026-08-28
 # ("can we code that in as a hard cap that will catch prior to dispatch?"):
 # clamp down and log loudly, don't silently proceed and don't just warn.
 # A model with no entry here is simply unmeasured, not assumed safe --
@@ -178,7 +178,7 @@ UNRAID_SPILLOVER_EXCEPTIONS = {
     # touched when routed to, not every token -- confirmed live 2026-08-29,
     # gpt-oss:20b loaded at 10.96GB VRAM / 3.46GB CPU (24% spilled) and still
     # ran ~41 tok/s on a short response, competitive with several fully-
-    # on-GPU dense models tested the same night. Penn's call: document real
+    # on-GPU dense models tested the same night. the user's call: document real
     # per-model exceptions here rather than loosen the rule generally.
     "gpt-oss:20b": {"max_spill_frac": 0.30},
 }
@@ -1464,7 +1464,7 @@ def tool_web_search(cwd: Path, args: dict, searxng_host: str) -> str:
         _WEB_SEARCH_CALLS["searxng"] += 1
         log("[worker] web_search: served by SearXNG")
         return searxng_out
-    # Brave (PAID -- $5/1k, card bills) is DELIBERATELY NOT in the auto-chain (e2 + Penn's free-
+    # Brave (PAID -- $5/1k, card bills) is DELIBERATELY NOT in the auto-chain (e2 + the user's free-
     # services preference, 2026-08-30): a paid fallback that fires unnoticed accumulates a bill
     # quietly, and "last in chain" is not the same as "never fires without a decision". _search_brave
     # stays defined and the key stays in Keychain for a DELIBERATE future choice, but web_search never
@@ -1947,7 +1947,7 @@ def _host_is_free(host_url: str) -> bool:
 def pick_host(model: str) -> str:
     """Choose which of the two known Ollama hosts to dispatch `model` to.
 
-    Priority, Penn's call 2026-08-28: **Studio first if it's currently
+    Priority, the user's call 2026-08-28: **Studio first if it's currently
     free, Unraid as parallel overflow capacity, Unraid only ever used when
     the model actually fits it.** (Previously preferred Unraid whenever a
     model fit, to keep Studio free for other things -- reversed because
@@ -2175,7 +2175,7 @@ def write_dispatch_metrics(metrics: dict) -> None:
     metrics-logging failure must not fail (or mask the real error of) the
     actual dispatch. Called both from run_task's normal completion path and
     from main()'s crash handler, so a context-exhaustion crash -- the exact
-    failure mode this log exists to eventually let Penn threshold against --
+    failure mode this log exists to eventually let the user threshold against --
     still gets a real entry instead of silently vanishing."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -2732,12 +2732,12 @@ def _try_lan_copy(host: str, model: str) -> bool:
     return True
 
 
-# ZERO CPU spillover tolerated on Unraid -- Penn, 2026-08-28, in these exact
+# ZERO CPU spillover tolerated on Unraid -- the user, 2026-08-28, in these exact
 # words, after a dispatch was reported as "should clear, ~10% spillover,
 # under threshold": "no spillover, at all, period." A percentage-threshold
 # framing (this constant used to be SPILLOVER_ABORT_FRACTION = 0.15) reads
 # as "up to 15% is fine," which is not the rule and got restated back to
-# Penn as if it were -- the standing rule has always been zero, going back
+# the user as if it were -- the standing rule has always been zero, going back
 # to "no. no cpu spillover on unraid." earlier this same session. The
 # post-warmup check below now aborts on ANY measured spillover at all, no
 # threshold, no epsilon -- size/size_vram from /api/ps are exact integer
@@ -2772,9 +2772,9 @@ def ensure_model_ready(host: str, model: str, temperature: float, num_ctx: int,
     omitted). Confirmed live: gpt-oss:20b's base weights (13.79GB) already
     exceed Unraid's 12GB card before any context is even added, and at
     --num-ctx 65536 it loaded at ~10GB VRAM / ~22.8GB total -- over half
-    spilled to CPU. Penn: "we need hard rules programmed for model
+    spilled to CPU. the user: "we need hard rules programmed for model
     dispatching to prevent this. it keeps happening." Confirmed unconditional,
-    no override -- Penn: "no. no cpu spillover on unraid." This is that hard
+    no override -- the user: "no. no cpu spillover on unraid." This is that hard
     rule, made non-bypassable by living here (every dispatch calls this,
     regardless of how --host was chosen) rather than only in pick_host()
     (which an explicit --host skips past), and by having no escape hatch at
@@ -3266,7 +3266,7 @@ def _verify_delta_feedback(verify: str, cwd, baseline_sig):
 
 
 # --- Anti-thrash guard for re-issued identical READ-ONLY tool calls -------------
-# Motivating failure (Penn 2026-09-08): a diagnosis dispatch re-issued near-identical
+# Motivating failure (the user 2026-09-08): a diagnosis dispatch re-issued near-identical
 # run_bash greps against the SAME files ("Let me grep app/bfmr/page.tsx..." fired
 # repeatedly), burning context going in circles. The existing loop-detect (below, in
 # the tool loop) only SOFT-nudges at 3/6/9 and still RE-RUNS the command every time,
@@ -3306,7 +3306,7 @@ def _anti_thrash_intercept(sig, cacheable, result_cache, repeat_counts):
     return annotated, nudge
 
 
-# --- Resume-time transcript compaction (Penn 2026-09-08) ------------------------
+# --- Resume-time transcript compaction (the user 2026-09-08) ------------------------
 # A job that paused at ~92% context leaves a resume= transcript, but resuming INTO a
 # ~92%-full window can't make progress -- the pre-send projection re-pauses almost
 # immediately, so a plain resume is inert. (The queue's auto-resume bumps num_ctx
@@ -3567,7 +3567,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         "model": model, "host": host, "api_style": api_style,
         "configured_num_ctx": num_ctx,
         # How many times the queue's auto-resume watchdog raised this job's
-        # context before this run. Penn's framing 2026-09-02: resource cost is
+        # context before this run. the user's framing 2026-09-02: resource cost is
         # REPORTED DATA, never a penalty -- "solved but needed 131072 and 3 bumps"
         # is a deployment fact worth having, and equalising budgets would measure
         # a model we had crippled rather than the one we would deploy. Kept as a
@@ -3616,9 +3616,9 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     nudge_count = 0
     MAX_NUDGES = 3  # hard ceiling regardless of progress -- see below for the
     # condition that governs whether a nudge under that ceiling is actually sent.
-    # Added 2026-08-28 (Penn's request): let a model ask for more iterations itself, via the
+    # Added 2026-08-28 (the user's request): let a model ask for more iterations itself, via the
     # request_more_iterations tool, instead of the only recovery being a human noticing
-    # DID-NOT-CONVERGE after the fact. Penn's call: this is a review gate, not an auto-grant --
+    # DID-NOT-CONVERGE after the fact. the user's call: this is a review gate, not an auto-grant --
     # setting this to a non-None reason string cleanly pauses the whole dispatch (both loops),
     # same as running out of iterations, so it's resumable via the exact same `--resume` flow
     # already proven live tonight. See its two setters below (request_more_iterations, and the
@@ -3909,7 +3909,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         _dispatch_metrics["peak_prompt_tokens"] = max(_dispatch_metrics["peak_prompt_tokens"], usage.get("prompt_tokens") or 0)
         _dispatch_metrics["peak_total_tokens"] = max(_dispatch_metrics["peak_total_tokens"], usage.get("total_tokens") or 0)
         _dispatch_metrics["sum_completion_tokens"] += usage.get("completion_tokens") or 0
-        # Added 2026-08-28 (Penn: "can we put tok/s ... on the dashboard?") -- the
+        # Added 2026-08-28 (the user: "can we put tok/s ... on the dashboard?") -- the
         # queue-tool API parses this line out of the job's log file to show live
         # throughput. completion_tokens is generation only (excludes prompt
         # processing), matching how tok/s is normally reported for LLM inference.
@@ -3920,7 +3920,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         msg = resp.get("message", {})
         messages.append(msg)
 
-        # Context-usage counterpart to request_more_iterations, added same day at Penn's
+        # Context-usage counterpart to request_more_iterations, added same day at the user's
         # request ("can we do the same for context?"): a model can't self-report running low
         # on context the way it can ask for more iterations, since it doesn't see its own
         # token accounting -- so this is harness-driven instead, checked every turn against
@@ -3989,7 +3989,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             # underlying failure (treating description as the deliverable),
             # so the trigger is now "no mutation has happened yet at all" (see
             # any_mutation_called above for why read-only tool calls don't count).
-            # Fable gap-fix 2026-08-29 (Penn: rv6-control-checklist-r1 "said done but is on
+            # Fable gap-fix 2026-08-29 (the user: rv6-control-checklist-r1 "said done but is on
             # iteration 40/41"): the mutation-count nudge below fires when any_mutation_called
             # is False -- but that flag only counts write_file/edit_file, so a task whose
             # deliverable is written via a run_bash heredoc (the review-bench pattern: the model
@@ -4061,7 +4061,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             # claims every time even with iteration budget to spare. A ONE-TIME nudge here
             # proved genuinely insufficient in practice -- confirmed live: a Tesla research
             # dispatch got nudged once at 1/3 required fetches, made exactly one more real
-            # fetch attempt, then gave up and was accepted at 1/3 anyway. Penn's standing
+            # fetch attempt, then gave up and was accepted at 1/3 anyway. the user's standing
             # instruction: when Unraid research comes back incomplete, the mechanism should be
             # strengthened and retried, not just reported thin. Bounded to MAX_MIN_FETCH_NUDGES
             # (matching the file's other bounded-nudge conventions) instead of exactly one, so
@@ -4301,7 +4301,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
 
             if name == "request_more_iterations":
                 # Special-cased here rather than in tool_impls/build_tool_impls: it needs to
-                # stop the whole dispatch, not just return a tool result. Penn's call
+                # stop the whole dispatch, not just return a tool result. the user's call
                 # 2026-08-28: this is a REVIEW GATE, not an auto-grant or a wait-with-timeout --
                 # no in-process polling at all. The request pauses the dispatch cleanly (same
                 # incremental-save mechanism that already makes every DID-NOT-CONVERGE stop
@@ -4400,7 +4400,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                           f"shape, reason about it from documentation/what you already know instead "
                           f"of making a live call.")
             elif name == "task_complete":
-                # Fable design 2026-08-29 (Penn: "how do we fix so we get it to converge?"),
+                # Fable design 2026-08-29 (the user: "how do we fix so we get it to converge?"),
                 # built against real transcripts where coding-tuned models structurally
                 # avoided the old silence-only convergence signal (some never emitted a
                 # single content-only turn across 13-30 iterations) while also, separately,
@@ -4792,7 +4792,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                           worktree_start_snapshot=_worktree_start_snapshot,
                           baseline_verify_sig=_baseline_verify_sig)
 
-        # Context-usage counterpart to request_more_iterations (Penn's request, "can we do
+        # Context-usage counterpart to request_more_iterations (the user's request, "can we do
         # the same for context?"): a model can't self-report running low on context the way
         # it can ask for more iterations, since it doesn't see its own token accounting --
         # so this is harness-driven instead, checked against the objective usage the API
@@ -5090,7 +5090,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         log("[worker] No --verify command given. Output has NOT been verified -- "
             "build/test it before trusting it.")
 
-    # Accept-on-verify-pass despite no task_complete (2026-08-30, Penn: "we're still
+    # Accept-on-verify-pass despite no task_complete (2026-08-30, the user: "we're still
     # choking these processes"). Root cause of a class of false NON-CONVERGENCE:
     # qwen3-coder reliably WRITES a correct deliverable and verifies it by running it
     # via run_bash, but often never emits the task_complete tool call to SIGNAL done --
@@ -5115,7 +5115,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     log_dispatch_to_obsidian(model, task, converged, verify_passed, log_path,
                               baseline_no_regression=_baseline_no_regression)
 
-    # This log USED to be success-only by design (Penn's call): a crashed or
+    # This log USED to be success-only by design (the user's call): a crashed or
     # non-converged run's token counts aren't a clean signal for "how much
     # context does a task like this actually need", and would pollute the
     # threshold analysis the log exists for.
@@ -5463,7 +5463,7 @@ def main():
     # CRASH PATH. write_dispatch_metrics' docstring has always claimed it is
     # "called both from run_task's normal completion path and from main()'s
     # crash handler, so a context-exhaustion crash -- the exact failure mode
-    # this log exists to eventually let Penn threshold against -- still gets a
+    # this log exists to eventually let the user threshold against -- still gets a
     # real entry instead of silently vanishing." There was no crash handler.
     # The claim was aspirational, and the crashes it names were exactly the
     # rows missing from the file. Now it is true.

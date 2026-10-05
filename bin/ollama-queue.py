@@ -11,7 +11,7 @@ chain also queuing work on the same host, because neither could see the
 other's state.
 
 This tool is the shared state those chains were missing. It is
-deliberately a plain FIFO, not a priority-preemption scheduler -- Penn's
+deliberately a plain FIFO, not a priority-preemption scheduler -- the user's
 call the night this was scoped: an LLM dispatch doesn't checkpoint/resume
 cleanly mid-run, so "preemption" really means "kill and redo," which stays
 a judgment call, not something to hand to a scheduling algorithm.
@@ -163,7 +163,7 @@ class EnqueueError(Exception):
     HTTP path (ollama-queue-api.py) catches it and returns a structured 4xx
     instead of taking the server process down with a bare sys.exit."""
 
-# --- Dashboard-as-worklist retention (Penn 2026-09-07) -------------------------
+# --- Dashboard-as-worklist retention (the user 2026-09-07) -------------------------
 # The dashboard is a worklist of what still needs handling, not a log. A finished
 # job clears only when it is genuinely handled:
 #   - failed / done_unconverged -> stay until an explicit `resolve` (I acted on it)
@@ -171,7 +171,7 @@ class EnqueueError(Exception):
 #                                   shown below the failures; resolve clears it on merge)
 #   - plain `done` (non-gate)    -> NOT saved: cleared as soon as it finishes. The dispatch's
 #                                   value lives on in its persisted gate-<id> result, not the
-#                                   done row. (Penn 2026-09-07: "Done shouldn't be saved.")
+#                                   done row. (the user 2026-09-07: "Done shouldn't be saved.")
 #   - running / pending / paused -> never auto-pruned
 # Only `prune_finished_jobs` auto-removes; everything else clears via resolve/cancel.
 RETAIN_DONE_RECENT = 0
@@ -202,7 +202,7 @@ def prune_finished_jobs(jobs):
     return [j for j in jobs if j.get("id") not in drop_ids]
 
 
-# --- Chain dependencies + chain-final gating (Penn 2026-09-07) -----------------
+# --- Chain dependencies + chain-final gating (the user 2026-09-07) -----------------
 # A split fix can be enqueued as an ordered chain: each job carries `after` (the
 # full id of the job it must follow), an optional `chain` group tag, and
 # `chain_final` on the last step. The daemon launches a job only once its `after`
@@ -435,7 +435,7 @@ def _persist_job_completion(job):
 
 
 def _fire_gate_on_complete(job):
-    """Advisory auto-gate hook (2026-08-31, Penn's "wire the gate to run automatically").
+    """Advisory auto-gate hook (2026-08-31, the user's "wire the gate to run automatically").
     Fire-and-forget the Studio gate on a completed job. gate-on-complete.py runs the
     decidable checks (scope/completeness/verify-quality) inline and ENQUEUES the model
     review as a --runner job -- so the GPU work serialises through the queue and respects
@@ -668,7 +668,7 @@ def _evict_template_bug_models():
             print(f"[queue] WATCHDOG WARNING: failed to evict {name}: {e}", file=sys.stderr)
 
 
-# Auto-resume watchdog (added 2026-08-29, Penn's request: "I want you to be able to handle
+# Auto-resume watchdog (added 2026-08-29, the user's request: "I want you to be able to handle
 # it autonomously so jobs don't just hang endlessly"). A paused job used to require a human
 # or Claude to notice the pause, judge whether more room is warranted, and manually bump
 # --num-ctx/--max-iters before resuming -- confirmed live tonight (wire-live-log-queue paused
@@ -704,7 +704,7 @@ AUTO_RESUME_MAX_ITERS = 60
 AUTO_RESUME_MIN_ITER_BUMP = 5
 
 
-# --- Auto num-ctx sizing + auto split/recombination (Penn 2026-09-08) ----------
+# --- Auto num-ctx sizing + auto split/recombination (the user 2026-09-08) ----------
 # Replaces the two wrong defaults (worker's flat DEFAULT_NUM_CTX and the hand-passed
 # 65536) with a computed START value. Under-estimating is SAFE: ollama-queue.py's
 # auto-resume bump (see AUTO_RESUME_* above, ~line 750) doubles num_ctx UPWARD and
@@ -735,7 +735,7 @@ _CTX_CODE_FILE_RE = re.compile(
     r'c|cc|cpp|cxx|h|hpp|rb|php|cs|swift|css|scss|html|htm|xml|yml|yaml|toml|ini|sql))\b'
 )
 
-# --- Investigation/diagnosis context FLOOR (Penn 2026-09-08) --------------------
+# --- Investigation/diagnosis context FLOOR (the user 2026-09-08) --------------------
 # A diagnosis dispatch (a model reading a repo to write DIAGNOSIS.md) reads many
 # files and accumulates tool output, so a small window walls it: a real one thrashed
 # -- re-issuing near-identical greps against the same files -- and PAUSED at iteration
@@ -2108,7 +2108,7 @@ def _candidate_lanes(job, w):
     # qwen3.8 crashes on Studio's native Ollama (see LLAMA_SERVER_QWEN38_URL
     # comment) -- redirect auto/studio routing to the llama-server bypass
     # instead. An explicit --host unraid or explicit URL still overrides
-    # this (Penn's call, e.g. a deliberate Unraid headroom test), matching
+    # this (the user's call, e.g. a deliberate Unraid headroom test), matching
     # how explicit --host already bypasses auto-routing everywhere else.
     if job["model"] == LLAMA_SERVER_QWEN38_MODEL and pref in ("auto", "studio"):
         return [LLAMA_SERVER_QWEN38_URL]
@@ -2289,7 +2289,7 @@ def _second_slot_vram_fits(lane_url, new_num_ctx):
 
 
 def _safe_label(label):
-    """Log filenames must survive whatever --label Penn typed."""
+    """Log filenames must survive whatever --label the user typed."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", label) or "job"
 
 

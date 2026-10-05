@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ollama job handoff: what's in flight, and what's finished but not acted on.
 
-Penn's model is WORKFLOW STATE, not gate verdict:
+the user's model is WORKFLOW STATE, not gate verdict:
 
     pending/   jobs still in flight (queued or running)
     complete/  jobs the MODEL finished that WE have not acted on yet --
@@ -94,7 +94,7 @@ def _report_verdict(job_id, kind):
 
 
 def final_verdict(job_id, g, job=None):
-    """Authoritative FINAL gate verdict (Penn: "the final pass or the final fail").
+    """Authoritative FINAL gate verdict (the user: "the final pass or the final fail").
 
     The regate (Studio 27B) is the final authority when it ran, so its report
     wins over the pre-gate. We surface the reviewer's narrative `## VERDICT:`

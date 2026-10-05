@@ -1958,7 +1958,7 @@ def seal_baseline(root: Path):
 
 
 # ---------------------------------------------------------------------------
-# REPO_MAP.md generator (Penn 2026-09-08) -- the highest-leverage diagnosis fix.
+# REPO_MAP.md generator (the user 2026-09-08) -- the highest-leverage diagnosis fix.
 # Live evidence: a 27B model looping a diagnosis was not really "repeating a grep" --
 # it could not LOCALIZE where a value was computed, grepped blind, got walls of hits,
 # and flailed. Anti-thrash stops the identical repeat but not the blind-discovery root
@@ -2120,7 +2120,7 @@ def build_repo_map(root: Path) -> str:
     return "\n".join(out) + "\n"
 
 
-# Browser-automation markers (Penn 2026-09-09). A code-fix flavour verifies the
+# Browser-automation markers (the user 2026-09-09). A code-fix flavour verifies the
 # fix OFFLINE against a static fixture. When the target drives a live browser
 # (Puppeteer/Playwright: page.evaluate, cross-origin frame traversal, $eval),
 # a static-HTML fixture goes GREEN while the real page stays broken -- the worst

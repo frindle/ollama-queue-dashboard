@@ -2,7 +2,7 @@
 """Dashboard B (2026-09-27): per-slice live phase, off-GPU activity, wait reasons,
 livelog fallback.
 
-Penn's complaints this answers: the bundle header read "1/5" with s2 long green
+the user's complaints this answers: the bundle header read "1/5" with s2 long green
 (the slicer run file lags its driver's poll); a committed bundle between GPU jobs
 looked hung while preflight/verify-relevance ran on the CPU; held/pending rows gave
 no reason; a reaped job's log was unreachable from the dashboard.

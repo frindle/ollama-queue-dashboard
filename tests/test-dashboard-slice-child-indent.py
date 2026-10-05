@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dashboard: rows UNDER a slice line (author/gate/refine runs, stage headers,
 attempt folds/dividers) render one indent level DEEPER than the slice line itself
-(Penn 2026-10-03: "author and gate should be tabbed in another level from their
+(the user 2026-10-03: "author and gate should be tabbed in another level from their
 'host' bundle"). They used an inline padding-left:1.4rem, which overrode the CSS
 child indent and put them LEFT of the slice line's 1.8rem.
 

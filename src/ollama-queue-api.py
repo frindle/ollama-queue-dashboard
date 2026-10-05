@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal HTTP API + frontend for ollama-queue.py, meant to sit behind the
-existing "Penn Only" Cloudflare Access policy (see the tunnel hostname) --
+existing "owner-only" Cloudflare Access policy (see the tunnel hostname) --
 this process trusts every request that reaches it, since Access already
 authenticated it before the tunnel connector ever proxies here. Do not expose
 this port directly to the LAN/internet without Access in front of it.
@@ -53,20 +53,20 @@ _LOG_TAIL_BYTES = 16_384  # comfortably more than one iteration's log output
 # running first (what's happening right now must never be lost below a long list),
 # then EVERY "waiting in the queue, not yet run" state in ONE shared tier:
 # pending/held/paused/queued/scheduled. That shared tier is the point (2026-09-18,
-# Penn: the queue view jumped around under him): a job flipping held -> pending as
+# the user: the queue view jumped around under him): a job flipping held -> pending as
 # the gate barrier lifts has NOT changed its place in the launch order, so it must
 # not change its place in the table either. Splitting those states across tiers made
 # every barrier lift re-sort the list and yank rows around mid-read. Only a genuine
 # reorder (drag / send-to-top / send-to-bottom) moves a row now.
 #
-# ONE exception to that shared tier (2026-09-18, Penn): `held` is SUNK to the
+# ONE exception to that shared tier (2026-09-18, the user): `held` is SUNK to the
 # bottom. A hold is STICKY -- an operator/fit hold (the parked bonsai job) sits
 # there for hours or days, and mid-list it clutters the active worklist without
 # ever being actionable. `paused`/`queued`/`scheduled` are the TRANSIENT flips the
 # shared tier exists to protect, so they stay at tier 1 and do not move.
 #
 # `planned` (a queued-up-front DAG placeholder -- see ollama-queue.PLANNED_STATUS)
-# shares the waiting tier with pending, deliberately (Penn: "they are essentially
+# shares the waiting tier with pending, deliberately (the user: "they are essentially
 # queued just waiting on the job before it to finish like other jobs in the queue").
 # The tier alone does not order them -- _waiting_region_order slots each planned row
 # directly after the row it waits on, so the whole waiting block reads top-to-bottom
@@ -83,7 +83,7 @@ _QUEUE_STATUS_DEFAULT_TIER = 5
 # Statuses that mean a queue row in a bundle did NOT succeed, and that therefore may
 # never be rendered in the same faint grey as routine housekeeping counts.
 #
-# Penn, 2026-09-19, on the `bg-escalation` bundle header: "right now the counter makes
+# the user, 2026-09-19, on the `bg-escalation` bundle header: "right now the counter makes
 # it seem like its already done when its failed". The header showed a prominent green
 # `4/5 slices` with `running: s5-audit`, and the only trace of the failure was `1
 # failed` inside the small #666 breakdown -- same tone as `3 planned`. That bundle was
@@ -110,7 +110,7 @@ def _focus_bundle_key(state, now=None):
     """The bundle the DAEMON is actually holding the lanes for, read out of the shared
     queue state file the API already loads.
 
-    FOCUS PIN (Penn 2026-09-20): "if something is first and between runs it should stay
+    FOCUS PIN (the user 2026-09-20): "if something is first and between runs it should stay
     top of the queue. the queue should reflect the actual queue and not have cosmetic
     quirks." The scheduler in ollama-queue.py is right and was never the problem: it
     keeps ONE bundle active across the gap where that bundle has no row in the queue at
@@ -180,7 +180,7 @@ def _waiting_region_order(waiting, known_ids, focus_key=None):
     """PURE. Order the MERGED waiting region (pending/paused/queued/scheduled AND
     the PLANNED DAG rows) as the true EXECUTION sequence.
 
-    Penn 2026-09-18: "can we put the planned runs in the queue where they'll fall
+    the user 2026-09-18: "can we put the planned runs in the queue where they'll fall
     when we run them? ... they are essentially queued just waiting on the job before
     it to finish like other jobs in the queue." So planned rows are NOT a separate
     block: each one is slotted directly after the row it waits on.
@@ -274,7 +274,7 @@ def _waiting_region_order(waiting, known_ids, focus_key=None):
                 # The dep is running/elsewhere, so this slice is genuinely next --
                 # but "next" must mean next WITHIN ITS OWN BUNDLE when that bundle
                 # already has rows on screen. Hoisting to the front of the whole
-                # region regardless is the other half of the jumping Penn sees:
+                # region regardless is the other half of the jumping the user sees:
                 # measured live, bg-escalation's planned s4/s5 sat at display_seq
                 # 1 and 2 -- the very top of the queue -- while the slice actually
                 # being worked (auto-refine-...-s3-letter, pending) sat at 141. The
@@ -322,7 +322,7 @@ def _slice_base_label(label):
 def _drop_planned_twins(jobs):
     """PURE. Remove a PLANNED placeholder row when a live (non-planned, non-finished)
     job is already realising the same slice -- the placeholder's job now exists, so
-    showing both is the doubling Penn saw ("not everything is lined up ... one main
+    showing both is the doubling the user saw ("not everything is lined up ... one main
     job ... expand to show the interior"). A placeholder with no live twin (a future
     slice not yet authored) is kept: it is the only thing standing in for that work."""
     live_bases = {
@@ -391,7 +391,7 @@ def _row_display_seq(row):
 
 
 # The parent row shows its MOST ACTIVE child's status, not a generic "active"
-# (2026-09-18, Penn: "whatever job is actively being worked should show running" --
+# (2026-09-18, the user: "whatever job is actively being worked should show running" --
 # the rolled-up queue read as all-pending while a slice was in fact running). Lower
 # rank wins. Anything unknown sorts last, so a new status can never outrank running.
 _PLAN_STATUS_PRECEDENCE = ("running", "pending", "queued", "scheduled",
@@ -422,7 +422,7 @@ def _slice_short_name(label, group_key):
 
 def _group_waiting_by_plan(rows):
     """PURE. Roll the queue's rows up into ONE entry per slice-PLAN, so the panel can
-    render a single collapsible parent instead of 161 flat rows (2026-09-18, Penn:
+    render a single collapsible parent instead of 161 flat rows (2026-09-18, the user:
     "one main job ... expand to show the interior").
 
     The plan identity is `row['group_key']` -- stamped by _annotate_job_groups from
@@ -492,7 +492,7 @@ def _group_waiting_by_plan(rows):
 # A slice is "through" only once it has actually COMPLETED -- the slicer marks it
 # 'done' after the coding job finishes AND its deliverable is committed onto the
 # chain. 'enqueued' means the coding job is merely PLACED/queued/running, not
-# finished, so it must NOT count toward progress (Penn: "why does this show 1/2 if
+# finished, so it must NOT count toward progress (the user: "why does this show 1/2 if
 # neither has run yet?" -- a regated-but-not-run coding slice was inflating X).
 # Everything else (pending/blocked/failed/escalated) is also still ahead, not behind.
 # 'skipped' (added to the slicer 2026-09-19) counts as THROUGH, not ahead. It is
@@ -582,7 +582,7 @@ def _plan_progress_recursive(group_key, runs_dir=None, now=None, _seen=None):
     counting it as one unit. Without this, a bundle split for being too big to
     dispatch in one piece (bg-eraser -> bg-eraser-s1-invoke + bg-eraser-s2-verify,
     each further split) reports its ORIGINAL top-level count forever -- "0 of 2"
-    even once 8 real sub-slices are in flight underneath (Penn: "I want to see
+    even once 8 real sub-slices are in flight underneath (the user: "I want to see
     total slices not just the initial slices"). Ids come from `order` only (never
     a slices-dict fallback beyond the no-order case) so a DROPPED slice -- already
     excluded from `order` for exactly this reason, see aw-app-wiring's s8-and --
@@ -721,7 +721,7 @@ def _needs_attention_ids(rows, state_of=None, log_dir=None,
     """PURE apart from the injected lookups. The ids of non-success rows that a bundle
     header should actually RAISE AN ALARM about -- as opposed to merely report.
 
-    Why (2026-09-19, Penn, on the red `1 failed` this same day's badge put on
+    Why (2026-09-19, the user, on the red `1 failed` this same day's badge put on
     bg-escalation): "why are we showing failed if nothing is blocking us that failed",
     then, sharpening it, "is the failure something i need to care about is a better way
     to put it." The badge was asking `status in PLAN_ALERT_STATUSES`, and non-success
@@ -863,7 +863,7 @@ def _plan_done_children(state, group_key, live_rows, log_dir=None,
     state reads that mirror _plan_progress_recursive). The DISPLAY-ONLY child rows
     for slices this plan has already FINISHED.
 
-    Why they have to be synthesized (2026-09-18, Penn: "1/4 but only 3 rows in the
+    Why they have to be synthesized (2026-09-18, the user: "1/4 but only 3 rows in the
     bundle"): Y counts the WHOLE plan, but a done slice's queue row is pruned, so an
     expanded bundle showed fewer children than its own denominator and read as
     inconsistent. These rows put the finished slices back, so the bundle is
@@ -874,7 +874,7 @@ def _plan_done_children(state, group_key, live_rows, log_dir=None,
     status counts or the queue tiers, and carry NO display_seq, so they cannot move
     a real row. Returned in plan `order`, which is the order they actually ran in.
 
-    NON-SUCCESS ROWS DO NOT STAND IN (2026-09-19, Penn: `bg-escalation-s3-letter` is
+    NON-SUCCESS ROWS DO NOT STAND IN (2026-09-19, the user: `bg-escalation-s3-letter` is
     done+PASS and
     "doesn't appear in the bundle's row list AT ALL anymore"). THE BUG: the dupe guard
     was `_slice_base_label(row.label) == base`, and _slice_base_label deliberately
@@ -895,7 +895,7 @@ def _plan_done_children(state, group_key, live_rows, log_dir=None,
     slice's own primary row -- the bare coding label, or `slices[sid].job_id` -- always
     stands in whatever its status: that row IS the slice, so it cannot contradict it.
 
-    GATE TAG (2026-09-18, Penn: "I don't want them to continue to disappear out of
+    GATE TAG (2026-09-18, the user: "I don't want them to continue to disappear out of
     the queue"). A slice flips to `done` in the slicer's run-state as soon as its
     CODING job converges and the deliverable commits -- its reviewer/gate pass is a
     SEPARATE queue row (`gate-<job id>`) that runs afterwards and can still change
@@ -911,7 +911,7 @@ def _plan_done_children(state, group_key, live_rows, log_dir=None,
     The resolved verdict comes off the durable <id>.gate.json sidecar, NOT the live
     queue -- that is what makes it survive the gate row's own pruning.
 
-    RECURSIVE INTO SUB-PLANS (2026-09-19, Penn: "all runs still aren't reflecting
+    RECURSIVE INTO SUB-PLANS (2026-09-19, the user: "all runs still aren't reflecting
     like this as they complete in the bundle"). THE BUG: the X/Y fraction is computed
     by _plan_progress_recursive, which EXPANDS any slice that was itself escalated
     into its own finer sub-plan (slice-runs/<group_key>-<sid>.json) and counts that
@@ -1008,7 +1008,7 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
                             still renders and still counts, it just cannot be the
                             plan's lead status
       row['plan_incomplete'] -- True while X < Y: the plan still owes work, so its
-                            parent must NOT read as completed (Penn 2026-09-18:
+                            parent must NOT read as completed (the user 2026-09-18:
                             "while we work through the bundle the whole thing is
                             pending and shouldn't be moved to completed until
                             everything is completed")
@@ -1059,7 +1059,7 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
     # live rows forms no group at all -- those rows keep their per-row 'done' default
     # and the bundle reads completed (or disappears) with slices still owed.
     #
-    # FULL RUN HISTORY (2026-09-19, Penn: "batch should show the full run history
+    # FULL RUN HISTORY (2026-09-19, the user: "batch should show the full run history
     # always, except gates -- gates can get dropped after running"). This used to
     # skip any plan that still had a live row (`k in live_keys`), which made the
     # bundle's history asymmetric in the worst possible direction: _queue_display_order
@@ -1114,7 +1114,7 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
         size = len(g["children"]) + len(dones)
         # plan_bundle is THE render decision -- "does this row live inside a bundle" --
         # and it is deliberately a property of the PLAN, not of however many rows the
-        # plan happens to have on screen this poll (2026-09-19, Penn: "auto authors can
+        # plan happens to have on screen this poll (2026-09-19, the user: "auto authors can
         # disappear but the job it queues needs to stay showing"). An `auto-author-<slice>`
         # row is ephemeral: it finishes, is reaped, and the real coding row it enqueued
         # takes its place. While a plan is down to ONE visible row in that handover -- or
@@ -1138,7 +1138,7 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
     return rows
 
 
-# BUNDLE ORDER (Penn 2026-09-27: bundle rows "keep changing position as runs start
+# BUNDLE ORDER (the user 2026-09-27: bundle rows "keep changing position as runs start
 # and finish"). The queue panel placed each bundle at plan_seq = MIN display_seq of
 # its rows, and display_seq puts RUNNING on top and gives terminal rows 10_000+tier.
 # So the committed bundle jumped to the top while one of its jobs ran, fell below
@@ -1259,7 +1259,7 @@ def _after_ids(r):
 
 def _wait_reason_for(r, active, by_id, running, db_status=None):
     """One line saying WHY a waiting row is not running, always naming what it is held
-    on (Penn 2026-10-01: "held on xxxx so we know why its not running"). Priority:
+    on (the user 2026-10-01: "held on xxxx so we know why its not running"). Priority:
     hold/gate -> unfinished `after` dependency -> another bundle that is active (and
     what it is doing) -> a busy lane (and which job) -> next in line."""
     if r.get("status") == "held" and (r.get("hold_reason") or r.get("held_on")):
@@ -1304,7 +1304,7 @@ def _wait_reason_for(r, active, by_id, running, db_status=None):
 def _darkbloom_wait(r, st=None):
     """(full, reason, busy, cap) for a row on the Darkbloom lane, else None. Uses ONLY
     the queue's parsed `darkbloom status` (q.darkbloom_status, 10s-cached), never an
-    HTTP load probe. Penn 2026-10-01: "held on Darkbloom: N/4 slots busy"."""
+    HTTP load probe. the user 2026-10-01: "held on Darkbloom: N/4 slots busy"."""
     if q.DARKBLOOM_LANE not in (r.get("lane"), r.get("host_pref")):
         return None
     try:
@@ -1319,7 +1319,7 @@ def _darkbloom_wait(r, st=None):
 
 
 def _annotate_wait_reason(rows, state, now=None):
-    """Stamp row['wait_reason'] on every pending/held/planned row (Penn 2026-09-27: a
+    """Stamp row['wait_reason'] on every pending/held/planned row (the user 2026-09-27: a
     waiting row read as hung; 2026-10-01: name what it is held on). Only ADDS a field."""
     active = _active_bundle_key(state, now)
     by_id = {r.get("id"): r for r in rows}
@@ -1412,7 +1412,7 @@ FRONTEND_HTML = r"""<!doctype html>
   tr.run-parent .proj-name { font-weight: 600; }
   tr.run-parent .proj-summary { color: #666; font-size: .8rem; }
   /* A sub-plan is a LABEL inside its batch, not a second card: no pointer, no hover
-     affordance, nothing to click (Penn 2026-09-19: "one click on the bundle reveals
+     affordance, nothing to click (the user 2026-09-19: "one click on the bundle reveals
      everything"). Quiet divider styling so it reads as a sub-heading over the rows
      that follow it, not as another collapsed thing hiding work. */
   tr.run-subplan { background: rgba(70,130,180,0.045); cursor: default; }
@@ -1434,7 +1434,7 @@ FRONTEND_HTML = r"""<!doctype html>
   .verdict-blocked { color: #c0392b; font-weight: 600; }
   tr.run-child td:nth-child(2) { padding-left: 1.8rem; border-left: 3px solid rgba(70,130,180,0.35); }
   /* QUEUE panel plan rollup -- deliberately the SAME visual language as the Run
-     Status parent/child rows above (Penn 2026-09-18: "like it does down below"). */
+     Status parent/child rows above (the user 2026-09-18: "like it does down below"). */
   tr.queue-parent { cursor: pointer; background: rgba(70,130,180,0.10); }
   tr.queue-parent:hover { background: rgba(70,130,180,0.18); }
   tr.queue-parent td { font-size: .85rem; }
@@ -1443,7 +1443,7 @@ FRONTEND_HTML = r"""<!doctype html>
   /* Which slice is actually being worked, named on the parent line. Same green as
      .status-running so "something here is running" reads at a glance. */
   tr.queue-parent .plan-lead { color: #2e8b57; font-weight: 600; font-size: .8rem; }
-  /* X/Y: how far the plan has got. Prominent -- it is the number Penn scans for. */
+  /* X/Y: how far the plan has got. Prominent -- it is the number the user scans for. */
   tr.queue-parent .plan-frac { font-weight: 700; font-variant-numeric: tabular-nums;
     background: rgba(70,130,180,0.18); border-radius: 4px; padding: .05rem .35rem; }
   /* A queue row in this bundle did not succeed. Deliberately the HEAVIEST thing on the
@@ -1479,7 +1479,7 @@ FRONTEND_HTML = r"""<!doctype html>
   .wait-reason { opacity: .6; font-size: .8em; display: block; }
   tr.live-activity td { font-size: .85em; background: rgba(21,128,61,0.07); }
 
-  /* ---- PHONE (2026-09-19, Penn on an iPhone on the LAN) -----------------
+  /* ---- PHONE (2026-09-19, the user on an iPhone on the LAN) -----------------
      Three separate defects, measured in a 390x844 viewport before the fix:
        1. #hosts had NO scroll wrapper, so its 549px-wide table pushed the BODY
           out: document.scrollWidth 566 vs a 375px viewport. The whole PAGE
@@ -1489,7 +1489,7 @@ FRONTEND_HTML = r"""<!doctype html>
           matter (label/status) scrolled away with the rest.
        3. Nothing truncated cleanly: the `model` cell measured 107px starting at
           x=319, so `qwen3.8:27b-q4_K_M` was simply cut off by the screen edge
-          mid-word -- exactly the "qwen3.8:27..." in Penn's screenshot.
+          mid-word -- exactly the "qwen3.8:27..." in the user's screenshot.
      The fix is to make the table FIT rather than to make it scroll better: the
      columns a phone cannot use (progress, tok/s, lane, pid, exit -- and
      host/files/when in Run Status) are dropped, the survivors wrap instead of
@@ -1531,7 +1531,7 @@ FRONTEND_HTML = r"""<!doctype html>
          further down -- this is the cell that used to clip `qwen3.8:27b-q4_K_M` */
       overflow-wrap: anywhere; word-break: break-word; }
     /* The label owns its own line and reads first; the actions get the last line,
-       full width, so every button stays reachable (Penn confirmed these were the
+       full width, so every button stays reachable (the user confirmed these were the
        thing that was unusable before). Everything between them -- status, elapsed,
        model -- flows inline on the line in the middle. */
     /* calc, not 100%: the drag grip / expand caret is the cell BEFORE this one and
@@ -1578,7 +1578,7 @@ FRONTEND_HTML = r"""<!doctype html>
 </tr></thead><tbody></tbody></table>
 </div>
 
-<!-- UNIFIED run-status list (2026-09-17, Penn: "complete jobs and handoff should
+<!-- UNIFIED run-status list (2026-09-17, the user: "complete jobs and handoff should
      essentially be the same one list when qwen is done that shows the run status
      that we can clear once it's handled"). ONE surface replacing the old split
      between the never-pruned "Completed Jobs" durable-verdict table and the
@@ -1662,7 +1662,7 @@ FRONTEND_HTML = r"""<!doctype html>
 const tbody = document.querySelector('#jobs tbody');
 let dragId = null;
 let dragStartedAt = null;
-// Bundle (parent-row) drag reordering (Penn 2026-09-18). Kept SEPARATE from dragId so a
+// Bundle (parent-row) drag reordering (the user 2026-09-18). Kept SEPARATE from dragId so a
 // bundle drag and a job drag can never be confused: only one is ever non-null at a time.
 // Drag is initiated only from a dedicated grip handle (not the whole parent row), because
 // the parent row is also the expand/collapse toggle -- a row-wide drag fights the toggle.
@@ -1676,7 +1676,7 @@ let planExpanded = {};
 // planExpanded. Absent key = the default (open only for failed/escalated slices).
 let sliceExpanded = {};
 let bundleViews = {views: {}, activity: [], active: null};
-// FINISHED bundles (Penn 2026-10-05): bundles with no queue row left, each with its
+// FINISHED bundles (the user 2026-10-05): bundles with no queue row left, each with its
 // full per-slice history, newest activity first. Paged + age-bounded server-side
 // (/api/bundle-history); "show all ages" drops the age window, "show more" pages on.
 let finishedBundles = {views: [], total: 0, has_more: false};
@@ -1788,7 +1788,7 @@ function trimBundle(txt, key) {
 }
 // END sliceSuffix
 
-// TRUTH after an arrow (Penn 2026-09-27: "that's why we have arrows"). Every reorder
+// TRUTH after an arrow (the user 2026-09-27: "that's why we have arrows"). Every reorder
 // reply carries `truth` -- one honest sentence on when the job/bundle will launch
 // (e.g. "queued behind committed bundle X") -- shown here for a few seconds, so an
 // arrow never looks like it worked when the commitment still decides.
@@ -1893,7 +1893,7 @@ const ALERT_STATUSES = __PLAN_ALERT_STATUSES__;
 // PURE. Split a bundle's {status: count} breakdown into the part that needs a DECISION
 // and the routine part, and render the former as its own badge.
 //
-// Penn, 2026-09-19, on the bg-escalation header: "right now the counter makes it seem
+// the user, 2026-09-19, on the bg-escalation header: "right now the counter makes it seem
 // like its already done when its failed". `1 failed` was one comma-separated item in a
 // #666 .proj-summary, immediately beside a bold `4/5 slices` chip and a green
 // `running: s5-audit` -- so a bundle carrying a failure looked exactly like a bundle
@@ -1901,7 +1901,7 @@ const ALERT_STATUSES = __PLAN_ALERT_STATUSES__;
 // really was not blocked); the point is that a failure must survive a two-second
 // glance instead of being read as done.
 //
-// ...and then, same day, the correction that matters more (Penn: "why are we showing
+// ...and then, same day, the correction that matters more (the user: "why are we showing
 // failed if nothing is blocking us that failed" / "is the failure something i need to
 // care about is a better way to put it"). `alertCounts` is NOT derived from the status
 // here: the server stamps needs_attention per row, having asked whether the row's
@@ -1996,7 +1996,7 @@ async function refresh() {
   // pendingIds MUST reflect true FIFO enqueue order (the daemon's actual launch
   // order), not the display sort below -- reorder buttons compute neighbors
   // from this, and it has to match what the daemon itself iterates over.
-  // Includes 'paused' jobs too (added 2026-08-29, Penn's request) -- a paused job
+  // Includes 'paused' jobs too (added 2026-08-29, the user's request) -- a paused job
   // isn't launchable yet, but its position in this list still determines where it
   // lands once resumed, and pending/paused jobs share the same reorder controls.
   const pendingIds = jobs.filter(j => j.status === 'pending' || j.status === 'paused').map(j => j.id);
@@ -2016,7 +2016,7 @@ async function refresh() {
   // Finished rows are out of the queue panel, with ONE exception: a row whose PLAN
   // still owes slices (plan_incomplete, server-decided from X<Y). Without it, a plan
   // whose every current row is terminal -- the window before its next slice is
-  // enqueued -- vanishes from the queue as if completed, which is exactly what Penn
+  // enqueued -- vanishes from the queue as if completed, which is exactly what the user
   // called out ("shouldn't be moved to completed until everything is completed").
   // Such a row only ever renders INSIDE its bundle; plan_incomplete is stamped on
   // grouped rows alone, so an ordinary finished job is filtered out as before.
@@ -2027,7 +2027,7 @@ async function refresh() {
   // (the coding job converged+committed, then its own meta-job got SIGKILLed or
   // empty-diff-overridden afterward -- a known reap gap, not a real outstanding
   // failure). Before this, that stale failed row alone kept the whole completed bundle
-  // pinned in the active queue panel with a live "cancel" button (Penn 2026-09-19,
+  // pinned in the active queue panel with a live "cancel" button (the user 2026-09-19,
   // bg-captcha showing "3/3 slices done" yet still here). A plan that's genuinely
   // incomplete still shows its failed rows exactly as before, via plan_incomplete.
   const TERMINAL_STATUSES = ['done', 'done_unconverged', 'failed'];
@@ -2048,7 +2048,7 @@ async function refresh() {
   // They diverge whenever plan grouping hoists a row to its plan's anchor -- a
   // re-enqueued slice lands at the FIFO tail but its plan_seq stays pinned to the
   // plan's earliest row, so it renders near the top while being nearly last.
-  // Penn 2026-09-19: bg-crypto's re-gated slice displayed directly under the running
+  // the user 2026-09-19: bg-crypto's re-gated slice displayed directly under the running
   // row showing only an up-arrow (it was truly 29th of 30, hence no down-arrow),
   // while bfmr-split-reservation-diagnose displayed lower showing the "I'm first"
   // single up-arrow (it truly WAS first). The arrows were correct both times; the row
@@ -2196,17 +2196,17 @@ async function refresh() {
       // ahead of the one directly preceding this one). Down: move before the
       // pending job currently two slots later, or to the end if none.
       if (pos > 0) actions += `<button class="iconbtn" data-top title="Send to top of queue">&uarr;&uarr;</button>`;
-      // Whole-job promote (2026-09-18, Penn: a multi-slice job took one click per
+      // Whole-job promote (2026-09-18, the user: a multi-slice job took one click per
       // slice). Only shown when this row's logical job actually HAS more than one
       // pending slice -- otherwise it would duplicate the plain send-to-top button.
       // Monochrome &uarr;&uarr; (single-line doubled up arrow), same .iconbtn as every
-      // other action: one consistent arrow family across the dashboard (Penn 2026-09-18),
+      // other action: one consistent arrow family across the dashboard (the user 2026-09-18),
       // no emoji glyph here, deliberately.
       if (j.group_pending > 1) actions += `<button class="iconbtn" data-promote-group title="Promote the WHOLE job &quot;${j.group_key}&quot; (${j.group_pending} pending slices) to the top, keeping slice order">&uarr;&uarr;</button>`;
       if (pos > 0) actions += `<button class="iconbtn" data-up>&uarr;</button>`;
       if (pos === 0) actions += `<button class="iconbtn" data-promote-front title="Pause whatever is running and run this one now">&uarr;</button>`;
       if (pos < pendingIds.length - 1) actions += `<button class="iconbtn" data-down>&darr;</button>`;
-      // Send to bottom (2026-09-18, Penn): reuses the existing move endpoint with
+      // Send to bottom (2026-09-18, the user): reuses the existing move endpoint with
       // before_id: null, which _reorder_job already treats as "append to the end" --
       // no new endpoint needed. Hidden once a row is already last (nothing to do).
       if (pos < pendingIds.length - 1) actions += `<button class="iconbtn" data-bottom title="Send to bottom of queue">&darr;&darr;</button>`;
@@ -2295,7 +2295,7 @@ async function refresh() {
     const removeBtn = tr.querySelector('[data-remove]');
     if (removeBtn) removeBtn.addEventListener('click', async () => {
       // The response was thrown away here, which is half of why "remove doesn't work"
-      // (Penn 2026-09-19) was so hard to see: the server can legitimately answer
+      // (the user 2026-09-19) was so hard to see: the server can legitimately answer
       // "kept in place" (a paused/blocked row with resumable state), and it can answer
       // 400 QueueActionError -- and BOTH used to look identical to success, because
       // refresh() simply re-rendered the unchanged row with no message at all. Read the
@@ -2354,7 +2354,7 @@ async function refresh() {
     if (!g) { g = {key: key, children: []}; planByKey[key] = g; planEntries.push(g); }
     g.children.push(j);
   }
-  // Running work always leads (Penn 2026-10-01: "why isn't the running task on top?").
+  // Running work always leads (the user 2026-10-01: "why isn't the running task on top?").
   // The server's plan_seq can rank a bundle whose slices are merely PLANNED ahead of the
   // bundle that is actually executing. Array.sort is stable, so every other bundle keeps
   // the server's order; the running bundle is also the real head of the run priority.
@@ -2365,7 +2365,7 @@ async function refresh() {
   planEntries.sort((a, b) => planRank(a) - planRank(b));
   // --- bundle ORDER controls -----------------------------------------------
   // Under depth-first scheduling the order of the bundles IS the run priority, so
-  // this is the control that matters (2026-09-18, Penn: arrange which bundle runs
+  // this is the control that matters (2026-09-18, the user: arrange which bundle runs
   // next). Only whole bundles move; slice order inside a bundle is sequential for a
   // reason and is never exposed here -- move_group preserves it server-side.
   // Movable = the bundle actually has a PENDING slice, which is exactly what
@@ -2390,7 +2390,7 @@ async function refresh() {
   // ones by default; a user toggle wins and is remembered.
   // Rows UNDER a slice line (author/gate/refine/... runs, stage headers, attempt
   // folds) sit one level deeper than the slice line itself (1.8rem, tr.queue-child)
-  // so they read as part of that slice, not as siblings (Penn 2026-10-03).
+  // so they read as part of that slice, not as siblings (the user 2026-10-03).
   const SLICE_KID_N = 3.2, SLICE_KID = SLICE_KID_N + 'rem';
   // ...and an attempt's runs one level deeper again, under their attempt row.
   const ATTEMPT_KID_N = 4.6;
@@ -2578,7 +2578,7 @@ async function refresh() {
     // the normal mid-chain shape, where the earlier slices are done (pruned to the
     // synthesized plan_done_slices below) and only the current author/coding slice is
     // live -- still nests under its bundle instead of floating as a lone "one-off" row
-    // at the bottom (Penn 2026-09-18). A keyless standalone row still renders flat.
+    // at the bottom (the user 2026-09-18). A keyless standalone row still renders flat.
     if (!g.key) {
       for (const c of g.children) tbody.appendChild(buildQueueRow(c, false));
       continue;
@@ -2642,17 +2642,17 @@ async function refresh() {
       : !!(counts.running || (view && g.key === bundleViews.active && view.current));
     const pending = g.children.filter(c => c.status === 'pending');
     // Includes the RUNNING slice: cancelling a bundle must stop it, not leave it to
-    // finish and advance the plan (Penn 2026-10-01). Running ones go via ?force=1.
+    // finish and advance the plan (the user 2026-10-01). Running ones go via ?force=1.
     const cancellable = g.children;
     // A paused/held bundle has NO pending children, so it drops out of movablePlans
-    // (mpos=-1) and every reorder arrow disappears -- leaving only "cancel" (Penn
+    // (mpos=-1) and every reorder arrow disappears -- leaving only "cancel" (the user
     // 2026-09-18: "there should be a resume button on these so i can reposition them").
     // Resume flips each paused/held child back to pending; the arrows reappear on the
     // next poll, so the bundle can then be moved like any other.
     const resumable = g.children.filter(c => c.status === 'paused' || c.status === 'held');
     // Pause the WHOLE bundle in one action: gracefully stop its running slice
     // (SIGTERM, state saved) AND hold its pending slices, so the bundle fully
-    // vacates the GPU and another bundle can run (Penn 2026-09-18: "need a way to
+    // vacates the GPU and another bundle can run (the user 2026-09-18: "need a way to
     // pause that bundle"). The header "hold" only parks pending slices, which
     // leaves the running one holding the single GPU slot -- this covers that gap.
     const running = g.children.filter(c => c.status === 'running');
@@ -2663,7 +2663,7 @@ async function refresh() {
     // previous one / before the one two later, i.e. after the next one).
     const mpos = movablePlans.indexOf(g);
     let pacts = '';
-    // Button order (Penn 2026-09-18): upup, up, down, downdown, hold, cancel -- and
+    // Button order (the user 2026-09-18): upup, up, down, downdown, hold, cancel -- and
     // all arrows one consistent single-line family (&uarr;/&darr;, doubled for the
     // ends) rather than mixing a double-line chevron (&uArr;) with single arrows.
     if (pending.length) pacts += `<button class="iconbtn" data-plan-promote title="Run this bundle FIRST (send &quot;${g.key}&quot;'s ${pending.length} pending slices to the front of the queue, keeping slice order)">&uarr;&uarr;</button>`;
@@ -2696,7 +2696,7 @@ async function refresh() {
     // The parent shows its MOST ACTIVE child's status, decided server-side by
     // _group_waiting_by_plan (running > pending > paused/held > planned) and stamped
     // as plan_status -- NOT a generic "active", which made a queue with a slice
-    // actually running read as all-pending (2026-09-18, Penn: "whatever job is
+    // actually running read as all-pending (2026-09-18, the user: "whatever job is
     // actively being worked should show running"). Same status-* class as every
     // other row, so a running plan is green/bold exactly like a running job.
     const leadStatus = planFirst('plan_status') || (active ? 'pending' : 'planned');
@@ -2708,12 +2708,12 @@ async function refresh() {
       : (leadStatus === 'running' && leadSlice)
       ? `<span class="plan-lead">&#9654; running: ${leadSlice}</span> ` : '';
     // The status breakdown alone once there is an X/Y -- the fraction's Y already IS
-    // the slice total, so a leading "N slices ·" just repeats it (2026-09-18, Penn).
+    // the slice total, so a leading "N slices ·" just repeats it (2026-09-18, the user).
     // Without a fraction (no readable plan state) the count is the only size cue
     // there is, so it stays.
     // ...and the breakdown is explicitly labelled "queue rows" so "1/8 slices" next to
     // "5 planned" reads as two different measurements instead of a contradiction
-    // (Penn 2026-09-18, the Ollama Queue panel on bg-eraser).
+    // (the user 2026-09-18, the Ollama Queue panel on bg-eraser).
     const summary = (total ? '' : `${g.children.length} slices &middot; `)
       + (total && parts.length ? 'queue rows: ' : '') + parts.join(' &middot; ');
     const ptr = document.createElement('tr');
@@ -2787,7 +2787,7 @@ async function refresh() {
     if (promoteBtn) promoteBtn.addEventListener('click', async () => {
       // Reuses the EXISTING server-side group route: it resolves the plan from any
       // member id and moves every pending member as one ordered block, atomically.
-      // ↑↑ = "this is the NEXT bundle that launches" (Penn 2026-09-27), even over a
+      // ↑↑ = "this is the NEXT bundle that launches" (the user 2026-09-27), even over a
       // committed or pinned bundle: take_focus writes the human focus override. It
       // pauses NOTHING -- a running job finishes first, and a committed bundle
       // yields and resumes right after.
@@ -2835,7 +2835,7 @@ async function refresh() {
       // Fan-out over the plan's PAUSED/HELD slices using the same per-job resume
       // endpoint the per-row resume button uses. Once they are pending again the
       // bundle re-enters movablePlans, so the reorder arrows reappear on the next
-      // poll and the bundle can be repositioned in the queue (Penn 2026-09-18).
+      // poll and the bundle can be repositioned in the queue (the user 2026-09-18).
       for (const c of resumable) {
         const r = await fetch('/api/jobs/' + c.id + '/resume', {method: 'POST'});
         if (!r.ok) { alert('resume failed for ' + c.label + ': ' + (await r.text())); break; }
@@ -2871,7 +2871,7 @@ async function refresh() {
       // this slice's gate/regate row is still live, then the resolved verdict once it
       // lands. The server reads that verdict off the durable sidecar, so it KEEPS
       // showing after the gate's own queue row is pruned -- the row never goes blank
-      // and never disappears (Penn 2026-09-18).
+      // and never disappears (the user 2026-09-18).
       //
       // A SKIPPED slice (deliberately retired as already satisfied at the chain tip)
       // is finished business and counts toward X, so it belongs in this list -- but it
@@ -2897,7 +2897,7 @@ async function refresh() {
         tbody.appendChild(dtr);
       }
       for (const c of g.children) tbody.appendChild(buildQueueRow(c, true));
-      // NOT-YET-STARTED SLOTS (Penn 2026-09-21: "4 slices but only three
+      // NOT-YET-STARTED SLOTS (the user 2026-09-21: "4 slices but only three
       // showing. We should at least have a pending slot for each slice to
       // hold for anything pending"). These have no job at all yet -- still
       // `blocked` on a dependency, or `pending` before an auto-author round
@@ -3215,7 +3215,7 @@ function renderRunRow(r, handled, isChild) {
   return tr;
 }
 
-// --- Run Status is a THREE-level tree (2026-09-18, Penn: all the bg-* runs and
+// --- Run Status is a THREE-level tree (2026-09-18, the user: all the bg-* runs and
 // slices should collapse under ONE "broker-guard" header, each slice a sub-group
 // inside it):
 //     project (bg / broker-guard)
@@ -3239,14 +3239,14 @@ function rollupBadges(s) {
   if (s.signoff) b.push(`<span class="eyes-badge eyes-ok">${s.signoff} awaiting sign-off</span>`);
   if (!b.length && s.good) {
     // A passing child in a bundle that still owes slices is NOT "good to go" -- say so
-    // in amber, don't paint the whole bundle green (Penn 2026-09-18: cc-waitlist read
+    // in amber, don't paint the whole bundle green (the user 2026-09-18: cc-waitlist read
     // "all good to go (1)" while 5 of 6 slices had not started).
     if (s.incomplete) b.push(`<span class="eyes-badge eyes-warn">${s.good} passed &middot; slices still owed</span>`);
     else b.push(`<span class="eyes-badge eyes-ok">all good to go (${s.good} runs)</span>`);
   }
   // NOT a contradiction with "N/M slices done": these badges count RUN ROWS still
   // wanting something from you, and a slice that passed and was auto-handled/archived
-  // leaves none (Penn 2026-09-18: "its also showing 1/2 with nothing passing").
+  // leaves none (the user 2026-09-18: "its also showing 1/2 with nothing passing").
   if (!b.length) b.push('<span style="color:#888" title="Every run under this bundle is auto-handled -- nothing here is waiting on you. The slices-done fraction counts PLAN SLICES; these badges count run rows that still want a decision.">auto-handled runs</span>');
   return b.join(' &middot; ');
 }
@@ -3320,7 +3320,7 @@ function renderParentGroup(g, forceCollapsedDefault, indent) {
   attachBulkClear(hdr, g.allRows || g.rows, g.project);
   runTbody.appendChild(hdr);
   if (!expanded) return;
-  // ONE CLICK REVEALS EVERYTHING (Penn 2026-09-19): the bundle's own runs, then every
+  // ONE CLICK REVEALS EVERYTHING (the user 2026-09-19): the bundle's own runs, then every
   // sub-plan's runs inline, to any depth. A sub-plan gets a LABEL row, never a second
   // collapse toggle -- a PASS two splits down must not need a second click to find.
   for (const r of g.rows) runTbody.appendChild(renderRunRow(r, r.group === 'handled', true));
@@ -3402,7 +3402,7 @@ function sectionHeader(text, expanded, toggle, bg, color) {
 // re-renders from this instead of re-fetching: /api/runs/tree takes 0.5-0.9s (measured
 // in-browser 2026-09-19, it stats every job sidecar), which made a click look like it
 // did nothing and then have the table rearrange itself a beat later, out of sync with
-// the user (Penn: a nested PASS "disappears" on the next tick). Data still refreshes on
+// the user (the user: a nested PASS "disappears" on the next tick). Data still refreshes on
 // the 5s poll; only the render is now instant.
 let lastRunTree = null;
 
@@ -3440,7 +3440,7 @@ function renderRunTree(tree) {
   }
   for (const e of needsEyes) renderEntry(e, false);
   // GOOD TO GO: a PASS is a PASS. Sign-off on a passing dispatch is the
-  // coordinator's job, not Penn's, so these are NOT in "needs your eyes" -- they get
+  // coordinator's job, not the user's, so these are NOT in "needs your eyes" -- they get
   // their own green section that says so plainly. Expanded by default: passing work
   // should be visible, not folded away like something that did not matter.
   if (goodToGo.length) {
@@ -3448,7 +3448,7 @@ function renderRunTree(tree) {
       goodExpanded, () => { goodExpanded = !goodExpanded; },
       'rgba(30,132,73,.12)', '#1e8449');
     // ...which is why these render UNFOLDED (was `true`, which contradicted the
-    // comment above and buried the passes two clicks deep -- Penn 2026-09-19).
+    // comment above and buried the passes two clicks deep -- the user 2026-09-19).
     if (goodExpanded) for (const e of goodToGo) renderEntry(e, false);
   }
   if (handled.length) {
@@ -3586,7 +3586,7 @@ FRONTEND_HTML = FRONTEND_HTML.replace("__PLAN_ALERT_STATUSES__", json.dumps(PLAN
 # changes nothing for an already-open tab: the data goes on updating, which makes
 # the page look live, while the front-end stays at the old build forever.
 #
-# That is exactly how the mobile fix "failed" on Penn's phone: he was looking at a
+# That is exactly how the mobile fix "failed" on the user's phone: he was looking at a
 # tab loaded minutes before the fix landed, so it rendered the PREVIOUS commit's
 # CSS (headers breaking one letter per line, `elapsed` not the short `time`) over
 # completely current job data. Verified at the time: the deployed HTML contained
@@ -3739,7 +3739,7 @@ def _darkbloom_host_summary():
 
 def _hosts_summary():
     """What's actually resident right now on each host, independent of the
-    job queue -- Penn's ask: visibility into GPU/memory occupancy even when
+    job queue -- the user's ask: visibility into GPU/memory occupancy even when
     nothing is currently dispatched (an idle lane can still have a model
     sitting loaded from keep_alive, which is exactly the state that caused
     tonight's OOM incidents).
@@ -3906,7 +3906,7 @@ def _job_summary(j, jobs=None):
         d[q.BUNDLE_FIELD] = j.get(q.BUNDLE_FIELD)
     if j.get("hold_reason"):
         d["hold_reason"] = j.get("hold_reason")
-    # NUMBERED RERUNS (Penn 2026-10-01). {n, cause}: the dashboard draws "#N" next to
+    # NUMBERED RERUNS (the user 2026-10-01). {n, cause}: the dashboard draws "#N" next to
     # the label with `cause` as the tooltip, so a continuation round is never mistaken
     # for a first attempt. ollama-queue.py stamps it at enqueue; DERIVE it here for a
     # row enqueued before that existed (or one whose chain only became visible later),
@@ -3945,7 +3945,7 @@ def _job_summary(j, jobs=None):
         except OSError:
             pass
     d["wall_s"] = elapsed_s
-    # ACTIVE runtime (Penn 2026-09-27: 0b130de503d8 read "8 hours" for ~38 min of
+    # ACTIVE runtime (the user 2026-09-27: 0b130de503d8 read "8 hours" for ~38 min of
     # work -- the rest was a promote-preempt pause). The daemon accrues each finished
     # run segment into job["active_s"] (_accrue_active_s at reap); add the live
     # segment for a running job. Paused = wall - active, shown separately. A job
@@ -4039,7 +4039,7 @@ def _esc_review_display(label, group_key=None):
 def _gate_plan_key(row, by_id, reverse=None, log_dir=None):
     """The PLAN a gate/regate row belongs to, or None when it can't be resolved.
 
-    A gate is part of the work it gates (2026-09-18, Penn: "gates should stay part
+    A gate is part of the work it gates (2026-09-18, the user: "gates should stay part
     of the bundle, not outside it"), but its own label names a job id, not a slice,
     so q.job_group_key alone makes it a standalone group of one. Resolution order:
       1. the parent row is still in this payload -> take ITS group key (the exact
@@ -4198,7 +4198,7 @@ def _gate_extra(r):
 
 
 # Statuses that mean "this job is still live in the queue" -- a row in this state
-# belongs in the Ollama Queue panel above, never in Run Status (2026-09-18, Penn:
+# belongs in the Ollama Queue panel above, never in Run Status (2026-09-18, the user:
 # "pending doesn't have to show in run status, those are above in the queue").
 # Applied as a status-field safety net ON TOP OF the by-id live_ids exclusion
 # below: live_ids catches a job still literally present in state["jobs"]; this
@@ -4218,7 +4218,7 @@ def _completed_jobs(limit=50):
     module docstring on reusing ollama-queue.py's own state), newest-timestamp
     first, bounded so the page stays fast against thousands of historical jobs.
 
-    Bug (2026-09-19, Penn: "gate is already gone. we should leave it in the queue
+    Bug (2026-09-19, the user: "gate is already gone. we should leave it in the queue
     as pending gate, or gate passed for visibility until the full batch is done"):
     this used to exclude ANY job id still present in queue-state.json's `jobs`
     array, on the theory that presence there meant "still live or not yet reaped".
@@ -4246,7 +4246,7 @@ def _completed_jobs(limit=50):
     return out
 
 
-# --- Unified run-status list (2026-09-17, Penn: "complete jobs and handoff should
+# --- Unified run-status list (2026-09-17, the user: "complete jobs and handoff should
 # essentially be the same one list when qwen is done that shows the run status that
 # we can clear once it's handled") ---
 # ONE list replaces the two overlapping surfaces that used to sit on this page:
@@ -4290,7 +4290,7 @@ def _run_status_jobs(limit=100):
     return rows
 
 
-# --- run-status RETENTION (2026-10-02, Penn via coordinator): harness rows
+# --- run-status RETENTION (2026-10-02, the user via coordinator): harness rows
 # (auto-author/auto-refine) once their parent deliverable lands or they are acted on,
 # cancelled slice rows, and acted-on diag/research rows are archived automatically;
 # awaiting-signoff rows and unreviewed deliverables never are. The ONE predicate lives
@@ -4369,7 +4369,7 @@ def _retention_loop():
         time.sleep(RETENTION_INTERVAL_S)
 
 
-# --- parent/child rollup of sliced jobs (2026-09-18, Penn: "when jobs are auto
+# --- parent/child rollup of sliced jobs (2026-09-18, the user: "when jobs are auto
 # sliced can we show the main job, and then expand that main job to show the jobs
 # inside it ... so we can better see ... where a full project/dispatch is") ---
 # A sliced dispatch enqueues each slice as "<project-label>-<sliceid>" (e.g.
@@ -4476,7 +4476,7 @@ def _annotate_run_parents(rows, reverse=None, projects=None, progress=None):
                           _plan_progress_recursive: every slice that was itself
                           escalated into its own finer sub-plan is expanded to its real
                           leaf slices, to any depth. None when the plan state can't be
-                          read. Penn 2026-09-18: "i want to see total slices not just
+                          read. the user 2026-09-18: "i want to see total slices not just
                           the initial slices" and "maybe we need to put the data in one
                           place and just pull from there instead of having it split so
                           many places" -- so the SAME (X, Y) that the queue panel's
@@ -4487,7 +4487,7 @@ def _annotate_run_parents(rows, reverse=None, projects=None, progress=None):
     row['bundle_incomplete'] -- True when the parent plan still owes slices (X < Y).
                           Used by _build_run_tree to keep a bundle OUT of "good to go
                           -- nothing owed" until the WHOLE bundle is done, even when
-                          every FINISHED slice passed (Penn 2026-09-18: the good-to-go
+                          every FINISHED slice passed (the user 2026-09-18: the good-to-go
                           bar listed bundles whose slices weren't all done yet).
 
     PURE given reverse/projects; loads them from disk when not supplied. Only ADDS
@@ -4551,7 +4551,7 @@ def _annotate_run_parents(rows, reverse=None, projects=None, progress=None):
     return rows
 
 
-# --- PROJECT layer, one level ABOVE the slice/feature rollup (2026-09-18, Penn:
+# --- PROJECT layer, one level ABOVE the slice/feature rollup (2026-09-18, the user:
 # every bg-* run/slice/piece should collapse under ONE "broker-guard" header, with
 # each slice as a sub-group inside it). Dispatch labels are prefixed with a short
 # project token -- bg-health-s1-status, aw-scan-s2-fares -- so the token before the
@@ -4642,7 +4642,7 @@ def _live_queue_labels(jobs):
     denylist only named done/done_unconverged, so every `failed` (and cancelled,
     needs_opus, blocked...) job counted as live and filed its OWN row as "re-running
     in the queue" -- a failed author job sat hidden under auto-handled forever while
-    nothing was re-running (Penn 2026-09-27: bg-automate-optout-form-submission and
+    nothing was re-running (the user 2026-09-27: bg-automate-optout-form-submission and
     auto-author-verify-relevance showing failed, never surfaced)."""
     return [j.get("label") for j in (jobs or [])
             if j.get("status") in _QUEUE_LIVE_STATUSES]
@@ -4712,7 +4712,7 @@ def _annotate_run_groups(rows, live_labels=None):
                                    else "superseded by a newer retry")
             # Display "superseded", not the raw "SKIPPED" -- the stage was intentionally
             # dismissed because a newer one carries the verdict; "SKIPPED" reads like an
-            # error/dropped step (Penn 2026-09-18). raw_verdict is untouched (color +
+            # error/dropped step (the user 2026-09-18). raw_verdict is untouched (color +
             # pass-logic unchanged).
             r["verdict"] = "superseded"
             continue
@@ -4724,7 +4724,7 @@ def _annotate_run_groups(rows, live_labels=None):
             r["group"] = "handled"
             r["handled_reason"] = f"{base} is re-running in the queue -- wait for the live verdict"
             # a finished stage a live re-run has replaced: show "superseded", not the
-            # alarming raw "SKIPPED" (Penn 2026-09-18). raw_verdict/color untouched.
+            # alarming raw "SKIPPED" (the user 2026-09-18). raw_verdict/color untouched.
             if str(r.get("raw_verdict") or "").strip().upper().startswith("SKIP"):
                 r["verdict"] = "superseded"
             continue
@@ -4764,9 +4764,9 @@ def _annotate_run_groups(rows, live_labels=None):
             r["group"] = "handled"
             r["handled_reason"] = "research/diagnosis output (no code gate) -- read & clear"
             continue
-        # A PASS is GOOD TO GO (2026-09-18, Penn: "if it passed, it passed ... i'd
+        # A PASS is GOOD TO GO (2026-09-18, the user: "if it passed, it passed ... i'd
         # like it to show that more clearly"). Sign-off on a passing dispatch is the
-        # coordinator's job, not Penn's, so a clean PASS must not sit in his "needs
+        # coordinator's job, not the user's, so a clean PASS must not sit in his "needs
         # your eyes" bucket implying something is wrong. It gets its own visible,
         # green section instead of being folded away. needs_eyes is now strictly
         # CONCERNS / FAIL / ESCALATED / BLOCKED -- rows owing a real decision.
@@ -4814,7 +4814,7 @@ def _run_blocked_reason(row, _label=None):
 
 
 # What the "N need eyes" badge should actually SAY for one row, and how loud it
-# should be (2026-09-18, Penn: a green PASS reading "needs eyes" looks like a
+# should be (2026-09-18, the user: a green PASS reading "needs eyes" looks like a
 # fault). Severity drives the colour: 'ok' green, 'warn' amber, 'bad' red.
 _EYES_LABELS = {
     "good": ("good to go", "ok"),
@@ -4881,7 +4881,7 @@ def _summarize_rows(rows, total=None, done=None):
       good       : RUN ROWS currently sitting in the good_to_go bucket -- i.e. results
                    that already passed and need nothing from you. A bundle whose
                    passing slices were all auto-handled/archived has good == 0 with
-                   slicesDone > 0, which is correct, not a contradiction (Penn
+                   slicesDone > 0, which is correct, not a contradiction (the user
                    2026-09-18: "its also showing 1/2 with nothing passing").
 
     Field NAMES are the ones the front-end renders directly.
@@ -4890,7 +4890,7 @@ def _summarize_rows(rows, total=None, done=None):
     vc = {"PASS": 0, "FAIL": 0, "CONCERNS": 0, "BLOCKED": 0, "other": 0}
     # LIVE verdict counts exclude auto-handled rows (a superseded/re-run/eval-arm row).
     # The rolled-up VERDICT is computed from these so it can never contradict the flags
-    # -- Penn 2026-09-18: bg-brokers read "FAIL ... all good to go (2)" because a
+    # -- the user 2026-09-18: bg-brokers read "FAIL ... all good to go (2)" because a
     # superseded FAIL was still counted in the verdict while the flags (which honour the
     # handled status) had already moved past it.
     vc_live = {"PASS": 0, "FAIL": 0, "CONCERNS": 0, "BLOCKED": 0, "other": 0}
@@ -4942,7 +4942,7 @@ def _summarize_rows(rows, total=None, done=None):
     incomplete = (any(r.get("bundle_incomplete") for r in rows) or vc_live["other"] > 0
                   or bool(done is not None and total_out and done < total_out))
 
-    # VERDICT rule (Penn 2026-09-18): you cannot pass, partially-pass, or fail a checklist
+    # VERDICT rule (the user 2026-09-18): you cannot pass, partially-pass, or fail a checklist
     # you have not finished. While a bundle is incomplete its verdict is PENDING -- never
     # "PASS (partial)" (a contradiction) and never a premature FAIL. Once complete, the
     # verdict is the worst of the LIVE runs only, so it can never say FAIL while the flags
@@ -4968,7 +4968,7 @@ def _summarize_rows(rows, total=None, done=None):
     # Only when there is no readable plan state does this fall back to the old
     # row-derived count: len(slices) counts distinct slice_ids that happen to have a
     # run-status ROW in this batch, which undercounts a slice that converged without
-    # ever producing its own row (Penn 2026-09-18: bg-interpret's s1-prompt), so a
+    # ever producing its own row (the user 2026-09-18: bg-interpret's s1-prompt), so a
     # complete bundle shows its full total rather than that undercount.
     if done is not None:
         slices_done = min(done, total_out) if total_out else done
@@ -5052,7 +5052,7 @@ def _build_run_tree(rows):
       {kind: 'project', key, name, entries[], rows[], covered[], summary, section}
     A row/slice with no project stays top-level, exactly as it rendered before.
 
-    SUB-PLANS NEST (Penn 2026-09-18: "ok but we still don't have complete runs inside
+    SUB-PLANS NEST (the user 2026-09-18: "ok but we still don't have complete runs inside
     the batch"). When a slice is escalated and re-split, its sub-plan's runs used to
     render as a SEPARATE top-level bundle card. bg-eraser therefore showed "3/8 done"
     over six stale pre-split attempts and not one of the three converged PASS runs
@@ -5064,7 +5064,7 @@ def _build_run_tree(rows):
     runs (what renders between the header and the nested cards); `allRows` is the full
     subtree, which is what the summary, the section rollup and bulk-clear use.
 
-    SLICE COUNTS COME FROM EXACTLY ONE PLACE (Penn 2026-09-18: "maybe we need to put
+    SLICE COUNTS COME FROM EXACTLY ONE PLACE (the user 2026-09-18: "maybe we need to put
     the data in one place and just pull from there instead of having it split so many
     places"). This function does NOT compute a slice total of its own any more: it
     reads the (X, Y) that _annotate_run_parents stamped on each row as
@@ -5188,7 +5188,7 @@ def _build_run_tree(rows):
         # A bundle that still owes slices (X < Y) may NOT read "good to go -- nothing
         # owed", even when every FINISHED slice passed: its not-yet-run slices simply
         # have no rows here, so the pass-only children would otherwise float it green.
-        # Keep it in needs_eyes until the WHOLE bundle is done (Penn 2026-09-18), the
+        # Keep it in needs_eyes until the WHOLE bundle is done (the user 2026-09-18), the
         # same "don't call it complete while slices are owed" clamp the queue rollup uses.
         if e["section"] == "good_to_go" and any(r.get("bundle_incomplete") for r in kids):
             e["section"] = "needs_eyes"
@@ -5238,7 +5238,7 @@ def _archive_run(job_id, override=None, how=None):
     Archives exactly what the backlog sweep did -- the <id>.done.json / .gate.json /
     .diff sidecars -- and NOT the run transcript log, so a livelog stays inspectable.
 
-    EXCEPTION (2026-09-22, Penn: 3 research jobs -- rt-cc-sync-diagnosis,
+    EXCEPTION (2026-09-22, the user: 3 research jobs -- rt-cc-sync-diagnosis,
     rt-churning-research, rt-price-apis-research -- kept reappearing after
     "{ok: true, moved: []}"): a job with NEITHER a .done.json NOR a .gate.json is a
     log-only research/diagnosis job predating the durable sidecars (see
@@ -5463,7 +5463,7 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
     gate, regate, second opinion, escalation review, landed) rebuilt from the durable
     livelogs + sidecars by bundle_view.load_history -- the queue prunes a finished row
     on the next tick, so views built from queue-state alone showed only ACTIVE jobs
-    (Penn 2026-10-05). `history` injects those records (tests); None reads them.
+    (the user 2026-10-05). `history` injects those records (tests); None reads them.
     `activity` is what is happening right now, GPU or not: running jobs plus every
     live dispatch_progress record (preflight / verify-relevance). Best-effort: a
     missing lib or unreadable file yields an empty payload, never a 500."""
@@ -5575,7 +5575,7 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
     return {"views": views, "activity": activity, "active": active}
 
 
-# --- FINISHED bundles (Penn 2026-10-05: "I want to see the full history of each
+# --- FINISHED bundles (the user 2026-10-05: "I want to see the full history of each
 # slice ... done ones included, grouped under their slice/bundle") ---
 # _bundle_views covers bundles that still have a queue row. Once a bundle's last row
 # is pruned it used to vanish from the queue panel entirely; this rebuilds it from the
@@ -6087,7 +6087,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text(f"error: {e}", 500)
 
     def _move_group(self):
-        # Reorder whole BUNDLES relative to each other (2026-09-18, Penn: arrange
+        # Reorder whole BUNDLES relative to each other (2026-09-18, the user: arrange
         # which bundle runs next -- under depth-first that IS the run priority).
         # Body: {id: <a job id in the bundle to move>,
         #        before_id: <a job id in the bundle to sit before>, null = to the end}
@@ -6123,7 +6123,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # keeping one implementation means the two can't drift apart.
         try:
             if force:
-                # BUNDLE CANCEL must stop the RUNNING slice too (Penn 2026-10-01): the
+                # BUNDLE CANCEL must stop the RUNNING slice too (the user 2026-10-01): the
                 # button used to skip it, so cancelling a bundle left its live slice
                 # running -- and when it finished, the slicer advanced the plan. Same
                 # sequence as `ollama-queue.py cancel --force`: mark the plan cancelled
@@ -6372,7 +6372,7 @@ def _self_test():
             (ld / "3gate-parent0.done.json").write_text(json.dumps(
                 {"id": "3gate-parent0", "label": "gate-someparent", "status": "done"}))
             (ld / "3gate-parent0.gate.json").write_text(json.dumps({"verdict": "pass"}))
-            # --- Run Status must not leak a still-live-status row (2026-09-18, Penn:
+            # --- Run Status must not leak a still-live-status row (2026-09-18, the user:
             # "pending doesn't have to show in run status, those are above in the
             # queue") -- a sidecar whose OWN persisted status is a live-queue state
             # (e.g. a stale/partial snapshot, or a duplicate label re-enqueued under a
@@ -6426,7 +6426,7 @@ def _self_test():
                       all(k in r1 for k in ("model", "host", "changed_file_count", "timestamp", "raw_verdict")),
                       True)
 
-            # --- Unified run-status list + clear/archive (2026-09-17, Penn: "one list
+            # --- Unified run-status list + clear/archive (2026-09-17, the user: "one list
             # ... that we can clear once it's handled") ---
             # A reaped (not live) job that still REQUIRES sign-off, so it appears in
             # the list and exercises the clear-refusal path.
@@ -6482,7 +6482,7 @@ def _self_test():
                       "4signoffjob0" in {r["id"] for r in _run_status_jobs()}, True)
 
                 # Clear WITH an override reason: allowed, and the reason is recorded.
-                res_override = _archive_run("4signoffjob0", override="penn said ship it")
+                res_override = _archive_run("4signoffjob0", override="operator said ship it")
                 check("clear with override succeeds", res_override.get("ok"), True)
                 check("override is recorded on the result",
                       res_override.get("signoff_overridden"), True)
@@ -6490,10 +6490,10 @@ def _self_test():
                       "4signoffjob0" in {r["id"] for r in _run_status_jobs()}, False)
                 man = json.loads((ld / "archive" / "clear-manifest.json").read_text())
                 check("clear-manifest records the override reason",
-                      any(e.get("signoff_override_reason") == "penn said ship it" for e in man), True)
+                      any(e.get("signoff_override_reason") == "operator said ship it" for e in man), True)
 
                 # --- Log-only job (no .done.json/.gate.json) must ALSO stay cleared
-                # (2026-09-22, Penn: rt-cc-sync-diagnosis/rt-churning-research/
+                # (2026-09-22, the user: rt-cc-sync-diagnosis/rt-churning-research/
                 # rt-price-apis-research kept reporting {ok: true, moved: []} and
                 # reappearing after "clear" -- see _archive_run's EXCEPTION note).
                 # Fixture: a bare research job with ONLY a run log + cached answer,
@@ -6530,7 +6530,7 @@ def _self_test():
         finally:
             q.LOG_DIR = orig_log_dir
 
-    # --- run-status grouping (2026-09-18, Penn: "if they're cluttered there, how do
+    # --- run-status grouping (2026-09-18, the user: "if they're cluttered there, how do
     # i know what's been handled?") -- prove the needs_eyes/handled split so the
     # panel can fold intermediate/no-eyes rows WITHOUT hiding anything. Pure logic,
     # no filesystem: drive _annotate_run_groups directly.
@@ -6580,10 +6580,10 @@ def _self_test():
         check("a FRESH (<24h) research/diag stays needs_eyes", g["h"], "needs_eyes")
         check("a STALE (>24h) research/diag folds", g["i"], "handled")
 
-        # --- a PASS is GOOD TO GO, not "needs eyes" (2026-09-18, Penn: "if it
+        # --- a PASS is GOOD TO GO, not "needs eyes" (2026-09-18, the user: "if it
         # passed, it passed ... i'd like it to show that more clearly"). Sign-off on
         # a passing dispatch is the coordinator's job, so a clean PASS must leave
-        # Penn's needs_eyes bucket entirely; needs_eyes is now strictly CONCERNS /
+        # the user's needs_eyes bucket entirely; needs_eyes is now strictly CONCERNS /
         # FAIL / ESCALATED / BLOCKED. Fails without the fix (PASS was needs_eyes).
         g = grp([{"id": "j", "label": "real-app-fix", "awaiting_signoff": False,
                   "has_gate": True, "raw_verdict": "PASS", "verdict": "PASS",
@@ -6671,7 +6671,7 @@ def _self_test():
     finally:
         ho._label_is_eval = orig_eval
 
-    # --- parent/child rollup of sliced jobs (2026-09-18, Penn: "show the main job,
+    # --- parent/child rollup of sliced jobs (2026-09-18, the user: "show the main job,
     # and then expand that main job to show the jobs inside it") -- prove the
     # slice-index-driven parent resolution + per-row annotation. Pure logic: inject a
     # reverse/projects index rather than touching ~/.ollama-dispatch.
@@ -6712,7 +6712,7 @@ def _self_test():
     check("_project_for_base prefers the reverse map over the regex",
           _project_for_base("bg-actions-s1-item", reverse), "bg-actions")
 
-    # --- PROJECT layer above the slice rollup (2026-09-18, Penn: all the bg-* runs
+    # --- PROJECT layer above the slice rollup (2026-09-18, the user: all the bg-* runs
     # and slices under ONE "broker-guard" header, each slice a sub-group inside it).
     # Prove project > slice > run nesting AND that the worst-of rollup propagates all
     # the way up. Pure logic: inject the slice index rather than touching disk.
@@ -6794,7 +6794,7 @@ def _self_test():
           ["handled", "good_to_go", "needs_eyes", "good_to_go"])
 
     # A bundle whose finished slices ALL passed but which still OWES slices (X < Y)
-    # must NOT read "good to go -- nothing owed" (Penn 2026-09-18: the green bar listed
+    # must NOT read "good to go -- nothing owed" (the user 2026-09-18: the green bar listed
     # bundles that weren't fully done). Same all-PASS aw-scan rows, but now the plan
     # progress says 1 of 3 slices are through -> the project drops to needs_eyes.
     inc_rows = [dict(t4) for t4 in [trows[4]]]  # aw-scan-s1-fares, PASS/good_to_go
@@ -6816,7 +6816,7 @@ def _self_test():
 
     # The rollup BADGE must match the section clamp: an incomplete bundle's summary
     # carries incomplete=True so rollupBadges renders "N passed - slices still owed"
-    # (amber), never "all good to go (N)" (green). Penn 2026-09-18: cc-waitlist's flags
+    # (amber), never "all good to go (N)" (green). the user 2026-09-18: cc-waitlist's flags
     # read "all good to go (1)" with total=6, slicesDone=1 (5 slices not even started).
     check("incomplete bundle summary flags incomplete=True",
           _build_run_tree(inc_rows)[0]["summary"]["incomplete"], True)
@@ -6840,7 +6840,7 @@ def _self_test():
     check("total>slicesDone alone does NOT mark a complete bundle incomplete",
           com_sum["incomplete"], False)
 
-    # VERDICT MODEL (Penn 2026-09-18): you cannot pass/partially-pass/fail an unfinished
+    # VERDICT MODEL (the user 2026-09-18): you cannot pass/partially-pass/fail an unfinished
     # checklist, and a superseded FAIL must not contradict "all good to go".
     # (1) incomplete bundle with a passing slice -> PENDING, never "PASS (partial)".
     part = _summarize_rows([
@@ -6873,7 +6873,7 @@ def _self_test():
          "bundle_incomplete": False}], total=1)
     check("a live non-terminal run keeps the bundle PENDING", runx["verdict"], "PENDING")
 
-    # --- "send to bottom" queue control (2026-09-18, Penn's dashboard queue panel)
+    # --- "send to bottom" queue control (2026-09-18, the user's dashboard queue panel)
     # -- prove before_id=None already means "append to the end" in _reorder_job, the
     # pure function the dashboard's new send-to-bottom button relies on (it reuses
     # the existing POST /api/jobs/move with before_id: null rather than a new
@@ -6894,7 +6894,7 @@ def _self_test():
           _reorder_job([{"id": "x"}], "nope", None), False)
 
     # --- queue display order must not jump on a held -> pending transition
-    # (2026-09-18, Penn: "the view jumps when a job's status changes"). A gate
+    # (2026-09-18, the user: "the view jumps when a job's status changes"). A gate
     # barrier lifting is NOT a reorder: the job's place in the launch order is
     # unchanged, so its ROW must keep its index. This fails without the shared
     # pending/held/paused tier (held used to fall through to the bottom tier).
@@ -6907,7 +6907,7 @@ def _self_test():
     before = [j["id"] for j in _queue_display_order(qjobs)]
     check("queue display keeps true FIFO order within the waiting tier",
           before, ["r1", "p1", "p2", "z1", "f1", "h1"])
-    # HELD SINKS TO THE BOTTOM (2026-09-18, Penn: the parked bonsai job cluttered
+    # HELD SINKS TO THE BOTTOM (2026-09-18, the user: the parked bonsai job cluttered
     # the middle of the active worklist). A hold is sticky, not a transient flip.
     check("a held job sorts BELOW every pending job",
           before.index("h1") > max(before.index("p1"), before.index("p2")), True)
@@ -6926,7 +6926,7 @@ def _self_test():
     check("a lifted held job rejoins the pending tier in true FIFO position",
           after, ["r1", "p1", "h1", "p2", "z1", "f1"])
     # --- planned rows sit IN the queue, where they will actually run -----------
-    # Penn 2026-09-18: "can we put the planned runs in the queue where they'll fall
+    # the user 2026-09-18: "can we put the planned runs in the queue where they'll fall
     # when we run them? ... they are essentially queued just waiting on the job
     # before it to finish like other jobs in the queue."
     check("planned shares the waiting tier with pending (not its own block)",
@@ -6961,7 +6961,7 @@ def _self_test():
     check("display_seq matches that order (the front-end sorts by it)",
           [j["id"] for j in sorted(_ann, key=lambda j: j["display_seq"])], seq)
     # --- a bundle stays PUT until it completes (2026-09-19) --------------------
-    # THE BUG Penn reported live: "queue still seems to be jumping around and not
+    # THE BUG the user reported live: "queue still seems to be jumping around and not
     # staying in a single bundle until completion." A slice's `after` points at the
     # job for the PREVIOUS slice, and that job is reaped when it finishes, so mid-plan
     # the dep resolves to nothing and the row fell to the tail of the region -- while
@@ -7060,7 +7060,7 @@ def _self_test():
           f"const STATUS_ORDER = {json.dumps(QUEUE_STATUS_ORDER)};" in FRONTEND_HTML, True)
 
     # --- bundle header: a failure must not hide next to the counter (2026-09-19) ----
-    # Penn, on bg-escalation: "right now the counter makes it seem like its already
+    # the user, on bg-escalation: "right now the counter makes it seem like its already
     # done when its failed". These are BEHAVIOURAL, not containment: the real shipped
     # planAlertSummary is cut out of the served page between its markers and EXECUTED
     # under node, so what is asserted is the markup a bundle header actually renders.
@@ -7068,7 +7068,7 @@ def _self_test():
           f"const ALERT_STATUSES = {json.dumps(PLAN_ALERT_STATUSES)};" in FRONTEND_HTML,
           True)
     # WHICH rows may alarm: the server's judgement, on the underlying SLICE, not the
-    # row's status (Penn: "is the failure something i need to care about is a better
+    # row's status (the user: "is the failure something i need to care about is a better
     # way to put it"). The fixture IS the bg-escalation shape that prompted it.
     _esc = {"label": "bg-escalation",
             "order": ["s3-letter", "s5-audit"],
@@ -7163,7 +7163,7 @@ console.log(JSON.stringify({
               (["1 running", "3 planned"], ["1 running", "3 planned"]))
         check("...and the whole ROW is flagged, so it is findable while scanning",
               (_a.get("failRow"), _a.get("cleanRow")), (" queue-parent-alert", ""))
-        # Penn: "is the failure something i need to care about is a better way to put
+        # the user: "is the failure something i need to care about is a better way to put
         # it." Identical COUNTS to the alarming case -- only the server's per-row
         # judgement differs -- so this can only pass by honouring needs_attention.
         check("THE BUG: a failed row on an already-landed slice raises NO alarm",
@@ -7181,7 +7181,7 @@ console.log(JSON.stringify({
     elif not _node:
         print("  SKIP planAlertSummary behavioural checks: no `node` on PATH")
 
-    # --- second-opinion rows resolve through their PARENT job id (Penn 2026-10-01) ---
+    # --- second-opinion rows resolve through their PARENT job id (the user 2026-10-01) ---
     _bvs = _bundle_view_lib()[0]
     _sp = {"id": "b0c6d90fdf38", "label": "p1-s2-thing", "status": "running",
            "group_key": "p1"}
@@ -7345,7 +7345,7 @@ console.log(JSON.stringify({
           ("slice-dot" in FRONTEND_HTML and "str.dataset.open = open ? '1' : '0'" in FRONTEND_HTML
            and ": sl.active ? '&#9654;'" not in FRONTEND_HTML), True)
 
-    # --- escalation-review rows belong to their bundle/slice (Penn 2026-10-01) -------
+    # --- escalation-review rows belong to their bundle/slice (the user 2026-10-01) -------
     _EL = "esc-review-41Z-ev-service-screen-1-rivian-service-s1-request-status-map"
     _EP = "ev-service-screen-1-rivian-service"
     _bvm = _bundle_view_lib()[0]
@@ -7450,7 +7450,7 @@ console.log(JSON.stringify({
         check("only a failed/escalated slice opens by default, a running one stays one row",
               (_s.get("openEsc"), _s.get("openRun")), (True, False))
 
-    # --- run-status panel: a signal-carrying card must not hide (Penn 2026-09-19) ----
+    # --- run-status panel: a signal-carrying card must not hide (the user 2026-09-19) ----
     # A nested sub-plan is where the real PASS rows live once a slice was re-split, so
     # the batch auto-opening is pointless if the child does not. Three properties, all
     # checked as SOURCE invariants (there is no JS runtime here; the behaviour itself
@@ -7458,7 +7458,7 @@ console.log(JSON.stringify({
     check("only a fully auto-handled bundle starts folded (good_to_go opens too)",
           "const dflt = !forceCollapsedDefault && g.section !== 'handled';"
           in FRONTEND_HTML, True)
-    # Penn's design call, 2026-09-19: ONE click on the bundle reveals every run under
+    # the user's design call, 2026-09-19: ONE click on the bundle reveals every run under
     # it, sub-plans included. A sub-plan is a label, never a second collapse toggle.
     check("a sub-plan's runs are rendered inline, not behind their own card",
           ("function renderSubPlanRuns(g, indent)" in FRONTEND_HTML
@@ -7493,7 +7493,7 @@ console.log(JSON.stringify({
     check("...and reading it back is wrapped so blocked storage cannot break the panel",
           FRONTEND_HTML.count("catch (e) { /*") >= 2, True)
 
-    # --- "Loaded right now": REAL system memory from vm_stat (2026-09-18, Penn:
+    # --- "Loaded right now": REAL system memory from vm_stat (2026-09-18, the user:
     # show real system memory, not just the model-footprint sum). 16KB pages, a
     # 64GiB box; used = total - reclaimable(free+inactive+speculative+purgeable).
     PS = 16384
@@ -7635,7 +7635,7 @@ console.log(JSON.stringify({
     check("a missing display_seq falls back to the status tier, never crashes",
           _group_waiting_by_plan([{"id": "x", "group_key": None, "status": "pending"}])[0]["seq"],
           10_000 + _queue_status_tier("pending"))
-    # --- parent status = the MOST ACTIVE child (Penn: "whatever job is actively
+    # --- parent status = the MOST ACTIVE child (the user: "whatever job is actively
     # being worked should show running") ----------------------------------------
     check("running outranks every other status on the parent row",
           min(["planned", "pending", "running", "paused"], key=_plan_status_rank), "running")
@@ -7750,7 +7750,7 @@ console.log(JSON.stringify({
                                       "display_seq": 9}], runs_dir=_rdp)[0]["plan_total"], 0)
 
         # --- ONE authoritative slice count, all the way to the tree -------------
-        # Penn 2026-09-18: "i want to see total slices not just the initial slices"
+        # the user 2026-09-18: "i want to see total slices not just the initial slices"
         # and "maybe we need to put the data in one place and just pull from there
         # instead of having it split so many places". bg-eraser read "1/2" in the
         # run-status tree (its plan-index top-level count) while the queue panel read
@@ -7824,7 +7824,7 @@ console.log(JSON.stringify({
               _ntree[0]["covered"], ["np-s1-alpha"])
 
         # --- the sub-plan's runs live INSIDE the batch card, not beside it ---------
-        # Penn 2026-09-18: "ok but we still don't have complete runs inside the batch".
+        # the user 2026-09-18: "ok but we still don't have complete runs inside the batch".
         # bg-eraser showed 3/8 done over six stale pre-split attempts while the three
         # converged PASS runs sat in the separate top-level cards bg-eraser-s1-invoke
         # and bg-eraser-s2-verify. Same fixture plus a THIRD level, so a nesting that
@@ -7881,7 +7881,7 @@ console.log(JSON.stringify({
 
         # good vs slicesDone: DIFFERENT measurements, and the fix is that neither is
         # derived from the other. Every run here is auto-handled, so good == 0 while
-        # 2 slices are genuinely through -- Penn's "1/2 with nothing passing". The UI
+        # 2 slices are genuinely through -- the user's "1/2 with nothing passing". The UI
         # says "2/5 slices done" + "auto-handled runs", which do not contradict.
         # (runs == 2, not 1: the batch card now contains its nested sub-plan's run too
         # -- see the nesting block below.)
@@ -7908,7 +7908,7 @@ console.log(JSON.stringify({
               (_over["slicesDone"], _over["total"]), (3, 3))
 
         # --- a finished job still sitting in the queue must not supersede ITSELF -------
-        # Penn 2026-09-19: "nothing is showing" -- every run-status row read auto-handled
+        # the user 2026-09-19: "nothing is showing" -- every run-status row read auto-handled
         # with "<feature> is re-running in the queue -- wait for the live verdict" while
         # nothing was re-running. _run_status_jobs handed _annotate_run_groups EVERY job
         # in the queue file, so each of the 11 `done` jobs made its own PASS row wait for
@@ -7960,7 +7960,7 @@ console.log(JSON.stringify({
               _stree[0]["section"], "good_to_go")
 
     # --- FIX 1: done slices are synthesized back into the bundle ----------------
-    # Penn: "1/4 but only 3 rows in the bundle" -- a done slice's queue row is pruned
+    # the user: "1/4 but only 3 rows in the bundle" -- a done slice's queue row is pruned
     # while Y still counts it, so the expanded plan must render it from run state.
     _dstate = {"label": "aw-airport-groups",
                "order": ["s1-is-group", "s2-alias", "s3-map", "s4-emit"],
@@ -7980,7 +7980,7 @@ console.log(JSON.stringify({
           (_dsyn[0]["synthetic"], "display_seq" in _dsyn[0]), (True, False))
     check("a synthesized row is marked done and keeps its plan order",
           (_dsyn[0]["status"], _dsyn[0]["slice_order"]), ("done", 0))
-    # THE BUG (Penn, 2026-09-19): this case used to assert `[]` -- i.e. that ANY row
+    # THE BUG (the user, 2026-09-19): this case used to assert `[]` -- i.e. that ANY row
     # whose _slice_base_label folded onto the slice suppressed its tick. On
     # bg-escalation the only such row was a FAILED auto-refine round, so the slice that
     # had actually PASSED vanished from the bundle and the failure rendered in its
@@ -8048,7 +8048,7 @@ console.log(JSON.stringify({
               [r["id"] for r in _drows], ["a", "b", "c"])
 
     # --- FIX 1b: the bundle's done rows follow SUB-PLANS, like the fraction does --
-    # Penn 2026-09-19: "all runs still aren't reflecting like this as they complete in
+    # the user 2026-09-19: "all runs still aren't reflecting like this as they complete in
     # the bundle". THE BUG: X/Y came from _plan_progress_recursive (which expands a
     # slice that was escalated into its own sub-plan) while the tick rows came from a
     # FLAT read of the top-level slices map. A plan whose work all happened one level
@@ -8094,7 +8094,7 @@ console.log(JSON.stringify({
         check("...with its sub-plan's finished slices under it, not floating alone",
               [d["label"] for d in _fann["plan_done_slices"]],
               ["bg-x-s1-item-a", "bg-x-s1-item-b"])
-        # Penn 2026-09-19: "auto authors can disappear but the job it queues needs to
+        # the user 2026-09-19: "auto authors can disappear but the job it queues needs to
         # stay showing". The auto-author row is reaped the instant the coding row it
         # enqueued appears; a size-only bundle test collapsed the bundle to a flat row
         # in that handover window. plan_bundle is a property of the PLAN, so it doesn't.
@@ -8139,7 +8139,7 @@ console.log(JSON.stringify({
               {(1, 3, True)})
 
     # --- FIX 2: a done slice's row carries its GATE state, and never goes blank ---
-    # Penn 2026-09-18: "I need them to stop disappearing when they're done and being
+    # the user 2026-09-18: "I need them to stop disappearing when they're done and being
     # replaced by gates that then disappear ... change the tag on it to pending gate,
     # and then once the gate resolves, put the updated tag on it".
     # A slice flips to `done` when its CODING job converges; its gate is a separate
@@ -8409,7 +8409,7 @@ console.log(JSON.stringify({
               # 5 rendered children: the 2 live failed rows, the REAL done+PASS row
               # cap3win, and the 2 synthesized done-slice ticks for s1 and s2.
               #
-              # This asserted 4 until 2026-09-19 (Penn: "batch should show the full
+              # This asserted 4 until 2026-09-19 (the user: "batch should show the full
               # run history always, except gates -- gates can get dropped after
               # running"). cap3win is an actual job attempt that PASSED, and it used
               # to be dropped on the floor: the stranded-row recovery only ran for
@@ -8436,7 +8436,7 @@ console.log(JSON.stringify({
               _bundle_status(_fin, "fin"), {"done"})
 
     # --- an unfinished bundle NEVER reads as completed --------------------------
-    # Penn: "while we work through the bundle the whole thing is pending and
+    # the user: "while we work through the bundle the whole thing is pending and
     # shouldn't be moved to completed until everything is completed."
     with tempfile.TemporaryDirectory() as _rd3:
         _rd3p = Path(_rd3)
@@ -8489,7 +8489,7 @@ console.log(JSON.stringify({
         # This asserted the opposite (a terminal row "stays ungrouped") until
         # 2026-09-19, and its own comment gave the reason away: "no normal bundle
         # changes because of this" -- it was conservatism about blast radius, not a
-        # defence against any bug. Penn's criterion retires it: "batch should show
+        # defence against any bug. the user's criterion retires it: "batch should show
         # the full run history always". y2 is a real author attempt that finished;
         # leaving it outside the bundle is exactly how a completed attempt fell off
         # its own plan card. It is grouped, so it carries the PLAN's rollup
@@ -8622,7 +8622,7 @@ console.log(JSON.stringify({
     # The dashboard polls data into an existing DOM but never re-fetches its own
     # inline CSS/JS, so a restarted server left every open tab on the old build --
     # which is how a shipped, correctly-deployed mobile fix rendered as the
-    # PREVIOUS commit on Penn's phone while the job data on it was fully current.
+    # PREVIOUS commit on the user's phone while the job data on it was fully current.
     check("the page carries the build it was served as",
           f"const FRONTEND_VERSION = {json.dumps(FRONTEND_VERSION)};" in FRONTEND_HTML,
           True)
@@ -8655,7 +8655,7 @@ console.log(JSON.stringify({
     check("an unreadable header never breaks the poll",
           "catch (e) { /* header unreadable" in FRONTEND_HTML, True)
 
-    # BUNDLE ORDER is stable across run activity (Penn 2026-09-27: bundle rows kept
+    # BUNDLE ORDER is stable across run activity (the user 2026-09-27: bundle rows kept
     # changing position as runs started/finished). The committed bundle C is walked
     # through every activity phase -- author running, author done + coding pending,
     # coding running, everything done between slices -- and the whole /api/jobs
@@ -8734,7 +8734,7 @@ console.log(JSON.stringify({
         check("front-end sorts on bundle_rank first",
               "brank(a) - brank(b)" in FRONTEND_HTML, True)
 
-    # THE ARROWS are the interface (Penn 2026-09-27): drive the real handler methods
+    # THE ARROWS are the interface (the user 2026-09-27): drive the real handler methods
     # with a fake request and a recording queue module.
     _calls = []
 
@@ -8793,7 +8793,7 @@ console.log(JSON.stringify({
                _m[0]["bundle_rank"] < next(r for r in _ah if r["id"] == "o1")["bundle_rank"]),
               (1, True))
 
-    # NUMBERED RERUNS (Penn 2026-10-01). The real chain off ollama-queue-state.json:
+    # NUMBERED RERUNS (the user 2026-10-01). The real chain off ollama-queue-state.json:
     # dbcf30f84454 -> d96a71500b9b -> f059db0bce62. _job_summary must expose
     # rerun={n, cause} so the row can draw "#3" with the cause on hover, and must
     # expose NOTHING on a first attempt.

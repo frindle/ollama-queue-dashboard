@@ -10,7 +10,7 @@
   to be started by hand after every reboot. The failure mode was silent and expensive:
   the API LaunchAgent comes back on its own, so the dashboard answers normally and the
   queue LOOKS healthy while every enqueued job sits `pending` forever with no error
-  anywhere. Penn's call to make it a service.
+  anywhere. the owner's call to make it a service.
 
   THE TRADEOFF THIS ACCEPTS: the runner evicts models from Studio's native Ollama and
   starts/stops the llama-server bypass on port 8091. Starting it automatically at login

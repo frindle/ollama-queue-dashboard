@@ -3,8 +3,8 @@
 <!--
   HTTP API + frontend for ollama-queue.py, exposed the same way as Claude Code/
   Goose/qwen (com.penn.ttyd-*.plist): bound to <lan-ip>, NOT 0.0.0.0, since the
-  only intended route in is the Cloudflare tunnel (ollama-queue.penndalton.com),
-  which puts it behind the same "Penn Only" Access policy as the others.
+  only intended route in is the Cloudflare tunnel (<tunnel-hostname>),
+  which puts it behind the same "owner-only" Access policy as the others.
 
   Unlike the ttyd jobs this isn't a terminal -- it's a plain HTTP server
   (~/bin/ollama-queue-api.py) that reads/writes ollama-queue.py's own state file

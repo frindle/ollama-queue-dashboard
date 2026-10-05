@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression test: FINISHED runs stay visible on the dashboard (Penn 2026-10-05).
+"""Regression test: FINISHED runs stay visible on the dashboard (the user 2026-10-05).
 
 Bug: completed steps of a slice/bundle vanished -- only ACTIVE jobs showed. The queue
 prunes a clean `done` row from queue-state.json on the next tick (RETAIN_DONE_RECENT=0)

@@ -1,4 +1,4 @@
-"""bundle_view.py -- one line per slice, from LIVE truth (Penn 2026-09-27).
+"""bundle_view.py -- one line per slice, from LIVE truth (the user 2026-09-27).
 
 The dashboard's bundle view used to be built from two sources that each lag:
   * the slicer's run file (slice-runs/<plan>.json), whose status only changes when
@@ -452,7 +452,7 @@ def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None):
                           "label": (result_of(pid) or {}).get("label") or pid})
     if not mains:
         return None
-    # ONE pseudo-slice per FEATURE, not per job (Penn 2026-10-05: "the full history of
+    # ONE pseudo-slice per FEATURE, not per job (the user 2026-10-05: "the full history of
     # each slice"): auto-author-X, auto-refine-X-rN and the coding job X are the
     # author -> refine -> code stages of one unit of work, so they share a line whose
     # history carries every run (finished ones included, via load_history). Distinct
@@ -570,7 +570,7 @@ def load_view(plan, jobs, runs_dir, chain_dir, log_dir, heal_ledger_path,
 
 
 # ---------------------------------------------------------------------------
-# durable job HISTORY (Penn 2026-10-05: "completed steps of a slice are not shown
+# durable job HISTORY (the user 2026-10-05: "completed steps of a slice are not shown
 # anymore -- only ACTIVE jobs are visible")
 # ---------------------------------------------------------------------------
 # ROOT CAUSE this closes: ollama-queue.py's prune_finished_jobs drops a clean `done`

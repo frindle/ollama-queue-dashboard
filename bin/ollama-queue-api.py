@@ -372,7 +372,7 @@ async function refresh() {
   // pendingIds MUST reflect true FIFO enqueue order (the daemon's actual launch
   // order), not the display sort below -- reorder buttons compute neighbors
   // from this, and it has to match what the daemon itself iterates over.
-  // Includes 'paused' jobs too (added 2026-08-29, Penn's request) -- a paused job
+  // Includes 'paused' jobs too (added 2026-08-29, the user's request) -- a paused job
   // isn't launchable yet, but its position in this list still determines where it
   // lands once resumed, and pending/paused jobs share the same reorder controls.
   const pendingIds = jobs.filter(j => j.status === 'pending' || j.status === 'paused').map(j => j.id);
@@ -885,7 +885,7 @@ def _ollama_resident_models(url):
 
 def _hosts_summary():
     """What's actually resident right now on each host, independent of the
-    job queue -- Penn's ask: visibility into GPU/memory occupancy even when
+    job queue -- the user's ask: visibility into GPU/memory occupancy even when
     nothing is currently dispatched (an idle lane can still have a model
     sitting loaded from keep_alive, which is exactly the state that caused
     tonight's OOM incidents)."""
@@ -907,7 +907,7 @@ def _hosts_summary():
     studio_models = _ollama_resident_models(studio_url)
     unraid_models = _ollama_resident_models(unraid_url)
     # Studio = the box we're running on (unified memory). Unraid = the 3080's
-    # VRAM (12GB, hardcoded -- Penn can correct). used = sum of resident model
+    # VRAM (12GB, hardcoded -- the user can correct). used = sum of resident model
     # footprints reported by /api/ps.
     studio_total_gb = round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9) if hasattr(os, "sysconf") else 0
     studio_used_gb = round(sum(m["size_gb"] for m in studio_models), 1)

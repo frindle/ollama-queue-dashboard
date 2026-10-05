@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Auto-gate hook: run the Studio gate on a completed dispatch. ADVISORY ONLY.
 
-THE MODEL CALL GOES THROUGH THE QUEUE, NEVER DIRECTLY. Penn's constraint, and it
+THE MODEL CALL GOES THROUGH THE QUEUE, NEVER DIRECTLY. the user's constraint, and it
 restores my own original design -- the first version called ollama at
 127.0.0.1:11434 via subprocess, which would have run CONCURRENTLY with real
 dispatches: contending for the GPU, bypassing the VRAM guard, and forcing model
@@ -56,7 +56,7 @@ RELEVANCE = HERE / "verify-relevance.py"
 # a fixture repo without touching the live queue.
 TEST_MODE = os.environ.get("GATE_TEST_MODE") == "1"
 
-# --- Two-tier gate routing (2026-09-04, Penn's design; wired after the 14b bake-off) ---
+# --- Two-tier gate routing (2026-09-04, the user's design; wired after the 14b bake-off) ---
 # The cheap PRE-gate runs on Unraid (qwen3:14b, ~10.4G VRAM @ num-ctx 6144 -- fits
 # the 3080 with headroom, zero CPU spillover). Bake-off vs the Studio 27B over 16
 # real .gate.json diffs (2026-09-04): 88% agreement, 0 false-FAIL, 2 false-PASS;
@@ -89,7 +89,7 @@ TWO_TIER        = os.environ.get("GATE_TWO_TIER", "1") != "0"
 # suspect-the-grader / high-bar-for-model-is-the-problem). "shadow" (DEFAULT)
 # computes and RECORDS the decision + the exact requeue command into .gate.json
 # and AUTO-FIX-QUEUE.md, and enqueues NOTHING. "live" actually requeues. It ships
-# shadow so Penn can read, over real jobs, whether the classifier fires correctly
+# shadow so the user can read, over real jobs, whether the classifier fires correctly
 # and the requeue commands are right, at zero risk of a loop or a tampered verify.
 # Flip to live ONLY after the shadow log shows it agreeing with hand judgement.
 AUTOFIX_MODE       = os.environ.get("GATE_AUTOFIX_MODE", "shadow").lower()
@@ -1315,7 +1315,7 @@ def main() -> int:
                 _notify_non_pass(a.job_id, payload, gate_json)
         except Exception:
             pass
-        # Penn's at-a-glance surface. Best-effort and last: it is a VIEW, so a
+        # the user's at-a-glance surface. Best-effort and last: it is a VIEW, so a
         # failure here loses nothing (rebuild with --all), and it must never be
         # able to affect the gate's own exit code -- rule 2 again.
         try:
