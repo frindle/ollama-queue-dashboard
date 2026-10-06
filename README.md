@@ -217,6 +217,8 @@ token, `api_key = <your QUEUE_API_TOKEN>`.
 
 ## Using the dashboard
 
+**Waiting on (2026-10-06).** The daemon writes `~/.ollama-dispatch/queue-wait.json` (per lane busy/idle, the reason an idle lane is not launching, since-when; per-job short reasons). The dashboard shows a "Waiting on" banner (red if an idle lane has had the same reason for over 5 minutes), adds `queue_wait` to each `/api/jobs` row, and serves the lane view at `/api/queue-wait`; `ollama-queue.py status` prints the same as a header. Until the daemon is restarted onto the new code it degrades to the last focus/HELD lines of the daemon log, labelled as such.
+
 - **Loaded right now** — models resident on each host (live `/api/ps`).
 - **Job table** — status, iteration/throughput, elapsed; drag to reorder pending
   jobs; pause/resume/promote/cancel.
