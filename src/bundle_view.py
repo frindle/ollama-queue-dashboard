@@ -484,7 +484,7 @@ def is_actionable(key, last_activity, now, attention=None):
     return bool(last_activity) and (now - last_activity) <= ACTIONABLE_DAYS * 86400
 
 
-def bundle_outcome(view, superseded=None):
+def bundle_outcome(view, superseded=None, cancelled=None):
     """PURE. How a bundle with NOTHING LIVE actually ended: "finished" | "failed" |
     "incomplete" | "superseded" (+ the number of failed slices).
 
@@ -501,6 +501,10 @@ def bundle_outcome(view, superseded=None):
                  slice ("bundle#sid"), as replaced by a later bundle/job: a marked
                  bundle that is not finished is "superseded" (not stalled); a marked
                  slice no longer counts as failed/owed
+    A HUMAN-CANCELLED plan (`cancelled`: the plan_cancel.cancelled(label) record) is
+    retired the same way as a superseded one: a deliberate `--cancel` is terminal, so an
+    unfinished cancelled bundle reads "superseded", never "failed"/"incomplete"
+    (replay-endorse sat in Needs-attention for a day after its 2026-10-05 --cancel).
     The caller must only ask this of a bundle that has no live work."""
     sup = superseded or {}
     v = view or {}
@@ -526,7 +530,7 @@ def bundle_outcome(view, superseded=None):
             owed = int(v.get("through") or 0) + sum(
                 1 for s in marked if s.get("phase") != "done") < int(v.get("total") or 0)
         outcome = "incomplete" if owed else "finished"
-    if outcome != "finished" and key in sup:
+    if outcome != "finished" and (key in sup or cancelled):
         return "superseded", bad
     return outcome, bad
 
@@ -684,9 +688,22 @@ def load_view(plan, jobs, runs_dir, chain_dir, log_dir, heal_ledger_path,
         return load_view(label, jobs, runs_dir, chain_dir, log_dir, heal_ledger_path,
                          preflight_ledger_dir, progress_recs, alive, now, _seen)
 
-    return build_view(plan, state, jobs, now=now, verdict_of=verdict_of,
+    view = build_view(plan, state, jobs, now=now, verdict_of=verdict_of,
                       result_of=result_of, progress=progress_recs, chain=chain,
                       heal_ledger=heal, preflight_of=preflight_of, sub_view=sub_view)
+    # A HUMAN-cancelled plan (plan_cancel marker) is terminal: its escalated/failed slices
+    # are retired, not owed -- no Needs-attention flag (replay-endorse showed "2 failed"
+    # a day after its --cancel).
+    try:
+        import plan_cancel as _pc
+        canc = _pc.cancelled(plan, runs_dir=runs_dir)
+    except Exception:
+        canc = None
+    if view and canc:
+        view["cancelled"] = True
+        for r in view.get("slices") or []:
+            r["attention"] = False
+    return view
 
 
 # ---------------------------------------------------------------------------
