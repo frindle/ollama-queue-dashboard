@@ -411,9 +411,55 @@ def build_view(plan, state, jobs, now=None, verdict_of=None, result_of=None,
             "slices": rows}
 
 
-def bundle_outcome(view):
+# --- superseded / retired marker -------------------------------------------------------
+# A failed/stalled bundle (or one failed slice) that a LATER bundle/job replaced keeps
+# reading "failed" forever. `qctl supersede` records it here; bundle_outcome() then
+# reports "superseded" and the dashboard excludes it from the Stalled count.
+# Keys: "<bundle>" (whole bundle) or "<bundle>#<slice-id>" (one slice).
+def superseded_path():
+    return Path(os.environ.get("OLLAMA_SUPERSEDED_FILE")
+                or Path.home() / ".ollama-dispatch" / "bundle-superseded.json")
+
+
+def load_superseded(path=None):
+    try:
+        d = json.loads(Path(path or superseded_path()).read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_superseded(d, path=None):
+    p = Path(path or superseded_path())
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(d, indent=1, sort_keys=True))
+    os.replace(tmp, p)
+
+
+def mark_superseded(bundle, by, reason, slice_id=None, path=None, now=None):
+    if not (bundle and by and (reason or "").strip()):
+        raise ValueError("bundle, superseded-by and a reason are all required")
+    d = load_superseded(path)
+    key = f"{bundle}#{slice_id}" if slice_id else bundle
+    d[key] = {"by": by, "reason": reason.strip(),
+              "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now or time.time()))}
+    _save_superseded(d, path)
+    return key
+
+
+def unmark_superseded(bundle, slice_id=None, path=None):
+    d = load_superseded(path)
+    key = f"{bundle}#{slice_id}" if slice_id else bundle
+    found = d.pop(key, None) is not None
+    if found:
+        _save_superseded(d, path)
+    return found
+
+
+def bundle_outcome(view, superseded=None):
     """PURE. How a bundle with NOTHING LIVE actually ended: "finished" | "failed" |
-    "incomplete" (+ the number of failed slices).
+    "incomplete" | "superseded" (+ the number of failed slices).
 
     ROOT CAUSE this closes (Penn 2026-10-06, "considered finished but have failed
     flags"): the finished list was "every bundle with no queue row left", i.e.
@@ -424,23 +470,38 @@ def bundle_outcome(view):
                  split slice's sub-view) -- stalled on a failure, needs a look
       incomplete nothing failed but slices are still owed (through < total) and nothing
                  is live to run them -- also stalled, never finished
+      superseded `superseded` (load_superseded()) marks the whole bundle, or a failed
+                 slice ("bundle#sid"), as replaced by a later bundle/job: a marked
+                 bundle that is not finished is "superseded" (not stalled); a marked
+                 slice no longer counts as failed/owed
     The caller must only ask this of a bundle that has no live work."""
-    def _bad(slices):
-        n = 0
+    sup = superseded or {}
+    v = view or {}
+    key = v.get("key")
+
+    def _walk(slices, acc):
         for s in slices or []:
             sub = s.get("sub")
             if isinstance(sub, dict) and sub.get("slices"):
-                n += _bad(sub["slices"])
-            elif s.get("attention") or s.get("phase") in ATTENTION_PHASES:
-                n += 1
-        return n
-    v = view or {}
-    bad = _bad(v.get("slices"))
+                _walk(sub["slices"], acc)
+            else:
+                acc.append(s)
+        return acc
+    leaves = _walk(v.get("slices"), [])
+    marked = [s for s in leaves if f"{key}#{s.get('sid')}" in sup]
+    bad = sum(1 for s in leaves if s not in marked
+              and (s.get("attention") or s.get("phase") in ATTENTION_PHASES))
     if bad:
-        return "failed", bad
-    if int(v.get("through") or 0) < int(v.get("total") or 0):
-        return "incomplete", 0
-    return "finished", 0
+        outcome = "failed"
+    else:
+        owed = int(v.get("through") or 0) < int(v.get("total") or 0)
+        if owed and marked:   # a retired slice is not owed
+            owed = int(v.get("through") or 0) + sum(
+                1 for s in marked if s.get("phase") != "done") < int(v.get("total") or 0)
+        outcome = "incomplete" if owed else "finished"
+    if outcome != "finished" and key in sup:
+        return "superseded", bad
+    return outcome, bad
 
 
 _CHILD_RE = re.compile(r"^(?:(?:re)?gate|secondop)-([0-9a-f]{6,})")

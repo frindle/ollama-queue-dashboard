@@ -3243,7 +3243,8 @@ async function refresh() {
     const stalledN = (fb.stalled || []).length;
     document.getElementById('finishedSummary').innerHTML = `<b>Finished bundles</b>
       <span class="count" style="color:var(--muted)">${views.length} of ${fb.total || 0} &middot; all slices done &middot; ${age}, newest first</span>
-      ${stalledN ? `<span class="chip bad">${stalledN} stalled/failed (listed above, not finished)</span>` : ''}`;
+      ${stalledN ? `<span class="chip bad">${stalledN} stalled/failed (listed above, not finished)</span>` : ''}
+      ${(fb.superseded || []).length ? `<span class="chip" title="replaced by a later bundle/job (qctl supersede); not counted as stalled">${fb.superseded.length} superseded</span>` : ''}`;
     const tools = document.getElementById('finishedTools');
     tools.innerHTML = `<button class="btn" data-fb-age>${finishedDays ? 'show all ages' : 'last 3 days only'}</button>
       ${fb.has_more ? '<button class="btn" data-fb-more>show more</button>' : ''}
@@ -5940,7 +5941,8 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
     except (TypeError, ValueError):
         limit, offset = FINISHED_BUNDLE_PAGE, 0
     out = {"views": [], "total": 0, "days": days, "limit": limit, "offset": offset,
-           "has_more": False, "stalled": [], "stalled_total": 0}
+           "has_more": False, "stalled": [], "stalled_total": 0,
+           "superseded": [], "superseded_total": 0}
     if state is None:
         with q._Locked() as lock:
             state = lock.load()
@@ -6003,6 +6005,8 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         except Exception:
             return {}
 
+    sup = bv.load_superseded()   # `qctl supersede` markers (read each call: tiny file)
+
     def build(k):
         recs = members[k]
         v = None
@@ -6020,7 +6024,7 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         if not v:
             return None
         starts = [h.get("launched_at") for h in recs if h.get("launched_at")]
-        outcome, nbad = bv.bundle_outcome(v)
+        outcome, nbad = bv.bundle_outcome(v, sup)
         # FINISHED = every slice done/landed/skipped. A bundle with nothing live that
         # failed (or still owes slices) is STALLED, not finished (Penn 2026-10-06).
         v.update(finished=(outcome == "finished"), outcome=outcome, failed_slices=nbad,
@@ -6045,13 +6049,18 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
     # not age out of sight), so every bundle is classified; views are memoised briefly
     # because that means building them all.
     ordered = sorted(members, key=lambda k: -last[k])
-    stalled, fin_keys = [], []
+    stalled, fin_keys, superseded = [], [], []
     in_window = lambda k: cutoff is None or last[k] >= cutoff
     for k in ordered:
         v = view_of(k)
         if not v:
             continue
-        if v["outcome"] != "finished":
+        # markers can change inside the memo TTL: classify from the live marker set
+        v["outcome"], v["failed_slices"] = bv.bundle_outcome(v, sup)
+        v["finished"] = v["outcome"] == "finished"
+        if v["outcome"] == "superseded":
+            superseded.append({"key": k, **(sup.get(k) or {})})
+        elif v["outcome"] != "finished":
             stalled.append(v)
         elif in_window(k):
             fin_keys.append(k)
@@ -6061,6 +6070,8 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         out["views"].append(view_of(k))
     out["stalled"] = stalled
     out["stalled_total"] = len(stalled)
+    out["superseded"] = superseded
+    out["superseded_total"] = len(superseded)
     return out
 
 
