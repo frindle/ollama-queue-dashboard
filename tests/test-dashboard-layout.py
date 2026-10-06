@@ -10,7 +10,7 @@ Chrome loads it, runs the page's own JS, and dumps the DOM. We then assert:
   * Needs attention holds exactly the failed bundle, the parked bundle and the failed
     standalone job, each with its one-line reason and its primary action;
   * the Queue holds the healthy bundles and jobs (and none of the stuck ones);
-  * Finished bundles is collapsed, grouped by day, and names the failed one;
+  * Finished bundles is collapsed and grouped by day; a failed bundle is in the Stalled panel, never Finished;
   * no action was lost: every data-* control hook and every API endpoint the page had
     before the redesign is still in the page, and every hook the fixtures can reach is
     actually rendered;
@@ -139,8 +139,10 @@ def fixtures(now):
         "key": key, "through": 2, "total": 2, "current": None, "unit": "slices", "finished": True,
         "last_activity": ts, "first_activity": ts - 600, "runs": 4,
         "slices": [sl("s1-a", "done"), sl("s2-b", "escalated" if bad else "done", bad, "gate FAIL")]}
-    history = {"views": [fin("fin-today-ok", now - 30), fin("fin-today-bad", now - 40, True),
-                         fin("fin-yesterday", yesterday_noon)],
+    bad = fin("fin-today-bad", now - 40, True)
+    bad.update(finished=False, outcome="failed", failed_slices=1, through=1)
+    history = {"views": [fin("fin-today-ok", now - 30), fin("fin-yesterday", yesterday_noon)],
+               "stalled": [bad], "stalled_total": 1,
                "total": 7, "days": 3, "limit": 20, "offset": 0, "has_more": True}
     return {"/api/jobs": jobs,
             "/api/bundle-views": {"views": views, "activity": activity, "active": "fx-run"},
@@ -309,7 +311,7 @@ def main():
     check("summary: off-GPU activity is named too", "verify-relevance mutants 3/12" in now_t, True)
     check("summary: queue depth counts pending + paused + planned", t("sumQueue").startswith("Queue 7"), True)
     check("summary: needs-attention count and breakdown",
-          t("sumAttn").replace(" ", ""), "Needsattention32failed·1parked")
+          t("sumAttn").replace(" ", ""), "Needsattention42failed·1parked·1stalled(bundles)")
 
     # --- needs attention ------------------------------------------------------------
     attn = t("attnTable")
@@ -342,9 +344,12 @@ def main():
     fin = t("finishedPanel")
     check("finished: collapsed by default", doc.open_by_id.get("finishedDetails"), False)
     check("finished: grouped by day (Today, Yesterday)",
-          ("Today · 2" in fin and "Yesterday · 1" in fin), True)
-    check("finished: the failed one is surfaced in the collapsed summary",
-          ("1 with failed slices" in t("finishedSummary") and "fin-today-bad" in t("finishedSummary")), True)
+          ("Today · 1" in fin and "Yesterday · 1" in fin), True)
+    check("finished: a failed bundle is NOT in the finished list, it is in the stalled panel",
+          ("fin-today-bad" not in t("finishedPanel") and "fin-today-bad" in t("stalledPanel")
+           and "1 stalled/failed" in t("finishedSummary")), True)
+    check("stalled bundles are counted in the status header",
+          "stalled" in t("sumAttn"), True)
 
     # --- every reachable action hook is actually rendered ----------------------------
     rendered = {a for a in doc.attrs if a.startswith("data-")}

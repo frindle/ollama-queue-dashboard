@@ -411,6 +411,38 @@ def build_view(plan, state, jobs, now=None, verdict_of=None, result_of=None,
             "slices": rows}
 
 
+def bundle_outcome(view):
+    """PURE. How a bundle with NOTHING LIVE actually ended: "finished" | "failed" |
+    "incomplete" (+ the number of failed slices).
+
+    ROOT CAUSE this closes (Penn 2026-10-06, "considered finished but have failed
+    flags"): the finished list was "every bundle with no queue row left", i.e.
+    FINISHED meant NOTHING LIVE, so a bundle whose slice FAILED (or ended / needs_opus)
+    and was never retried sat in Finished, "2/3", flagged failed. FINISHED now means
+    every slice done (or skipped/retired, which slice_phase already maps to "done").
+      failed     any slice failed/escalated/ended (attention, recursively through a
+                 split slice's sub-view) -- stalled on a failure, needs a look
+      incomplete nothing failed but slices are still owed (through < total) and nothing
+                 is live to run them -- also stalled, never finished
+    The caller must only ask this of a bundle that has no live work."""
+    def _bad(slices):
+        n = 0
+        for s in slices or []:
+            sub = s.get("sub")
+            if isinstance(sub, dict) and sub.get("slices"):
+                n += _bad(sub["slices"])
+            elif s.get("attention") or s.get("phase") in ATTENTION_PHASES:
+                n += 1
+        return n
+    v = view or {}
+    bad = _bad(v.get("slices"))
+    if bad:
+        return "failed", bad
+    if int(v.get("through") or 0) < int(v.get("total") or 0):
+        return "incomplete", 0
+    return "finished", 0
+
+
 _CHILD_RE = re.compile(r"^(?:(?:re)?gate|secondop)-([0-9a-f]{6,})")
 
 

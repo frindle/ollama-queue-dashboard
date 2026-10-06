@@ -1631,6 +1631,14 @@ FRONTEND_HTML = r"""<!doctype html>
   <div class="empty" id="activeEmpty" hidden>The queue is empty.</div></div>
 </section>
 
+<section class="panel" id="stalledPanel" hidden>
+  <div class="list"><details class="fin" id="stalledDetails" open>
+    <summary id="stalledSummary"><b>Stalled / failed bundles</b></summary>
+    <div class="empty" style="padding:.4rem .8rem;color:var(--muted)">Nothing is running for these and they did NOT finish: a slice failed or ended, or slices are still owed. Never aged out; they stay until fixed or cleared.</div>
+    <table class="q" id="stalledTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  </details></div>
+</section>
+
 <section class="panel" id="finishedPanel">
   <div class="list"><details class="fin" id="finishedDetails">
     <summary id="finishedSummary"><b>Finished bundles</b></summary>
@@ -1729,6 +1737,7 @@ FRONTEND_HTML = r"""<!doctype html>
 const activeBody = document.querySelector('#jobs tbody');
 const attnBody = document.querySelector('#attnTable tbody');
 const finBody = document.querySelector('#finishedTable tbody');
+const stalledBody = document.querySelector('#stalledTable tbody');
 let tbody = activeBody;
 let dragId = null;
 let dragStartedAt = null;
@@ -1749,8 +1758,9 @@ let bundleViews = {views: {}, activity: [], active: null};
 // FINISHED bundles (the user 2026-10-05): bundles with no queue row left, each with its
 // full per-slice history, newest activity first. Paged + age-bounded server-side
 // (/api/bundle-history); "show all ages" drops the age window, "show more" pages on.
-let finishedBundles = {views: [], total: 0, has_more: false};
+let finishedBundles = {views: [], total: 0, has_more: false, stalled: [], stalled_total: 0};
 let finishedDays = 3, finishedLimit = 20, finishedFetchedAt = 0;
+let stalledShown = 25;   // the stalled panel is never age-bounded; page it client-side
 
 const transitioning = {};  // jobId -> {type: 'pausing'|'starting', since: timestamp}, client-side
                             // only visual feedback for the daemon's real ~15-30s pause/relaunch
@@ -2138,15 +2148,19 @@ function renderSummary(jobs, acts, attnStats, q) {
   document.getElementById('sumQueue').innerHTML = `<div class="k">Queue</div>
     <div class="v">${pend + paused + planned}</div>
     <div class="s">${pend} pending${paused ? ' &middot; ' + paused + ' paused' : ''} &middot; ${planned} planned</div>`;
-  const nA = attnStats.failed + attnStats.parked + attnStats.blocked;
-  const brk = ['failed', 'parked', 'blocked'].filter(k => attnStats[k]).map(k => attnStats[k] + ' ' + k).join(' &middot; ');
+  const nA = attnStats.failed + attnStats.parked + attnStats.blocked + (attnStats.stalled || 0);
+  const nList = nA - (attnStats.stalled || 0);
+  const brk = ['failed', 'parked', 'blocked', 'stalled'].filter(k => attnStats[k]).map(k => attnStats[k] + ' ' + k).join(' &middot; ');
   const at = document.getElementById('sumAttn');
   at.classList.toggle('has', nA > 0);
   at.innerHTML = `<div class="k">Needs attention</div><div class="v">${nA}</div>
-    <div class="s">${nA ? brk : 'nothing stuck'}</div>`;
+    <div class="s">${nA ? brk + (attnStats.stalled ? ' (bundles)' : '') : 'nothing stuck'}</div>`;
   document.getElementById('attnCount').textContent = nA ? String(nA) : '';
-  document.getElementById('attnList').hidden = !nA;
-  document.getElementById('attnEmpty').hidden = !!nA;
+  document.getElementById('attnList').hidden = !nList;
+  document.getElementById('attnEmpty').hidden = !!nList;
+  document.querySelector('#attnEmpty .empty').textContent = attnStats.stalled
+    ? attnStats.stalled + ' stalled/failed bundle' + (attnStats.stalled === 1 ? '' : 's') + ' (nothing live, not finished): see "Stalled / failed bundles" below.'
+    : 'Nothing is stuck. Failed, parked and blocked work shows up here.';
   document.getElementById('activeCount').textContent =
     `${q.bundles} bundle${q.bundles === 1 ? '' : 's'} · ${q.jobs} job${q.jobs === 1 ? '' : 's'}`;
   document.getElementById('activeEmpty').hidden = !!(q.bundles || q.jobs);
@@ -2279,7 +2293,7 @@ async function refresh() {
   // strip's "Running now" tile (renderSummary), each job naming ITS OWN bundle.
   const acts = (bundleViews.activity || []);
   // Needs-attention bookkeeping, filled while the bundles render below.
-  const attnStats = {failed: 0, parked: 0, blocked: 0};
+  const attnStats = {failed: 0, parked: 0, blocked: 0, stalled: ((finishedBundles || {}).stalled || []).length};
   let activeBundles = 0, activeJobs = 0;
   // ONE definition of a queue row, used for both a top-level (standalone) row and a
   // plan's child row -- the child only differs by an indent class, so every per-row
@@ -3164,6 +3178,7 @@ async function refresh() {
     }
     tbody = activeBody;
   }
+  renderStalledBundles(renderSliceLines);
   tbody = finBody;
   renderFinishedBundles(renderSliceLines);
   tbody = activeBody;
@@ -3178,15 +3193,57 @@ async function refresh() {
   // grouped by the day of their last activity, newest first; any bundle with a failed
   // slice is named in the collapsed summary so it is never hidden. Open a bundle for
   // the same per-slice lines + full history the live bundles get. Read-only.
+  function renderStalledBundles(renderSlices) {
+    // STALLED / FAILED bundles: nothing live, but NOT finished (a slice failed/ended or
+    // slices are still owed). Their own panel + count, never aged out (Penn 2026-10-06).
+    const allStalled = (finishedBundles || {}).stalled || [];
+    const views = allStalled.slice(0, stalledShown);
+    const panel = document.getElementById('stalledPanel');
+    panel.hidden = !allStalled.length;
+    document.getElementById('stalledSummary').innerHTML = `<b>Stalled / failed bundles</b>
+      <span class="count" style="color:var(--muted)">${views.length} of ${allStalled.length} &middot; all ages, newest first</span>
+      <span class="chip bad">${allStalled.length} not finished</span>
+      ${allStalled.length > stalledShown ? '<button class="btn" data-st-more>show 25 more</button>' : ''}
+      ${stalledShown > 25 ? '<button class="btn" data-st-less>show fewer</button>' : ''}`;
+    const sm = document.querySelector('#stalledSummary [data-st-more]');
+    if (sm) sm.addEventListener('click', ev => { ev.preventDefault(); ev.stopPropagation(); stalledShown += 25; refresh(); });
+    const sf = document.querySelector('#stalledSummary [data-st-less]');
+    if (sf) sf.addEventListener('click', ev => { ev.preventDefault(); ev.stopPropagation(); stalledShown = 25; refresh(); });
+    const sb = stalledBody;   // renderSlices appends to the shared `tbody`, so point it here
+    sb.innerHTML = '';
+    tbody = sb;
+    for (const view of views) {
+      const fkey = 'stalled:' + view.key;
+      const open = !!planExpanded[fkey];
+      const bad = view.failed_slices || 0;
+      const label = view.outcome === 'incomplete' ? 'incomplete' : 'failed';
+      const when = view.last_activity ? new Date(view.last_activity * 1000) : null;
+      const ftr = document.createElement('tr');
+      ftr.className = 'queue-parent finished-bundle queue-parent-alert needs-attn';
+      ftr.innerHTML = `
+        <td>${open ? '&#9662;' : '&#9656;'}</td>
+        <td><span class="proj-name">${escapeHtml(view.key)}</span><span class="chip m-chip failed">${label}</span>
+          <div class="sub">${progHtml(view.through, view.total, view.unit || 'slices', '')}
+          <span class="plan-alert">&#9888; ${bad ? bad + ' failed' : 'slices still owed, nothing running'}</span>
+          <span class="proj-summary">${view.runs || 0} runs &middot; ${escapeHtml(dayLabel(view.last_activity))}</span></div></td>
+        <td class="st"><span class="chip status-failed failed">${label}</span></td>
+        <td class="when" title="${when ? escapeHtml(when.toLocaleString()) : ''}">${when ? when.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : ''}</td><td></td>`;
+      ftr.addEventListener('click', () => { planExpanded[fkey] = !open; saveExpandState(); refresh(); });
+      sb.appendChild(ftr);
+      if (open && view.slices && view.slices.length) renderSlices({key: view.key, children: []}, view);
+    }
+  }
   function renderFinishedBundles(renderSlices) {
     const fb = finishedBundles || {};
-    const views = fb.views || [];
+    const views = (fb.views || []).filter(x => x.finished !== false);
     const age = finishedDays ? `last ${finishedDays} days` : 'all ages';
-    const failedViews = views.filter(v => (v.slices || []).some(x => x.attention));
+    // The server only lists a bundle here when EVERY slice is done/landed/skipped;
+    // anything failed or incomplete is in the Stalled / failed panel (never aged out).
+    // Defence in depth: a view that is not `finished` is never counted as one.
+    const stalledN = (fb.stalled || []).length;
     document.getElementById('finishedSummary').innerHTML = `<b>Finished bundles</b>
-      <span class="count" style="color:var(--muted)">${views.length} of ${fb.total || 0} &middot; ${age}, newest first</span>
-      ${failedViews.length ? `<span class="chip bad">${failedViews.length} with failed slices</span>
-        <span class="fail-list">${failedViews.slice(0, 4).map(v => escapeHtml(v.key)).join(', ')}${failedViews.length > 4 ? ', &hellip;' : ''}</span>` : ''}`;
+      <span class="count" style="color:var(--muted)">${views.length} of ${fb.total || 0} &middot; all slices done &middot; ${age}, newest first</span>
+      ${stalledN ? `<span class="chip bad">${stalledN} stalled/failed (listed above, not finished)</span>` : ''}`;
     const tools = document.getElementById('finishedTools');
     tools.innerHTML = `<button class="btn" data-fb-age>${finishedDays ? 'show all ages' : 'last 3 days only'}</button>
       ${fb.has_more ? '<button class="btn" data-fb-more>show more</button>' : ''}
@@ -5864,12 +5921,15 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
 # `has_more` so the UI can offer "show more" / "show all".
 FINISHED_BUNDLE_DAYS = 3
 FINISHED_BUNDLE_PAGE = 20
+_FIN_VIEW_MEMO = {}          # (key, last_activity, runs) -> (monotonic ts, view); live path only
+_FIN_VIEW_MEMO_TTL = 600.0   # a full rebuild of every bundle takes ~10s cold; keyed on last_activity+runs, so new work busts it
 
 
 def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE,
                            offset=0, state=None, history=None, runs_dir=None,
                            log_dir=None, chain_dir=None, now=None):
     now = time.time() if now is None else now
+    state_arg, history_arg = state, history
     try:
         days = max(0.0, float(days))
     except (TypeError, ValueError):
@@ -5880,7 +5940,7 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
     except (TypeError, ValueError):
         limit, offset = FINISHED_BUNDLE_PAGE, 0
     out = {"views": [], "total": 0, "days": days, "limit": limit, "offset": offset,
-           "has_more": False}
+           "has_more": False, "stalled": [], "stalled_total": 0}
     if state is None:
         with q._Locked() as lock:
             state = lock.load()
@@ -5930,10 +5990,6 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         members.setdefault(k, []).append(h)
         last[k] = max(last.get(k, 0), h.get("finished_at") or 0)
     cutoff = now - days * 86400 if days else None
-    keys = sorted((k for k in members if cutoff is None or last[k] >= cutoff),
-                  key=lambda k: -last[k])
-    out["total"] = len(keys)
-    out["has_more"] = offset + limit < len(keys)
     heal_path = Path.home() / ".ollama-dispatch" / "escalations" / "self-heal.json"
     preflight_dir = Path(os.environ.get("OLLAMA_PREFLIGHT_LEDGER",
                                         q.LOG_DIR / "preflight-ledger"))
@@ -5946,7 +6002,8 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
             return {"label": json.loads((log_dir / f"{i}.done.json").read_text()).get("label")}
         except Exception:
             return {}
-    for k in keys[offset:offset + limit]:
+
+    def build(k):
         recs = members[k]
         v = None
         try:
@@ -5961,11 +6018,49 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
             except Exception:
                 v = None
         if not v:
-            continue
+            return None
         starts = [h.get("launched_at") for h in recs if h.get("launched_at")]
-        v.update(finished=True, last_activity=last[k],
+        outcome, nbad = bv.bundle_outcome(v)
+        # FINISHED = every slice done/landed/skipped. A bundle with nothing live that
+        # failed (or still owes slices) is STALLED, not finished (Penn 2026-10-06).
+        v.update(finished=(outcome == "finished"), outcome=outcome, failed_slices=nbad,
+                 last_activity=last[k],
                  first_activity=min(starts) if starts else None, runs=len(recs))
-        out["views"].append(v)
+        return v
+
+    live_path = state_arg is None and history_arg is None
+    memo = _FIN_VIEW_MEMO if live_path else {}
+    for mk in [mk for mk, (t, _v) in memo.items() if time.monotonic() - t > _FIN_VIEW_MEMO_TTL]:
+        memo.pop(mk, None)
+
+    def view_of(k):
+        mk = (k, last[k], len(members[k]))
+        hit = memo.get(mk)
+        if hit and time.monotonic() - hit[0] <= _FIN_VIEW_MEMO_TTL:
+            return hit[1]
+        v = build(k)
+        memo[mk] = (time.monotonic(), v)
+        return v
+    # Stalled bundles are NEVER bounded by the age window or the page (a failure must
+    # not age out of sight), so every bundle is classified; views are memoised briefly
+    # because that means building them all.
+    ordered = sorted(members, key=lambda k: -last[k])
+    stalled, fin_keys = [], []
+    in_window = lambda k: cutoff is None or last[k] >= cutoff
+    for k in ordered:
+        v = view_of(k)
+        if not v:
+            continue
+        if v["outcome"] != "finished":
+            stalled.append(v)
+        elif in_window(k):
+            fin_keys.append(k)
+    out["total"] = len(fin_keys)
+    out["has_more"] = offset + limit < len(fin_keys)
+    for k in fin_keys[offset:offset + limit]:
+        out["views"].append(view_of(k))
+    out["stalled"] = stalled
+    out["stalled_total"] = len(stalled)
     return out
 
 
