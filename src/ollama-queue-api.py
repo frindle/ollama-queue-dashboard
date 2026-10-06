@@ -747,6 +747,13 @@ def _needs_attention_ids(rows, state_of=None, log_dir=None,
         if not r.get("id") or r.get("id") in (superseded or ()):
             continue
         gk = r.get("group_key") or None
+        if gk:   # a human-cancelled plan is terminal: its rows raise no alarm
+            try:
+                import plan_cancel as _pc
+                if _pc.cancelled(gk):
+                    continue
+            except Exception:
+                pass
         base = _slice_base_label(r.get("label"))
         s = None
         if gk and base and state_of is not None:
@@ -1794,6 +1801,7 @@ let planExpanded = {};
 // planExpanded. Absent key = the default (open only for failed/escalated slices).
 let sliceExpanded = {};
 let bundleViews = {views: {}, activity: [], active: null};
+let queueWait = null;   // last /api/queue-wait payload, read by the idle tile
 // FINISHED bundles (the user 2026-10-05): bundles with no queue row left, each with its
 // full per-slice history, newest activity first. Paged + age-bounded server-side
 // (/api/bundle-history); "show all ages" drops the age window, "show more" pages on.
@@ -2178,6 +2186,24 @@ function renderWaitBanner(w, jobs) {
   el.innerHTML = lines.join('');
 }
 
+// "Running now" tile, idle case: ONE short plain line saying what the queue is waiting on.
+// Daemon state reason when it is live; else derived from API data (the committed bundle, the
+// pending count). NEVER daemon-log text (the log's HELD/focus lines can be stale).
+function idleWaitText(w, jobs, activeKey) {
+  const pend = (jobs || []).filter(j => j.status === 'pending' || j.status === 'held');
+  if (!pend.length) return 'Queue empty';
+  if (w && w.source === 'state') {
+    const out = [];
+    for (const ln of Object.values(w.lanes || {})) {
+      const s = ln && ln.state === 'idle' && ln.pending && ln.reason && ln.reason.sentence;
+      if (s && !out.includes(s)) out.push(s);
+    }
+    if (out.length) return 'Waiting on: ' + out.join(' | ');
+  }
+  if (activeKey) return 'Waiting on: bundle ' + activeKey + ' to finish';
+  return 'Waiting on: queued work (reason shows after the next daemon restart)';
+}
+
 function renderSummary(jobs, acts, attnStats, q) {
   const gpu = (acts || []).filter(a => a.kind === 'gpu');
   const other = (acts || []).filter(a => a.kind !== 'gpu');
@@ -2209,6 +2235,7 @@ function renderSummary(jobs, acts, attnStats, q) {
   } else {
     now.innerHTML = `<div class="k"><span class="idle-dot"></span>Running now</div>
       <div class="now-job" style="color:var(--muted);font-weight:500">Nothing on the GPU</div>
+      <div class="now-more" id="idleWait">${escapeHtml(idleWaitText(queueWait, jobs, bundleViews.active))}</div>
       ${other.length ? `<div class="now-more">Off-GPU, live now: ${other.map(fmtAct).join(' &middot; ')}</div>` : ''}`;
     now.style.cursor = ''; now.onclick = null; now.title = '';
   }
@@ -2282,7 +2309,7 @@ async function refresh() {
     fetch('/api/queue-wait').catch(() => null)]);
   checkFrontendVersion(res);   // an open tab notices a new build and reloads once
   const jobs = await res.json();
-  try { if (qwRes && qwRes.ok) renderWaitBanner(await qwRes.json(), jobs); } catch (e) { /* keep last */ }
+  try { if (qwRes && qwRes.ok) { queueWait = await qwRes.json(); renderWaitBanner(queueWait, jobs); } } catch (e) { /* keep last */ }
   // Dashboard B: live per-slice truth; an older API (404) just renders as before.
   try { if (bvRes && bvRes.ok) bundleViews = await bvRes.json(); } catch (e) { /* keep last */ }
   try { if (fbRes && fbRes.ok) { finishedBundles = await fbRes.json(); finishedFetchedAt = Date.now(); } }
@@ -6083,6 +6110,14 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
     attn = bv.load_attention()
     sup = bv.load_superseded()   # `qctl supersede` markers (read each call: tiny file)
 
+    def _plan_cancel_rec(k):
+        # a human `ollama-dispatch-slice --cancel` marker is terminal (plan_cancel)
+        try:
+            import plan_cancel as _pc
+            return _pc.cancelled(k, runs_dir=runs_dir)
+        except Exception:
+            return None
+
     def build(k):
         recs = members[k]
         v = None
@@ -6100,7 +6135,7 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         if not v:
             return None
         starts = [h.get("launched_at") for h in recs if h.get("launched_at")]
-        outcome, nbad = bv.bundle_outcome(v, sup)
+        outcome, nbad = bv.bundle_outcome(v, sup, _plan_cancel_rec(k))
         # FINISHED = every slice done/landed/skipped. A bundle with nothing live that
         # failed (or still owes slices) is STALLED, not finished (Penn 2026-10-06).
         v.update(finished=(outcome == "finished"), outcome=outcome, failed_slices=nbad,
@@ -6132,10 +6167,10 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         if not v:
             continue
         # markers can change inside the memo TTL: classify from the live marker set
-        v["outcome"], v["failed_slices"] = bv.bundle_outcome(v, sup)
+        v["outcome"], v["failed_slices"] = bv.bundle_outcome(v, sup, _plan_cancel_rec(k))
         v["finished"] = v["outcome"] == "finished"
         if v["outcome"] == "superseded":
-            superseded.append({"key": k, **(sup.get(k) or {})})
+            superseded.append({"key": k, **(sup.get(k) or _plan_cancel_rec(k) or {})})
         elif v["outcome"] != "finished":
             v["actionable"] = bv.is_actionable(k, last[k], now, attn)
             stalled.append(v)
