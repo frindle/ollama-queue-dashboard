@@ -1341,6 +1341,36 @@ spec = importlib.util.spec_from_file_location("ollama_queue_lib", QUEUE_PATH)
 q = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(q)
 
+
+def _queue_wait_payload(now=None):
+    """The daemon's own wait state (ollama-queue.py wait_view: the ONE reader `status`
+    shares) for the banner. Never raises; an older queue module degrades to 'unavailable'."""
+    try:
+        v = q.wait_view(now=now)
+    except Exception as e:      # noqa: BLE001 -- a banner is never worth a 500
+        return {"source": "none", "message": f"reason unavailable: {type(e).__name__}",
+                "lanes": {}, "jobs": {}, "stuck": []}
+    for ln in (v.get("lanes") or {}).values():
+        (ln.get("reason") or {}).pop("sig", None)
+    v.pop("jobs", None)
+    return v
+
+
+def _annotate_queue_wait(rows, now=None):
+    """Stamp row['queue_wait'] = {short, code, source} from the daemon's wait state on
+    every pending/held/paused row (new field; only ADDS). No state file -> no field."""
+    try:
+        v = q.wait_view(now=now)
+    except Exception:
+        return rows
+    if v.get("source") != "state":
+        return rows
+    for r in rows:
+        w = (v.get("jobs") or {}).get(r.get("id"))
+        if w and r.get("status") in ("pending", "held", "paused"):
+            r["queue_wait"] = {"short": w.get("short"), "code": w.get("code"), "source": "daemon"}
+    return rows
+
 # handoff-emit.py is loaded as a LIBRARY (not shelled out to) so the unified
 # run-status list reuses its ONE definition of "does this job still need
 # sign-off" (signoff_blocks_acting) and "is this a measurement arm, not a
@@ -1487,6 +1517,13 @@ FRONTEND_HTML = r"""<!doctype html>
   .slice-dot { color: var(--run); animation: slicepulse 1.4s ease-in-out infinite; }
   @keyframes slicepulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
   @media (prefers-reduced-motion: reduce) { .slice-dot, .pulse { animation: none; } }
+  .waitbanner { border: 1px solid var(--warn); background: var(--warn-bg); color: var(--warn);
+    border-radius: 10px; padding: .55rem .8rem; margin: 12px 0; font-size: .85rem; }
+  .waitbanner.stuck { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); font-weight: 650; }
+  .waitbanner .lane { display: block; margin: 2px 0; }
+  .waitbanner .badge { display: inline-block; font-size: .68rem; font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase; padding: 1px 6px; border-radius: 6px; border: 1px solid currentColor; margin-right: 6px; }
+  .waitbanner .log { opacity: .85; font-weight: 400; font-size: .78rem; }
   .wait-reason { color: var(--muted); font-size: .79rem; display: block; margin-top: 2px; }
   span.qpos { font-size: .72rem; color: var(--muted); margin-right: 6px; font-variant-numeric: tabular-nums;
               white-space: nowrap; cursor: help; }
@@ -1616,6 +1653,8 @@ FRONTEND_HTML = r"""<!doctype html>
   <div class="tile" id="sumQueue"><div class="k">Queue</div><div class="v">&ndash;</div></div>
   <div class="tile attn" id="sumAttn"><div class="k">Needs attention</div><div class="v">&ndash;</div></div>
 </div>
+
+<div id="waitBanner" class="waitbanner" hidden></div>
 
 <section class="panel" id="attnPanel">
   <div class="panel-head"><h2>Needs attention</h2><span class="count" id="attnCount"></span></div>
@@ -2109,6 +2148,36 @@ function bundleAttention(g, view, kind) {
   return {reason: `${c.label}: ${failReason(c)}`, logId: c.id, logLabel: c.label};
 }
 // Summary strip: running now / queue depth / needs attention, plus section counts.
+// "Waiting on" banner: one line per lane that is IDLE while work is pending, from the
+// daemon's queue-wait.json. RED when the same reason has held an idle lane > stuck_after_s.
+function renderWaitBanner(w, jobs) {
+  const el = document.getElementById('waitBanner');
+  if (!el) return;
+  const dur = s => { s = Math.max(0, Math.round(s)); return s >= 3600 ? Math.floor(s / 3600) + 'h' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm' : s >= 60 ? Math.floor(s / 60) + 'm' : s + 's'; };
+  const now = w.now || Date.now() / 1000;
+  const lines = [];
+  let stuck = false;
+  if (w.source === 'state') {
+    for (const [lane, ln] of Object.entries(w.lanes || {})) {
+      if (ln.state !== 'idle' || !ln.pending) continue;
+      const r = ln.reason || {};
+      const isStuck = (w.stuck || []).includes(lane);
+      stuck = stuck || isStuck;
+      lines.push(`<span class="lane"><span class="badge">${escapeHtml(lane)} idle ${dur(now - (ln.idle_since || now))}</span>`
+        + `${isStuck ? '<b>POSSIBLE STUCK SEAM (same reason &gt; ' + Math.round((w.stuck_after_s || 300) / 60) + ' min): </b>' : ''}`
+        + `Waiting on: ${escapeHtml(r.sentence || 'reason unknown')} <span class="log">(${ln.pending} pending, same reason ${dur(now - (r.since || now))})</span></span>`);
+    }
+  } else if ((jobs || []).some(j => j.status === 'pending' || j.status === 'held')) {
+    lines.push(`<span class="lane">${escapeHtml(w.message || 'reason unavailable')}</span>`);
+    const lg = w.log || {};
+    if (lg.focus_line) lines.push(`<span class="lane log">from daemon log (last focus line, untimestamped): ${escapeHtml(lg.focus_line)}</span>`);
+    for (const l of (lg.held_lines || [])) lines.push(`<span class="lane log">from daemon log: ${escapeHtml(l)}</span>`);
+  }
+  el.hidden = !lines.length;
+  el.classList.toggle('stuck', stuck);
+  el.innerHTML = lines.join('');
+}
+
 function renderSummary(jobs, acts, attnStats, q) {
   const gpu = (acts || []).filter(a => a.kind === 'gpu');
   const other = (acts || []).filter(a => a.kind !== 'gpu');
@@ -2206,12 +2275,14 @@ async function refresh() {
   if (document.querySelector('details.menu[open]') && Date.now() - menuOpenedAt < 20000) return;
   // finished bundles change slowly: refetch at most every 15s (or right after a control)
   const wantFinished = Date.now() - finishedFetchedAt > 15000;
-  const [res, bvRes, fbRes] = await Promise.all([fetch('/api/jobs'),
+  const [res, bvRes, fbRes, qwRes] = await Promise.all([fetch('/api/jobs'),
     fetch('/api/bundle-views').catch(() => null),
     wantFinished ? fetch('/api/bundle-history?days=' + finishedDays + '&limit=' + finishedLimit)
-      .catch(() => null) : null]);
+      .catch(() => null) : null,
+    fetch('/api/queue-wait').catch(() => null)]);
   checkFrontendVersion(res);   // an open tab notices a new build and reloads once
   const jobs = await res.json();
+  try { if (qwRes && qwRes.ok) renderWaitBanner(await qwRes.json(), jobs); } catch (e) { /* keep last */ }
   // Dashboard B: live per-slice truth; an older API (404) just renders as before.
   try { if (bvRes && bvRes.ok) bundleViews = await bvRes.json(); } catch (e) { /* keep last */ }
   try { if (fbRes && fbRes.ok) { finishedBundles = await fbRes.json(); finishedFetchedAt = Date.now(); } }
@@ -2392,7 +2463,8 @@ async function refresh() {
       }
     }
     // The wait reason is a sentence: it reads under the label, never inside the status chip.
-    const waitHtml = (j.wait_reason && !_t) ? `<span class="wait-reason">${escapeHtml(j.wait_reason)}</span>` : '';
+    const _qw = j.queue_wait && j.queue_wait.short;
+    const waitHtml = ((_qw || j.wait_reason) && !_t) ? `<span class="wait-reason">${_qw ? '<b>Waiting on:</b> ' + escapeHtml(_qw) + (j.wait_reason && j.wait_reason !== _qw ? ' <span style="opacity:.7">&middot; ' + escapeHtml(j.wait_reason) + '</span>' : '') : escapeHtml(j.wait_reason)}</span>` : '';
     const toks = j.tok_s != null ? j.tok_s.toFixed(1) : '';
     // 0:00 for pending (elapsed_s null); live wall-time for running (recomputed
     // server-side from log ctime each refresh); frozen final duration once terminal.
@@ -6212,11 +6284,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The rendered order follows the daemon's OWN focused bundle (read from the
             # same state we just loaded), so a bundle that is first stays first across
             # the gap where its next slice has not been enqueued yet.
-            self._json(_annotate_wait_reason(_annotate_bundle_rank(_annotate_plan_rollup(
+            self._json(_annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_annotate_plan_rollup(
                 _annotate_display_seq(
                     _annotate_job_groups([_job_summary(j, state["jobs"])
                                           for j in state["jobs"]]),
-                    focus_key=_focus_bundle_key(state))), state), state))
+                    focus_key=_focus_bundle_key(state))), state), state)))
+        elif self.path == "/api/queue-wait":
+            # Lane-level "what is the queue waiting on" (daemon queue-wait.json, or the
+            # clearly-labelled daemon-log fallback until the daemon is restarted).
+            self._json(_queue_wait_payload())
         elif self.path == "/api/bundle-views":
             # Dashboard B: one line per slice with its LIVE phase + history, per plan
             # in the queue, and the live off-GPU activity row (see _bundle_views).
