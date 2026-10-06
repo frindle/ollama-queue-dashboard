@@ -347,9 +347,25 @@ def slice_history(sid, s, jobs_for_slice, verdict_of, result_of, heal, preflight
     return out
 
 
+def default_counter_of(plan, sid, s):
+    """THE attempt counter (failure_ledger.slice_counter, shared with the slicer's status text
+    and budget enforcement). None when the ledger module or its data is unavailable --
+    the dashboard must render without it. Only slices that burned author jobs get one."""
+    try:
+        import sys as _sys
+        for d in (Path.home() / "bin", Path(__file__).resolve().parent):
+            if (d / "failure_ledger.py").is_file() and str(d) not in _sys.path:
+                _sys.path.append(str(d))
+        import failure_ledger as _fl
+        c = _fl.slice_counter(plan, sid, s)
+        return c if (c.get("jobs_lifetime") or c.get("attempts")) else None
+    except Exception:
+        return None
+
+
 def build_view(plan, state, jobs, now=None, verdict_of=None, result_of=None,
                progress=None, chain=None, heal_ledger=None, preflight_of=None,
-               sub_view=None):
+               sub_view=None, counter_of=None):
     """PURE given its injectables. The bundle view for slice plan `plan`:
     {key, through, total, current, slices: [{sid, title, status, phase, detail,
     since, elapsed_s, active, attention, history}]}; every slice in `order` appears.
@@ -411,6 +427,7 @@ def build_view(plan, state, jobs, now=None, verdict_of=None, result_of=None,
             "elapsed_s": round(now - since, 1) if since else None,
             "active": phase in ACTIVE_PHASES, "attention": phase in ATTENTION_PHASES,
             "history": hist, "sub": sub,
+            "counter": (counter_of or default_counter_of)(plan, sid, s),
         })
     act = [r for r in rows if r["active"]]
     current = max(act, key=lambda r: (_HEAT.get(r["phase"].split(" ")[0], 1),

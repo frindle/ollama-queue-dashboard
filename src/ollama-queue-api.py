@@ -1806,6 +1806,7 @@ let queueWait = null;   // last /api/queue-wait payload, read by the idle tile
 // full per-slice history, newest activity first. Paged + age-bounded server-side
 // (/api/bundle-history); "show all ages" drops the age window, "show more" pages on.
 let finishedBundles = {views: [], total: 0, has_more: false, stalled: [], stalled_total: 0};
+let triageOpen = {open: 0, repeats: 0};   // /api/triage: open failure-signature triage packets
 let finishedDays = 3, finishedLimit = 20, finishedFetchedAt = 0;
 let stalledShown = 25;   // the stalled panel is never age-bounded; page it client-side
 
@@ -1829,7 +1830,14 @@ function sliceSuffix(sl) {
   const hist = (sl && sl.history) || [];
   const att = hist.reduce((m, h) => Math.max(m, h.attempt || 1), 1);
   const parts = [];
-  if (att > 1) parts.push('attempt ' + att);
+  // ONE attempt counter (failure_ledger.slice_counter, same numbers as `ollama-dispatch-slice
+  // --status` and the budget refusal): author jobs window/budget + lifetime/cap, last cause,
+  // "same cause as <job>". Falls back to the old history-derived count if absent.
+  const ctr = sl && sl.counter;
+  if (ctr) {
+    parts.push('author jobs ' + ctr.jobs_window + '/' + ctr.job_budget + ' (life ' + ctr.jobs_lifetime + '/' + ctr.lifetime_cap + ')' + (ctr.at_cap ? ' AT CAP' : ''));
+    if (ctr.last_signature) parts.push(ctr.last_signature + (ctr.same_as ? ' = same cause as ' + String(ctr.same_as).slice(0, 8) : ''));
+  } else if (att > 1) parts.push('attempt ' + att);
   let rnd = null;
   for (const h of hist) { if ((h.attempt || 1) !== att) continue; const m = /^refining \(round (\d+)\)/.exec(h.kind || ''); if (m) rnd = +m[1]; }
   if (rnd) parts.push('refine r' + rnd);
@@ -2250,7 +2258,7 @@ function renderSummary(jobs, acts, attnStats, q) {
   const at = document.getElementById('sumAttn');
   at.classList.toggle('has', nA > 0);
   at.innerHTML = `<div class="k">Needs attention</div><div class="v">${nA}</div>
-    <div class="s">${nA ? brk + (attnStats.stalled ? ' (bundles)' : '') : 'nothing stuck'}${attnStats.stale ? ` &middot; <a href="#stalledPanel" class="stale-link" style="color:var(--muted)" onclick="var d=document.getElementById('stalledDetails');if(d)d.open=true">stale backlog: ${attnStats.stale}</a>` : ''}</div>`;
+    <div class="s">${nA ? brk + (attnStats.stalled ? ' (bundles)' : '') : 'nothing stuck'}${(triageOpen && triageOpen.open) ? ` &middot; <span title="python3 ~/bin/triage-emit.py --json">triage: ${triageOpen.open} signature${triageOpen.open === 1 ? '' : 's'}${triageOpen.repeats ? ' (' + triageOpen.repeats + ' repeated)' : ''}</span>` : ''}${attnStats.stale ? ` &middot; <a href="#stalledPanel" class="stale-link" style="color:var(--muted)" onclick="var d=document.getElementById('stalledDetails');if(d)d.open=true">stale backlog: ${attnStats.stale}</a>` : ''}</div>`;
   document.getElementById('attnCount').textContent = nA ? String(nA) : '';
   document.getElementById('attnList').hidden = !nList;
   document.getElementById('attnEmpty').hidden = !!nList;
@@ -2302,14 +2310,16 @@ async function refresh() {
   if (document.querySelector('details.menu[open]') && Date.now() - menuOpenedAt < 20000) return;
   // finished bundles change slowly: refetch at most every 15s (or right after a control)
   const wantFinished = Date.now() - finishedFetchedAt > 15000;
-  const [res, bvRes, fbRes, qwRes] = await Promise.all([fetch('/api/jobs'),
+  const [res, bvRes, fbRes, qwRes, trRes] = await Promise.all([fetch('/api/jobs'),
     fetch('/api/bundle-views').catch(() => null),
     wantFinished ? fetch('/api/bundle-history?days=' + finishedDays + '&limit=' + finishedLimit)
       .catch(() => null) : null,
-    fetch('/api/queue-wait').catch(() => null)]);
+    fetch('/api/queue-wait').catch(() => null),
+    fetch('/api/triage').catch(() => null)]);
   checkFrontendVersion(res);   // an open tab notices a new build and reloads once
   const jobs = await res.json();
   try { if (qwRes && qwRes.ok) { queueWait = await qwRes.json(); renderWaitBanner(queueWait, jobs); } } catch (e) { /* keep last */ }
+  try { if (trRes && trRes.ok) triageOpen = await trRes.json(); } catch (e) { /* keep last */ }
   // Dashboard B: live per-slice truth; an older API (404) just renders as before.
   try { if (bvRes && bvRes.ok) bundleViews = await bvRes.json(); } catch (e) { /* keep last */ }
   try { if (fbRes && fbRes.ok) { finishedBundles = await fbRes.json(); finishedFetchedAt = Date.now(); } }
@@ -5873,6 +5883,18 @@ def _livelog_path(job, job_id, live_dir=None, log_dir=None):
     return None
 
 
+def _triage_summary():
+    """{'open': N, 'repeats': M, 'oldest': ts} from the triage handoff index. Never raises."""
+    try:
+        pb = str(QUEUE_PATH.parent)
+        if pb not in sys.path:
+            sys.path.append(pb)
+        import triage_packets as _tp
+        return _tp.open_summary()
+    except Exception:
+        return {"open": 0, "repeats": 0, "oldest": None}
+
+
 def _bundle_view_lib():
     """bundle_view lives next to this file (the repo's src/); dispatch_progress is a
     shared PIPELINE lib (written by preflight / verify-relevance) that stays in the
@@ -6331,6 +6353,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _annotate_job_groups([_job_summary(j, state["jobs"])
                                           for j in state["jobs"]]),
                     focus_key=_focus_bundle_key(state))), state), state)))
+        elif self.path == "/api/triage":
+            # Open failure-signature triage packets (triage_packets.open_summary; read-only,
+            # fail-open: an unreadable index is {"open": 0}).
+            self._json(_triage_summary())
         elif self.path == "/api/queue-wait":
             # Lane-level "what is the queue waiting on" (daemon queue-wait.json, or the
             # clearly-labelled daemon-log fallback until the daemon is restarted).
