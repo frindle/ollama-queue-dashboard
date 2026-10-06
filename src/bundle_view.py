@@ -457,6 +457,33 @@ def unmark_superseded(bundle, slice_id=None, path=None):
     return found
 
 
+# --- actionable vs stale backlog ---------------------------------------------------------
+# The Needs-attention tile counts only ACTIONABLE stalled bundles: recent (<= ACTIONABLE_DAYS
+# since last activity) or listed in the attention file (bundles the triage classified
+# REAL-UNFINISHED / NEEDS-REVIEW). Everything else is the "stale backlog" -- still listed
+# in the Stalled panel, never hidden, just not in the headline.
+ACTIONABLE_DAYS = 7
+
+
+def attention_path():
+    return Path(os.environ.get("OLLAMA_ATTENTION_FILE")
+                or Path.home() / ".ollama-dispatch" / "bundle-attention.json")
+
+
+def load_attention(path=None):
+    try:
+        d = json.loads(Path(path or attention_path()).read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def is_actionable(key, last_activity, now, attention=None):
+    if key in (attention or {}):
+        return True
+    return bool(last_activity) and (now - last_activity) <= ACTIONABLE_DAYS * 86400
+
+
 def bundle_outcome(view, superseded=None):
     """PURE. How a bundle with NOTHING LIVE actually ended: "finished" | "failed" |
     "incomplete" | "superseded" (+ the number of failed slices).

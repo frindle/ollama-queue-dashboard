@@ -2223,7 +2223,7 @@ function renderSummary(jobs, acts, attnStats, q) {
   const at = document.getElementById('sumAttn');
   at.classList.toggle('has', nA > 0);
   at.innerHTML = `<div class="k">Needs attention</div><div class="v">${nA}</div>
-    <div class="s">${nA ? brk + (attnStats.stalled ? ' (bundles)' : '') : 'nothing stuck'}</div>`;
+    <div class="s">${nA ? brk + (attnStats.stalled ? ' (bundles)' : '') : 'nothing stuck'}${attnStats.stale ? ` &middot; <a href="#stalledPanel" class="stale-link" style="color:var(--muted)" onclick="var d=document.getElementById('stalledDetails');if(d)d.open=true">stale backlog: ${attnStats.stale}</a>` : ''}</div>`;
   document.getElementById('attnCount').textContent = nA ? String(nA) : '';
   document.getElementById('attnList').hidden = !nList;
   document.getElementById('attnEmpty').hidden = !!nList;
@@ -2364,7 +2364,8 @@ async function refresh() {
   // strip's "Running now" tile (renderSummary), each job naming ITS OWN bundle.
   const acts = (bundleViews.activity || []);
   // Needs-attention bookkeeping, filled while the bundles render below.
-  const attnStats = {failed: 0, parked: 0, blocked: 0, stalled: ((finishedBundles || {}).stalled || []).length};
+  const attnStats = {failed: 0, parked: 0, blocked: 0, stalled: ((finishedBundles || {}).stalled || []).filter(v => v.actionable !== false).length,
+    stale: ((finishedBundles || {}).stalled || []).filter(v => v.actionable === false).length};
   let activeBundles = 0, activeJobs = 0;
   // ONE definition of a queue row, used for both a top-level (standalone) row and a
   // plan's child row -- the child only differs by an indent class, so every per-row
@@ -3274,7 +3275,8 @@ async function refresh() {
     panel.hidden = !allStalled.length;
     document.getElementById('stalledSummary').innerHTML = `<b>Stalled / failed bundles</b>
       <span class="count" style="color:var(--muted)">${views.length} of ${allStalled.length} &middot; all ages, newest first</span>
-      <span class="chip bad">${allStalled.length} not finished</span>
+      <span class="chip bad">${allStalled.filter(v => v.actionable !== false).length} actionable</span>
+      <span class="chip" style="color:var(--muted)">stale backlog: ${allStalled.filter(v => v.actionable === false).length}</span>
       ${allStalled.length > stalledShown ? '<button class="btn" data-st-more>show 25 more</button>' : ''}
       ${stalledShown > 25 ? '<button class="btn" data-st-less>show fewer</button>' : ''}`;
     const sm = document.querySelector('#stalledSummary [data-st-more]');
@@ -6014,6 +6016,7 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         limit, offset = FINISHED_BUNDLE_PAGE, 0
     out = {"views": [], "total": 0, "days": days, "limit": limit, "offset": offset,
            "has_more": False, "stalled": [], "stalled_total": 0,
+           "stalled_actionable": 0, "stale_total": 0,
            "superseded": [], "superseded_total": 0}
     if state is None:
         with q._Locked() as lock:
@@ -6077,6 +6080,7 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         except Exception:
             return {}
 
+    attn = bv.load_attention()
     sup = bv.load_superseded()   # `qctl supersede` markers (read each call: tiny file)
 
     def build(k):
@@ -6133,6 +6137,7 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         if v["outcome"] == "superseded":
             superseded.append({"key": k, **(sup.get(k) or {})})
         elif v["outcome"] != "finished":
+            v["actionable"] = bv.is_actionable(k, last[k], now, attn)
             stalled.append(v)
         elif in_window(k):
             fin_keys.append(k)
@@ -6142,6 +6147,8 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         out["views"].append(view_of(k))
     out["stalled"] = stalled
     out["stalled_total"] = len(stalled)
+    out["stalled_actionable"] = sum(1 for v in stalled if v.get("actionable"))
+    out["stale_total"] = len(stalled) - out["stalled_actionable"]
     out["superseded"] = superseded
     out["superseded_total"] = len(superseded)
     return out
