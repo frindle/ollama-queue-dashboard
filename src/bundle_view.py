@@ -39,6 +39,7 @@ PHASES = ("pending", "authoring", "refining", "preflight", "queued", "coding", "
 ACTIVE_PHASES = {"authoring", "refining", "preflight", "queued", "coding", "gate",
                  "regate", "self-heal", "escalation-review", "second-opinion"}
 ATTENTION_PHASES = {"escalated", "failed"}
+AUTHOR_ATTEMPT_CAP = 5   # mirrors ollama-dispatch-slice MAX_AUTHOR_ATTEMPTS (display only)
 _LIVE = {"running", "pending", "queued", "scheduled", "held", "paused"}
 # Marks a job dict that load_history() rebuilt from durable files (the queue already
 # pruned its row): rendered as a read-only history line, never as a live queue row.
@@ -248,7 +249,14 @@ def slice_phase(sid, s, plan, jobs_for_slice, verdict_of, progress, chain, heal,
                 t = _ts(last.get("at"))
                 if t and now - t < 30 * 60:
                     return "self-heal", f"{last.get('action')} (attempt {last.get('attempt')})", t
-        return "escalated", str(s.get("escalation_reason") or "")[:160], None
+        # ESCALATED = the chain is STOPPED for a human. Say why AND how much budget it
+        # burned getting here ("author 5/5 attempts, 7/8 jobs"), not just a reason prefix
+        # (2026-10-06: an escalated slice read as an ordinary row with a cut-off sentence).
+        _att = int(s.get("author_attempts") or 0)
+        _jobs = max(0, len(s.get("author_job_ids") or []) - int(s.get("author_jobs_at_retry") or 0))
+        _bud = f" [author {_att}/{AUTHOR_ATTEMPT_CAP} attempts, {_jobs} jobs]" if (_att or _jobs) else ""
+        return ("escalated", "ESCALATED, needs a human: "
+                + str(s.get("escalation_reason") or "(no reason recorded)")[:200] + _bud, None)
     if job_id and st == "enqueued":
         v = (verdict_of(job_id) or "").lower()
         if not v:
