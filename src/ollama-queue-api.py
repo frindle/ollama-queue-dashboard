@@ -34,6 +34,12 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
+# ~/bin holds the sibling helper modules (cpu_lane, ...). This file is a symlink target in the
+# dashboard repo, so Python's script-dir sys.path entry is the repo's src/, not ~/bin.
+_BIN_DIR = os.path.expanduser("~/bin")
+if _BIN_DIR not in sys.path:
+    sys.path.append(_BIN_DIR)
+
 QUEUE_PATH = Path.home() / "bin" / "ollama-queue.py"
 TASKS_DIR = Path.home() / "bin" / "ollama-queue-logs" / "web-tasks"
 PORT = 7684
@@ -1709,6 +1715,15 @@ FRONTEND_HTML = r"""<!doctype html>
 <div class="list tablewrap">
 <table id="runStatus"><thead><tr>
   <th>verdict</th><th>label</th><th>model</th><th>host</th><th>files</th><th>when</th><th>flags</th><th></th>
+</tr></thead><tbody></tbody></table>
+</div>
+</section>
+
+<section class="panel" id="cpuLanePanel">
+<div class="panel-head"><h2>CPU lane</h2><span class="count" id="cpuLaneSummary">Unraid CPU runner (read-only)</span></div>
+<div class="list tablewrap">
+<table id="cpuLaneTable"><thead><tr>
+  <th>state</th><th>stage</th><th>label</th><th>bundle</th><th>runner</th><th>time</th>
 </tr></thead><tbody></tbody></table>
 </div>
 </section>
@@ -3939,10 +3954,39 @@ async function openGateDetail(id, label) {
   }
 }
 
+// CPU lane (read-only): counts, running jobs with runner id, queue depth, recent durations.
+async function refreshCpuLane() {
+  try {
+    const d = await (await fetch('/api/cpu-lane')).json();
+    const panel = document.getElementById('cpuLanePanel');
+    if (!d.enabled) { panel.hidden = true; return; }
+    panel.hidden = false;
+    const c = d.counts || {};
+    const rn = (d.runners || []).filter(r => r.seen_s_ago < 120).length;
+    document.getElementById('cpuLaneSummary').textContent =
+      `${rn} runner(s) online - depth ${d.queue_depth} - running ${c.running || 0} - done ${c.done || 0}` +
+      ` - failed_infra ${c.failed_infra || 0} - local stages ${d.local_stages_active || 0}`;
+    const tb = document.querySelector('#cpuLaneTable tbody');
+    tb.innerHTML = '';
+    const add = (state, j, t) => {
+      const tr = document.createElement('tr');
+      [state, j.stage || '', j.label || j.id.slice(0, 8), j.bundle || '', j.runner || '', t].forEach(v => {
+        const td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
+      tb.appendChild(tr);
+    };
+    (d.running || []).forEach(j => add('running', j, Math.round(j.running_s) + 's'));
+    (d.pending || []).forEach(j => add('pending', j, 'waiting ' + Math.round(j.waiting_s) + 's'));
+    (d.recent || []).forEach(j => add(j.status + (j.exit_code ? ' (exit ' + j.exit_code + ')' : ''), j,
+      (j.duration_s == null ? '' : j.duration_s + 's') + (j.queue_wait_s == null ? '' : ' / wait ' + j.queue_wait_s + 's')));
+  } catch (e) { /* lane is optional */ }
+}
+
 refresh();
 refreshHosts();
 refreshHostSettings();
 refreshRuns();
+refreshCpuLane();
+setInterval(refreshCpuLane, 5000);
 setInterval(refresh, 4000);
 setInterval(refreshHosts, 4000);
 setInterval(refreshRuns, 5000);
@@ -6337,7 +6381,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(out)
 
+    def _cpu_lane(self, method):
+        """/api/cpu/* = the Unraid CPU runner's API. It enforces its OWN bearer token and
+        refuses Cloudflare-fronted requests (cpu_lane.handle); everything else on this
+        server trusts the caller. A broken/missing module only disables the lane."""
+        try:
+            import cpu_lane
+        except Exception as e:  # noqa: BLE001
+            return self._text("cpu lane unavailable: %s" % type(e).__name__, 503)
+        return cpu_lane.handle(self, method)
+
+    def do_PUT(self):
+        _invalidate_response_cache()
+        if self.path.startswith("/api/cpu/"):
+            return self._cpu_lane("PUT")
+        self._text("not found", 404)
+
     def do_GET(self):
+        if self.path.startswith("/api/cpu/"):
+            return self._cpu_lane("GET")
+        if self.path == "/api/cpu-lane":
+            # read-only dashboard feed (no token: same trust as every other dashboard
+            # route, behind Cloudflare Access). Counts and ids only: never the spec/cmd/env.
+            try:
+                import cpu_lane
+                return self._json(cpu_lane.get_store().summary())
+            except Exception as e:  # noqa: BLE001
+                return self._json({"enabled": False, "error": type(e).__name__})
         if self.path == "/chat" or self.path.startswith("/api/chat/"):
             return self._chat("GET")
         if self.path == "/" or self.path == "/index.html":
@@ -6475,6 +6545,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         # Any state change must be visible on the very next poll.
         _invalidate_response_cache()
+        if self.path.startswith("/api/cpu/"):
+            return self._cpu_lane("POST")
         if self.path.startswith("/api/chat/"):
             return self._chat("POST")
         if self.path == "/api/jobs":
@@ -6511,6 +6583,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         _invalidate_response_cache()
+        if self.path.startswith("/api/cpu/"):
+            return self._cpu_lane("DELETE")
         if self.path.startswith("/api/jobs/"):
             _p, _, _qs = self.path[len("/api/jobs/"):].partition("?")
             self._cancel(_p, force="force=1" in _qs.split("&"))
@@ -9376,6 +9450,12 @@ if __name__ == "__main__":
         sys.exit(0 if _self_test() else 1)
     _lim = _raise_fd_limit()
     threading.Thread(target=_retention_loop, name="runstatus-retention", daemon=True).start()
+    try:
+        import cpu_lane
+        cpu_lane.read_token(create=True)      # 0600 random token if absent (never printed)
+        cpu_lane.start_reaper()
+    except Exception as _e:  # noqa: BLE001
+        print(f"[queue-api] cpu lane disabled: {_e!r}", flush=True)
     srv = ThreadingServer((BIND_ADDR, PORT), Handler)
     # flush=True: under launchd stdout is a file, so it is block-buffered and
     # this one-line banner would otherwise sit in the buffer forever (the
