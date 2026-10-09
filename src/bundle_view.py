@@ -574,7 +574,101 @@ def child_parent_id(job):
     return jm.group(1) if jm else None
 
 
-def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None):
+_PASSED_RUNS_MEMO = {}
+
+
+def load_passed_runs(runs_dir=None):
+    """I/O. [(label, bundle, ended_epoch)] for every ended auto-run (~/.ollama-dispatch/
+    auto-runs/*.json) whose outcome is a clean `exit 0`. Best-effort: [] on any error."""
+    out, seen = [], set()
+    d = Path(runs_dir or os.environ.get("OLLAMA_DISPATCH_AUTO_RUNS_DIR")
+             or Path.home() / ".ollama-dispatch" / "auto-runs")
+    hit = _PASSED_RUNS_MEMO.get(str(d))
+    if hit and time.monotonic() - hit[0] < 10:
+        return hit[1]
+    _PASSED_RUNS_MEMO[str(d)] = (time.monotonic(), out)   # filled in place below
+    try:
+        files = sorted(d.glob("*.json"))
+    except Exception:
+        return out
+    for f in files:
+        rec = _read_json(f)
+        if not isinstance(rec, dict):
+            continue
+        for r in list((rec.get("runs") or {}).values()) + [rec]:
+            if not isinstance(r, dict) or not r.get("label") or r.get("phase") != "ended" \
+                    or str(r.get("outcome") or "").strip() != "exit 0":
+                continue
+            t = _ts(r.get("updated_at")) or _ts(r.get("phase_since"))
+            k = (r["label"], r.get("bundle") or r.get("key"), t)
+            if t and k not in seen:
+                seen.add(k)
+                out.append(k)
+    return out
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def load_active_runs(runs_dir=None, alive=None):
+    """I/O. [(label, bundle, step)] for auto-run chains whose driver is ALIVE and still
+    working (no outcome, pid alive, not parked-after-its-last-step). A chain between queue
+    rounds has no live queue row, so without this its bundle reads failed/finished."""
+    alive = alive or _pid_alive
+    out, seen = [], set()
+    d = Path(runs_dir or os.environ.get("OLLAMA_DISPATCH_AUTO_RUNS_DIR")
+             or Path.home() / ".ollama-dispatch" / "auto-runs")
+    try:
+        files = sorted(d.glob("*.json"))
+    except Exception:
+        return out
+    for f in files:
+        rec = _read_json(f)
+        if not isinstance(rec, dict):
+            continue
+        for r in list((rec.get("runs") or {}).values()) + [rec]:
+            if not isinstance(r, dict) or not r.get("label") or r.get("outcome") \
+                    or r.get("phase") == "ended" or not r.get("pid") or not alive(r.get("pid")):
+                continue
+            pk = r.get("parked")
+            if isinstance(pk, dict) and (_ts(pk.get("at")) or 0) >= (_ts(r.get("phase_since")) or 0):
+                continue
+            k = (r["label"], r.get("bundle") or r.get("key"), str(r.get("step") or r.get("phase") or ""))
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+    return out
+
+
+def _attempts_summary(mine, base):
+    """PURE. One compact line for a DONE group that needed several attempts:
+    'passed after 3 attempts: r1 failed (prose_loop) -> r2 failed -> r3 passed'. Failed
+    attempts keep their own failed label; only the final pass is called passed."""
+    works = sorted([x for x in mine if child_parent_id(x) is None and not esc_review_ref(x.get("label"))
+                    and x.get("status") not in _LIVE and x.get("status") != "planned"],
+                   key=lambda x: (_ts(x.get("launched_at")) or _ts(x.get("enqueued_at")) or 0))
+    if len(works) < 2 or not any(x.get("status") not in ("done", "done_unconverged") for x in works):
+        return ""
+    parts = []
+    for x in works:
+        _b, stage, rnd = strip_stage(x.get("label"))
+        tag = (f"r{rnd}" if rnd else stage) if stage != "coding" or rnd else "code"
+        st = "passed" if x.get("status") in ("done", "done_unconverged") else "failed"
+        why = x.get("terminal_reason") if st == "failed" else None
+        parts.append(f"{tag} {st}" + (f" ({why})" if why else ""))
+    if len(parts) > 5:
+        parts = ["..."] + parts[-5:]
+    return f"passed after {len(works)} attempts: " + " -> ".join(parts)
+
+
+def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None, passed_runs=None, active_runs=None):
     """PURE. A bundle made of directly-enqueued JOBS (`--bundle <key>`, no slicer plan):
     one pseudo-slice per non-child job (header "Job . <label>"), with its gate/regate/
     secondop/esc-review rows nested as that pseudo-slice's history -- the same shape as
@@ -599,7 +693,8 @@ def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None):
         if pid not in ids:
             mains.append({"id": pid, "status": "done",
                           "label": (result_of(pid) or {}).get("label") or pid})
-    if not mains:
+    _mine_runs = [a for a in active_runs or [] if a[1] is None or a[1] == key]
+    if not mains and not _mine_runs:
         return None
     # ONE pseudo-slice per FEATURE, not per job (the user 2026-10-05: "the full history of
     # each slice"): auto-author-X, auto-refine-X-rN and the coding job X are the
@@ -646,11 +741,84 @@ def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None):
             through += 1
         since = _ts((running or [m])[0].get("launched_at"))
         hist = slice_history(m.get("id"), {}, mine, verdict_of, result_of, None, None, now)
+        detail = ""
         rows.append({"sid": m.get("id"), "title": m.get("label") or "", "job": True,
-                     "status": st, "phase": phase, "detail": "", "since": since,
+                     "status": st, "phase": phase, "detail": detail, "since": since,
                      "elapsed_s": round(now - since, 1) if since and running else None,
                      "active": phase in ACTIVE_PHASES, "attention": phase == "failed",
-                     "history": hist, "sub": None})
+                     "history": hist, "sub": None,
+                     "summary": _attempts_summary(mine, base) if phase == "done" else "",
+                     "_base": base, "_t": max([_t(x) or 0 for x in mine] or [0]),
+                     "_sup": [x.get("superseded_by") for x in mine
+                              if x.get("status") in ("failed", "needs_opus") and x.get("superseded_by")]})
+    # SUPERSEDED FAILURES (Penn 2026-10-09, rt-bg-commitments-guard "9/9 jobs 5 failed"
+    # beside chains that later exited 0): a failed pseudo-slice is OUTSTANDING only when
+    # nothing later in its lineage passed or is still running. Three provable proofs, none
+    # weaker; the row stays in the expanded history either way:
+    #   (a) its failed job's superseded_by names a job that is now live (retrying) / done;
+    #   (b) it is an `<X>-sN` sub-slice of a sibling job group X that is done / still live;
+    #   (c) an ended auto-run `exit 0` for chain X (X or X-sN, same bundle) finished after
+    #       the group's last activity (passed_runs=[(label, bundle, ended_epoch)]).
+    by_id = {x.get("id"): x for x in jobs}
+    by_base = {r["_base"]: r for r in rows}
+
+    def _supersede(r, phase, why):
+        r["phase"], r["attention"], r["active"] = phase, False, phase in ACTIVE_PHASES
+        r["detail"], r["summary"] = "", why
+    for r in rows:
+        if r["phase"] != "failed":
+            continue
+        for (lab, bun, step) in active_runs or []:
+            if (bun is None or bun == key) and (r["_base"] == lab or re.fullmatch(re.escape(lab) + r"-s\d+", r["_base"])):
+                _supersede(r, "queued", f"chain {lab} still advancing ({step})")
+                break
+        if r["phase"] != "failed":
+            continue
+        for tid in r["_sup"]:
+            tj = by_id.get(tid)
+            if tj and tj.get("status") in _LIVE:
+                _supersede(r, "queued", f"failed attempt superseded -- retry {tid} is {tj.get('status')}")
+                break
+            if tj and tj.get("status") == "done":
+                _supersede(r, "done", f"failed attempt superseded by passing {tid}")
+                break
+        if r["phase"] != "failed":
+            continue
+        pm = re.match(r"^(.*)-s\d+$", r["_base"])
+        par = by_base.get(pm.group(1)) if pm else None
+        if par is not None and par is not r:
+            if par["phase"] == "done":
+                _supersede(r, "done", f"sub-slice failure superseded: {par['title']} passed")
+            elif par["phase"] != "failed" and par["phase"] in ACTIVE_PHASES:
+                _supersede(r, "queued", f"sub-slice failure superseded: {par['title']} is {par['status']}")
+        if r["phase"] != "failed":
+            continue
+        for (lab, bun, end) in passed_runs or []:
+            if (r["_base"] == lab or re.fullmatch(re.escape(lab) + r"-s\d+", r["_base"])) \
+                    and (not bun or bun == key) and r["_t"] and r["_t"] <= end:
+                _supersede(r, "done", f"chain {lab} ended exit 0 after this failure")
+                break
+    # a chain whose driver is alive but has no live queue row this instant (between rounds,
+    # preflight, self-check) keeps its bundle RUNNING, never finished/failed.
+    for (lab, bun, step) in active_runs or []:
+        if bun is not None and bun != key:
+            continue
+        lin = [r for r in rows if r["_base"] == lab or r["_base"].startswith(lab + "-")]
+        if any(r["active"] for r in lin):
+            continue
+        same = [r for r in lin if r["_base"] == lab]
+        if same:    # the chain's own row is between rounds: it is running, not done/failed
+            same[0].update(phase="authoring", active=True, attention=False,
+                           summary=f"chain advancing: {step}")
+            continue
+        rows.append({"sid": f"chain:{lab}", "title": lab, "job": True, "status": "running",
+                     "phase": "authoring", "detail": "", "summary": f"chain advancing: {step}",
+                     "since": None, "elapsed_s": None, "active": True, "attention": False,
+                     "history": [], "sub": None, "_base": lab, "_t": 0, "_sup": []})
+    through = sum(1 for r in rows if r["phase"] == "done")
+    for r in rows:
+        for k in ("_base", "_t", "_sup"):
+            r.pop(k, None)
     act = [r for r in rows if r["active"]]
     current = act[0]["sid"] if act else None
     return {"key": key, "through": through, "total": len(rows), "current": current,

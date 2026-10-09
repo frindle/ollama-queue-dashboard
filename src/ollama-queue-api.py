@@ -2860,7 +2860,7 @@ async function refresh() {
       const sDetail = (sl.detail || '').replace(/^refining \(round \d+\)( -- )?/, '');
       str.innerHTML = `
         <td class="slice-caret">${sl.history && sl.history.length ? (open ? '&#9662;' : '&#9656;') : ''}</td>
-        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sl.phase}">${sl.phase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${sp.cause ? '<div class="slice-cause" title="' + escapeHtml(sp.cause) + '">' + escapeHtml(sp.cause) + '</div>' : ''}</td>
+        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sl.phase}">${sl.phase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${(sp.cause || sl.summary) ? '<div class="slice-cause" title="' + escapeHtml(sp.cause || sl.summary) + '">' + escapeHtml(sp.cause || sl.summary) + '</div>' : ''}</td>
         <td class="st"><span class="chip ph ph-${sl.phase}">${sl.phase}</span></td>
         <td class="when slice-facts" colspan="2" title="${escapeHtml(sliceSuffix(sl))}">${sp.facts.map(f => '<span class="slice-fact">' + escapeHtml(f.replace(/^author jobs /, 'jobs ')) + '</span>').join('')}</td>`;
       str.addEventListener('click', () => {
@@ -6181,6 +6181,11 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
                              and bv.child_parent_id(j) is None) \
                     and q.job_group_key({"label": j.get("label")}, reverse) not in views:
                 _tagged.setdefault(t.strip(), []).append(j)
+        # a bundle whose chain driver is alive but has no queue row this instant
+        # (between rounds / preflight) still renders -- running, not absent
+        for _l, _b, _st in bv.load_active_runs():
+            if _b and _b not in views and not _b.startswith("esc-review-"):
+                _tagged.setdefault(_b, [])
         for t, tj in _tagged.items():
             # + this bundle's FINISHED jobs (durable bundle tag) and their children
             tj = tj + [h for h in history if h.get(q.BUNDLE_FIELD) == t
@@ -6194,7 +6199,9 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
                     return {"label": json.loads((log_dir / f"{i}.done.json").read_text()).get("label")}
                 except Exception:
                     return {}
-            v = bv.build_job_view(t, tj + kids, now=now, result_of=_lab)
+            v = bv.build_job_view(t, tj + kids, now=now, result_of=_lab,
+                                  passed_runs=bv.load_passed_runs(),
+                                  active_runs=bv.load_active_runs())
             if v:
                 views[t] = v
     except Exception:
@@ -6356,7 +6363,9 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
             v = None
         if not v:
             try:
-                v = bv.build_job_view(k, recs, now=now, result_of=_lab)
+                v = bv.build_job_view(k, recs, now=now, result_of=_lab,
+                                      passed_runs=bv.load_passed_runs(),
+                                      active_runs=bv.load_active_runs())
             except Exception:
                 v = None
         if not v:
