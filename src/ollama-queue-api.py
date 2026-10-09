@@ -723,7 +723,7 @@ def _slice_resolved_ok(s, verdict_of=_durable_verdict_tag, log_dir=None):
 
 
 def _needs_attention_ids(rows, state_of=None, log_dir=None,
-                         verdict_of=_durable_verdict_tag, superseded=()):
+                         verdict_of=_durable_verdict_tag, superseded=(), superseded_map=None):
     """PURE apart from the injected lookups. The ids of non-success rows that a bundle
     header should actually RAISE AN ALARM about -- as opposed to merely report.
 
@@ -747,12 +747,23 @@ def _needs_attention_ids(rows, state_of=None, log_dir=None,
     belongs to; rows that function already declared superseded are skipped outright.
     Returns a set of row ids. Nothing is dropped, reordered or restyled by this."""
     out, states = set(), {}
+    # a bundle `qctl supersede`d with nothing pending/running is retired: its leftover
+    # failed rows raise no alarm (2026-10-08; see _retired_bundle_keys)
+    try:
+        _sup_map = _bundle_view_lib()[0].load_superseded() if superseded_map is None else superseded_map
+        _retired = _retired_bundle_keys(
+            {r.get("group_key") for r in rows or [] if r.get("group_key")}, rows or [],
+            lambda j: j.get("group_key"), _sup_map, None)
+    except Exception:
+        _retired = set()
     for r in rows or []:
         if str(r.get("status") or "") not in PLAN_ALERT_STATUSES:
             continue
         if not r.get("id") or r.get("id") in (superseded or ()):
             continue
         gk = r.get("group_key") or None
+        if gk and gk in _retired:
+            continue
         if gk:   # a human-cancelled plan is terminal: its rows raise no alarm
             try:
                 import plan_cancel as _pc
@@ -1093,11 +1104,25 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
     # onto the dashboard forever -- a much larger change than the row-history bug
     # being fixed here. Only `k in live_keys` is gone, which is the asymmetry itself.
     stranded = []
+    # RETIRED plans (human-cancelled / `qctl supersede`d, nothing pending or running) are
+    # not "stranded": their leftover terminal rows must not rebuild a bundle that reads
+    # "pending X/Y slices, 0 jobs" in the Queue panel (replay-endorse, cancelled
+    # 2026-10-05, sat there with 21 done rows -- 2026-10-08). See _retired_bundle_keys.
+    try:
+        import plan_cancel as _pc
+        _retired = _retired_bundle_keys(
+            {r.get("group_key") for r in rows if r.get("group_key")}, rows,
+            lambda j: j.get("group_key"), _bundle_view_lib()[0].load_superseded(),
+            lambda k: _pc.cancelled(k, runs_dir=runs_dir))
+    except Exception:
+        _retired = set()
     for r in rows:
         k = r.get("group_key")
         if not k or r.get("status") not in _QUEUE_TERMINAL_STATUSES:
             continue
         if r in live:                     # already grouped; never double-count
+            continue
+        if k in _retired:
             continue
         prog = _load_plan_progress(k, runs_dir)
         if prog and prog[0] < prog[1]:
@@ -5954,6 +5979,47 @@ def _bundle_view_lib():
     return _bv, _dp
 
 
+LIVE_BUNDLE_STATUSES = ("pending", "running")
+
+
+def _retired_bundle_keys(keys, jobs, gkey, superseded=None, cancelled=None):
+    """PURE. Which of `keys` are RETIRED: marked superseded (`qctl supersede`:
+    bundle-superseded.json, whole-bundle key) or human-cancelled (`cancelled(key)`:
+    plan_cancel's `.cancelled` marker, own or an ancestor plan's) AND with no LIVE job
+    (pending/running) left. Such a bundle is finished business: it must not show in the
+    live Queue panel or raise Needs attention -- it belongs to the finished/stalled
+    history. ROOT CAUSE (2026-10-08): replay-endorse, cancelled 2026-10-05, sat in the
+    Queue as "pending 5/9 slices, 0 jobs" because 21 DONE rows were still in
+    queue-state; only the history path consulted the markers. A bundle with a live
+    job is never retired here (a marker must not hide running work). `gkey(job)` is the
+    queue's grouping authority; a job's `bundle` tag also counts as its bundle."""
+    sup = superseded or {}
+    live = set()
+    for j in jobs or []:
+        if str(j.get("status") or "") not in LIVE_BUNDLE_STATUSES:
+            continue
+        try:
+            k = gkey(j)
+        except Exception:
+            k = None
+        if k:
+            live.add(k)
+        t = j.get("bundle")
+        if isinstance(t, str) and t.strip():
+            live.add(t.strip())
+    out = set()
+    for k in keys:
+        if k in live:
+            continue
+        try:
+            canc = cancelled(k) if cancelled else None
+        except Exception:
+            canc = None
+        if k in sup or canc:
+            out.add(k)
+    return out
+
+
 def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
                   heal_path=None, preflight_dir=None, progress=None, alive=None,
                   now=None, history=None, live_dir=None):
@@ -6050,6 +6116,20 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
             v = bv.build_job_view(t, tj + kids, now=now, result_of=_lab)
             if v:
                 views[t] = v
+    except Exception:
+        pass
+    # RETIRED bundles (superseded / human-cancelled, nothing pending or running) leave
+    # the live panel -- see _retired_bundle_keys. Best-effort: never raise into a poll.
+    try:
+        def _gk_live(j):
+            return q.job_group_key(j, reverse)
+
+        def _canc(k):
+            import plan_cancel as _pc
+            return _pc.cancelled(k, runs_dir=runs_dir)
+        for k in _retired_bundle_keys(list(views), jobs, _gk_live,
+                                      bv.load_superseded(), _canc):
+            views.pop(k, None)
     except Exception:
         pass
     activity = []
