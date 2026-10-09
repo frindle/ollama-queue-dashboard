@@ -1957,7 +1957,10 @@ function foldRounds(entries) {
   const rnd = h => { const m = /^refining \(round (\d+)\)/.exec(h.kind || ''); return m ? +m[1] : null; };
   const rounds = entries.filter(h => rnd(h) !== null);
   const max = rounds.reduce((m, h) => Math.max(m, rnd(h)), 0);
-  const early = rounds.filter(h => rnd(h) < max);
+  // A LIVE (running/pending/...) row is never folded away: a chain relaunch restarts the
+  // round counter, so a running r1 can sit below an older done r2 and would otherwise be
+  // swallowed into the collapsed "refine r1-r1" group (Penn 2026-10-09).
+  const early = rounds.filter(h => rnd(h) < max && !isLiveRow(h));
   if (early.length < 2) return entries.map(h => ({h}));
   const out = []; let placed = false;
   for (const h of entries) {
@@ -1970,6 +1973,7 @@ function foldRounds(entries) {
   return out;
 }
 // Drop a leading '<bundle>-' the bundle row above already shows.
+function isLiveRow(h) { return !!h.live || ['running', 'pending', 'queued', 'held', 'paused'].includes(h.status); }
 function trimBundle(txt, key) {
   const t = String(txt || ''), p = String(key || '') + '-';
   return key && t.startsWith(p) && t.length > p.length ? t.slice(p.length) : t;
@@ -2950,7 +2954,7 @@ async function refresh() {
           for (const it of stg.list) {
             if (!it.fold) { tbody.appendChild(histRow(it.h, false)); continue; }
             const fk = prefix + '#rounds';
-            const fo = (fk in sliceExpanded) ? sliceExpanded[fk] : false;
+            const fo = (fk in sliceExpanded) ? sliceExpanded[fk] : it.fold.some(h => isLiveRow(h));
             tbody.appendChild(foldRow(fk, it.label, fo, 'slice-fold'));
             if (fo) for (const h of it.fold) tbody.appendChild(histRow(h, true));
             else for (const h of it.fold) if (h.live && h.id) claimed.add(h.id);
@@ -8150,7 +8154,8 @@ console.log(JSON.stringify({
         const ga = groupAttempts(hh);
         return {nums: ga.nums, n1: ga.by[1].length, sum1: attemptSummary(1, ga.by[1]), sum2: attemptSummary(2, ga.by[2])}; })(),
   fold: [foldRounds([H('authoring', 1), H('refining (round 1)', 1), H('refining (round 2)', 1), H('refining (round 3)', 1)]).map(i => i.fold ? i.label : i.h.kind),
-         foldRounds([H('authoring', 1), H('refining (round 1)', 1), H('refining (round 2)', 1)]).map(i => i.fold ? 'F' : i.h.kind)],
+         foldRounds([H('authoring', 1), H('refining (round 1)', 1), H('refining (round 2)', 1)]).map(i => i.fold ? 'F' : i.h.kind),
+         foldRounds([H('refining (round 1)', 1, {status:'done'}), H('refining (round 2)', 1, {status:'done'}), H('refining (round 1)', 1, {status:'done'}), H('refining (round 1)', 1, {status:'running', live:true})]).map(i => i.fold ? 'F' + i.fold.length : (i.h.live ? 'LIVE' : i.h.kind))],
   trim: [trimBundle('b-s1-x', 'b'), trimBundle('s1-x', 'b'), trimBundle('b-', 'b'), trimBundle('s1', null)],
   openEsc: sliceOpenByDefault({attention: true}),
   openRun: sliceOpenByDefault({phase: 'coding', active: true, attention: false}),
@@ -8191,7 +8196,8 @@ console.log(JSON.stringify({
         check("earlier refine rounds fold into one line only when there are two or more",
               _s.get("fold"),
               [["authoring", "refine r1-r2 \u00b7 2 rounds", "refining (round 3)"],
-               ["authoring", "refining (round 1)", "refining (round 2)"]])
+               ["authoring", "refining (round 1)", "refining (round 2)"],
+               ["F2", "refining (round 2)", "LIVE"]])
         check("the bundle prefix is trimmed only when it is really a prefix",
               _s.get("trim"), ["s1-x", "s1-x", "b-", "s1"])
         check("an idle slice and a lone escalated slice carry no suffix",
