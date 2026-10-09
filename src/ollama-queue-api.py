@@ -1544,6 +1544,9 @@ FRONTEND_HTML = r"""<!doctype html>
   .chip.running, .chip.ph-coding, .chip.ph-gate, .chip.ph-regate, .chip.ph-authoring, .chip.ph-refining,
   .chip.ph-preflight, .chip.ph-self-heal, .chip.ph-escalation-review, .chip.ph-second-opinion { background: var(--run-bg); color: var(--run); }
   .chip.warming { background: var(--warn-bg); color: var(--warn); }
+  table.q td.slice-facts { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .slice-fact { display: inline-block; padding: 0 6px; margin-right: 4px; border: 1px solid var(--line); border-radius: 8px; white-space: nowrap; }
+  .slice-cause { color: var(--muted); font-size: .79rem; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .chip.pending, .chip.planned, .chip.queued, .chip.ph-queued, .chip.ph-pending { background: var(--info-bg); color: var(--info); }
   .chip.held, .chip.paused, .chip.blocked, .chip.parked, .chip.warn, .chip.done_unconverged { background: var(--warn-bg); color: var(--warn); }
   .chip.failed, .chip.bad, .chip.ph-failed, .chip.ph-escalated { background: var(--bad-bg); color: var(--bad); }
@@ -1879,23 +1882,31 @@ function formatElapsed(s) {
   const pad = n => String(n).padStart(2, '0');
   return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
 }
-function sliceSuffix(sl) {
+function sliceSuffixParts(sl) {
   const hist = (sl && sl.history) || [];
   const att = hist.reduce((m, h) => Math.max(m, h.attempt || 1), 1);
-  const parts = [];
+  // {facts: [...always-visible short chips], cause: 'one failure-cause line' | ''}
+  const facts = [];
+  let cause = '';
   // ONE attempt counter (failure_ledger.slice_counter, same numbers as `ollama-dispatch-slice
   // --status` and the budget refusal): author jobs window/budget + lifetime/cap, last cause,
   // "same cause as <job>". Falls back to the old history-derived count if absent.
   const ctr = sl && sl.counter;
   if (ctr) {
-    parts.push('author jobs ' + ctr.jobs_window + '/' + ctr.job_budget + ' (life ' + ctr.jobs_lifetime + '/' + ctr.lifetime_cap + ')' + (ctr.at_cap ? ' AT CAP' : ''));
-    if (ctr.last_signature) parts.push(ctr.last_signature + (ctr.same_as ? ' = same cause as ' + String(ctr.same_as).slice(0, 8) : ''));
-  } else if (att > 1) parts.push('attempt ' + att);
+    facts.push('author jobs ' + ctr.jobs_window + '/' + ctr.job_budget + ' (life ' + ctr.jobs_lifetime + '/' + ctr.lifetime_cap + ')' + (ctr.at_cap ? ' AT CAP' : ''));
+    if (ctr.last_signature) cause = ctr.last_signature + (ctr.same_as ? ' = same cause as ' + String(ctr.same_as).slice(0, 8) : '');
+  } else if (att > 1) facts.push('attempt ' + att);
   let rnd = null;
   for (const h of hist) { if ((h.attempt || 1) !== att) continue; const m = /^refining \(round (\d+)\)/.exec(h.kind || ''); if (m) rnd = +m[1]; }
-  if (rnd) parts.push('refine r' + rnd);
-  if (sl && sl.active) { const run = hist.find(h => h.live && h.status === 'running' && h.duration_s != null); const el = run ? run.duration_s : sl.elapsed_s; if (el != null) parts.push(formatElapsed(el)); }
-  return parts.join(' · ');
+  if (rnd) facts.push('refine r' + rnd);
+  if (sl && sl.active) { const run = hist.find(h => h.live && h.status === 'running' && h.duration_s != null); const el = run ? run.duration_s : sl.elapsed_s; if (el != null) facts.push(formatElapsed(el)); }
+  return {facts, cause};
+}
+function sliceSuffix(sl) {
+  const p = sliceSuffixParts(sl);
+  const out = p.facts.slice();
+  if (p.cause) out.splice(Math.min(1, out.length), 0, p.cause);
+  return out.join(' \u00b7 ');
 }
 const sliceOpenByDefault = sl => !!(sl && sl.attention);
 // Short stage name for a child row under a slice (the bundle + slice are already on the
@@ -2849,10 +2860,9 @@ async function refresh() {
       const sDetail = (sl.detail || '').replace(/^refining \(round \d+\)( -- )?/, '');
       str.innerHTML = `
         <td class="slice-caret">${sl.history && sl.history.length ? (open ? '&#9662;' : '&#9656;') : ''}</td>
-        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sl.phase}">${sl.phase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}</td>
+        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sl.phase}">${sl.phase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${sp.cause ? '<div class="slice-cause" title="' + escapeHtml(sp.cause) + '">' + escapeHtml(sp.cause) + '</div>' : ''}</td>
         <td class="st"><span class="chip ph ph-${sl.phase}">${sl.phase}</span></td>
-        <td class="when">${escapeHtml(sliceSuffix(sl))}</td>
-        <td></td>`;
+        <td class="when slice-facts" colspan="2" title="${escapeHtml(sliceSuffix(sl))}">${sp.facts.map(f => '<span class="slice-fact">' + escapeHtml(f.replace(/^author jobs /, 'jobs ')) + '</span>').join('')}</td>`;
       str.addEventListener('click', () => {
         sliceExpanded[skey] = !open; saveExpandState(); refresh();
       });
@@ -2863,6 +2873,7 @@ async function refresh() {
       }
       // One history entry as a row: a live queue row (all actions kept) or a read-only line.
       const histRow = (h, indent) => {
+      const sp = sliceSuffixParts(sl);
         const live = h.live && g.children.find(c => c.id === h.id);
         if (live) {
           claimed.add(h.id);
