@@ -1182,6 +1182,64 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
     return rows
 
 
+# BUNDLE ROLLUP PRECEDENCE (Penn 2026-10-09, rt-costco-receipt-attach read `pending` while its
+# slice 1 said `authoring 2:45`, beside a yellow "1 failed" for a round that was being
+# retried). _annotate_plan_rollup sees QUEUE ROWS only, so "2 pending, none running"
+# rolled up to `pending` even though a slicer/chain driver was authoring a slice
+# between queue rows. The slice view (bundle_view) knows the truth, so this post-pass
+# applies it. Precedence, highest first:
+#   unresolved failure (slice view phase failed/escalated, nothing active)  -> unchanged
+#   active slice (authoring/refining/coding/gate/... per the view)          -> that phase
+#   running row (already `running`)                                          -> running
+#   pending > queued > paused/held > planned                                 -> unchanged
+#   done                                                                     -> unchanged
+# A `failed` row whose slice is ACTIVE in the view is a superseded/in-flight retry: its
+# needs_attention is cleared (the row and its history still render; it just may not
+# colour the bundle or reach Needs attention). A slice that is failed/escalated in the
+# view keeps its alarm.
+def _apply_view_activity(rows, views, active_phases=None, heat=None):
+    """PURE. Stamp plan_active_phase and fold live slice-view activity into plan_status /
+    needs_attention (see BUNDLE ROLLUP PRECEDENCE). Only mutates the passed rows."""
+    if active_phases is None or heat is None:
+        try:
+            bv = _bundle_view_lib()[0]
+            active_phases = bv.ACTIVE_PHASES if active_phases is None else active_phases
+            heat = bv._HEAT if heat is None else heat
+        except Exception:
+            return rows
+    ignore = {"queued"}      # a plain queue wait is already visible as a pending row
+    for r in rows:
+        r.setdefault("plan_active_phase", None)
+    by_key = {}
+    for r in rows:
+        if r.get("group_key"):
+            by_key.setdefault(r["group_key"], []).append(r)
+    for key, grp in by_key.items():
+        view = (views or {}).get(key)
+        if not isinstance(view, dict):
+            continue
+        slices = [x for x in view.get("slices") or [] if isinstance(x, dict)]
+        act = [x for x in slices if x.get("phase") in active_phases
+               and x.get("phase") not in ignore and not x.get("attention")]
+        if not act:
+            continue
+        hot = max(act, key=lambda x: heat.get(x.get("phase"), 0))["phase"]
+        act_sids = [x.get("sid") for x in act if x.get("sid")]
+        for r in grp:
+            if r.get("plan_status") in ("pending", "queued", "scheduled", "planned",
+                                        "paused", "held", "done", "failed", None):
+                r["plan_status"] = hot
+            r["plan_active_phase"] = hot
+            if r.get("needs_attention") and r.get("status") in PLAN_ALERT_STATUSES:
+                base = _slice_base_label(r.get("label")) or ""
+                for sid in act_sids:
+                    pre = f"{key}-{sid}"
+                    if base == pre or base.startswith(pre + "-"):
+                        r["needs_attention"] = False
+                        break
+    return rows
+
+
 # BUNDLE ORDER (the user 2026-09-27: bundle rows "keep changing position as runs start
 # and finish"). The queue panel placed each bundle at plan_seq = MIN display_seq of
 # its rows, and display_seq puts RUNNING on top and gives terminal rows 10_000+tier.
@@ -1543,6 +1601,8 @@ FRONTEND_HTML = r"""<!doctype html>
           white-space: nowrap; background: var(--surface-2); color: var(--muted); line-height: 1.5; }
   .chip.running, .chip.ph-coding, .chip.ph-gate, .chip.ph-regate, .chip.ph-authoring, .chip.ph-refining,
   .chip.ph-preflight, .chip.ph-self-heal, .chip.ph-escalation-review, .chip.ph-second-opinion { background: var(--run-bg); color: var(--run); }
+  .chip.authoring, .chip.refining, .chip.preflight, .chip.coding, .chip.gate, .chip.regate, .chip.self-heal,
+  .chip.escalation-review, .chip.second-opinion { background: var(--run-bg); color: var(--run); }
   .chip.warming { background: var(--warn-bg); color: var(--warn); }
   table.q td.slice-facts { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .slice-fact { display: inline-block; padding: 0 6px; margin-right: 4px; border: 1px solid var(--line); border-radius: 8px; white-space: nowrap; }
@@ -3124,7 +3184,7 @@ async function refresh() {
     // unresolved failure => "failed"; stuck because it was held/paused => "parked";
     // only blocked rows => "blocked". A bundle that is still MOVING keeps its failure
     // as a quiet amber note in the Queue: a retry in flight is not an emergency.
-    const liveNow = !!(counts.running || counts.pending || counts.queued);
+    const liveNow = !!(counts.running || counts.pending || counts.queued || planFirst('plan_active_phase'));
     const hasAlert = alertSummary.alerts.length > 0 || badSlices > 0;
     const attnKind = (!liveNow && (counts.held || counts.paused)) ? 'parked'
       : (!liveNow && hasAlert) ? 'failed'
@@ -6588,11 +6648,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The rendered order follows the daemon's OWN focused bundle (read from the
             # same state we just loaded), so a bundle that is first stays first across
             # the gap where its next slice has not been enqueued yet.
-            self._json(_annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_annotate_plan_rollup(
+            _rows = _annotate_plan_rollup(
                 _annotate_display_seq(
                     _annotate_job_groups([_job_summary(j, state["jobs"])
                                           for j in state["jobs"]]),
-                    focus_key=_focus_bundle_key(state))), state), state)))
+                    focus_key=_focus_bundle_key(state)))
+            try:    # fold the live slice view into the rollup (see _apply_view_activity)
+                _apply_view_activity(_rows, (_cached_response("bundle-views", _bundle_views, ttl=3)
+                                             or {}).get("views") or {})
+            except Exception:
+                pass
+            self._json(_annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_rows, state), state)))
         elif self.path == "/api/triage":
             # Open failure-signature triage packets (triage_packets.open_summary; read-only,
             # fail-open: an unreadable index is {"open": 0}).
