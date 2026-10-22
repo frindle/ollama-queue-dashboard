@@ -49,11 +49,11 @@ PORT = 7684
 # the tok/s line is new). Only the LAST match in the tail matters; a job's log
 # can have many of these, we only want current progress, not history.
 _ITER_RE = re.compile(r"--- iteration (\d+)/(\d+) ---")
-_TOKS_RE = re.compile(r"\(([\d.]+) tok/s\)")
+_TOKS_RE = re.compile(r"\(([\d.]+) tok/s\b")  # "(12.3 tok/s)" (worker) and "(12.3 tok/s wall incl. prefill+tools, ..." (mini-runner)
 _LOG_TAIL_BYTES = 16_384  # comfortably more than one iteration's log output
 # The worker's end-of-run line: "[worker] USAGE SUMMARY: prompt_tokens=N completion_tokens=M tok_s=X decode_tok_s=Y calls=K"
 # (n/a = the backend reported nothing). Shown on finished job rows only; absent line = no usage shown.
-_USAGE_RE = re.compile(r"USAGE SUMMARY: prompt_tokens=(\S+) completion_tokens=(\S+) tok_s=(\S+) decode_tok_s=(\S+) calls=(\S+)")
+_USAGE_RE = re.compile(r"USAGE SUMMARY: prompt_tokens=(\S+) completion_tokens=(\S+) tok_s=(\S+) decode_tok_s=(\S+)(?: tok_s_basis=\S+)? calls=(\S+)")  # tok_s_basis=... is optional (mini-runner adds it)
 _USAGE_TAIL_BYTES = 65_536
 _USAGE_CACHE = {}
 
@@ -1922,7 +1922,7 @@ FRONTEND_HTML = r"""<!doctype html>
 <div class="strip" id="summary">
   <div class="tile now" id="sumNow"><div class="k"><span class="idle-dot"></span>Running now</div><div class="s">loading&hellip;</div></div>
   <div class="tile" id="sumQueue"><div class="k">Queue</div><div class="v">&ndash;</div></div>
-  <div class="tile attn" id="sumAttn"><div class="k">Needs attention</div><div class="v">&ndash;</div></div>
+  <div class="tile attn" id="sumAttn"><div class="k">Stalled / failed</div><div class="v">&ndash;</div></div>
 </div>
 
 <div id="laneChips" class="lanechips" hidden></div>
@@ -1937,17 +1937,13 @@ FRONTEND_HTML = r"""<!doctype html>
   <div class="empty" id="activeEmpty" hidden>The queue is empty.</div></div>
 </section>
 
-<section class="panel" id="attnPanel">
-  <div class="panel-head"><h2>Needs attention</h2><span class="count" id="attnCount"></span></div>
+<section class="panel" id="stalledPanel" hidden>
+  <div class="panel-head"><h2>Stalled / failed</h2><span class="count" id="attnCount"></span></div>
   <div class="list attn" id="attnList"><table class="q" id="attnTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table></div>
-  <div class="list" id="attnEmpty" hidden><div class="empty">Nothing is stuck. Failed, parked and blocked work shows up here.</div></div>
   <div class="list" id="attnHiddenWrap" hidden><details class="fin" id="attnHiddenDetails">
     <summary id="attnHiddenSummary"></summary>
     <table class="q" id="attnHiddenTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
   </details></div>
-</section>
-
-<section class="panel" id="stalledPanel" hidden>
   <div class="list"><details class="fin" id="stalledDetails" open>
     <summary id="stalledSummary"><b>Stalled / failed bundles</b></summary>
     <div class="empty" style="padding:.4rem .8rem;color:var(--muted)">Nothing is running for these and they did NOT finish: a slice failed or ended, or slices are still owed. Never aged out; they stay until fixed or cleared.</div>
@@ -3074,7 +3070,7 @@ function renderSummary(jobs, acts, attnStats, q) {
   const brk = ['failed', 'parked', 'blocked', 'stalled'].filter(k => attnStats[k]).map(k => attnStats[k] + ' ' + k).join(' &middot; ');
   const at = document.getElementById('sumAttn');
   at.classList.toggle('has', nA > 0);
-  at.innerHTML = `<div class="k">Needs attention</div><div class="v">${nA}</div>
+  at.innerHTML = `<div class="k">Stalled / failed</div><div class="v">${nA}</div>
     <div class="s">${nA ? brk + (attnStats.stalled ? ' (bundles)' : '') : 'nothing stuck'}${_hn0 ? ` &middot; <a href="#attnHiddenWrap" class="stale-link" style="color:var(--muted)" onclick="var d=document.getElementById('attnHiddenDetails');if(d)d.open=true">${attnTileText(nA, attnStats.hidden).hidden.trim()}</a>` : ''}${(triageOpen && triageOpen.open) ? ` &middot; <span title="python3 ~/bin/triage-emit.py --json">triage: ${triageOpen.open} signature${triageOpen.open === 1 ? '' : 's'}${triageOpen.repeats ? ' (' + triageOpen.repeats + ' repeated)' : ''}</span>` : ''}${attnStats.stale ? ` &middot; <a href="#stalledPanel" class="stale-link" style="color:var(--muted)" onclick="var d=document.getElementById('stalledDetails');if(d)d.open=true">stale backlog: ${attnStats.stale}</a>` : ''}</div>`;
   const _tile = attnTileText(nA, attnStats.hidden);
   document.getElementById('attnCount').textContent = (nA ? _tile.count : '') + _tile.hidden;
@@ -3082,10 +3078,9 @@ function renderSummary(jobs, acts, attnStats, q) {
   document.getElementById('attnHiddenWrap').hidden = !_hn;
   document.getElementById('attnHiddenSummary').textContent = attnHiddenSummary(attnStats.hidden);
   document.getElementById('attnList').hidden = !nList;
-  document.getElementById('attnEmpty').hidden = !!nList;
-  document.querySelector('#attnEmpty .empty').textContent = attnStats.stalled
-    ? attnStats.stalled + ' stalled/failed bundle' + (attnStats.stalled === 1 ? '' : 's') + ' (nothing live, not finished): see "Stalled / failed bundles" below.'
-    : 'Nothing is stuck. Failed, parked and blocked work shows up here.';
+  window._attnShown = !!(nList || _hn);   // live failed/parked rows now render inside the Stalled / failed panel
+  if (window._stalledN === undefined) window._stalledN = attnStats.stalled || 0;
+  document.getElementById('stalledPanel').hidden = !(window._attnShown || window._stalledN);
   renderCpuQueue(q);
   document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString() + ' · refreshes every 4s';
 }
@@ -4179,7 +4174,9 @@ async function refresh() {
     const allStalled = (finishedBundles || {}).stalled || [];
     const views = allStalled.slice(0, stalledShown);
     const panel = document.getElementById('stalledPanel');
-    panel.hidden = !allStalled.length;
+    window._stalledN = allStalled.length;
+    document.getElementById('stalledDetails').parentElement.hidden = !allStalled.length;
+    panel.hidden = !(allStalled.length || window._attnShown);
     document.getElementById('stalledSummary').innerHTML = `<b>Stalled / failed bundles</b>
       <span class="count" style="color:var(--muted)">${views.length} of ${allStalled.length} &middot; all ages, newest first</span>
       <span class="chip bad">${allStalled.filter(v => v.actionable !== false).length} actionable</span>
