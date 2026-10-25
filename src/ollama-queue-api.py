@@ -4608,7 +4608,7 @@ function verdictClass(tag) {
   const t = (tag || '').toUpperCase();
   if (t.startsWith('PASS')) return 'verdict-pass';
   if (t.startsWith('FAIL')) return 'verdict-fail';
-  if (t.startsWith('CONCERNS')) return 'verdict-concerns';
+  if (t.startsWith('CONCERNS') || t.startsWith('NEEDS-REVIEW')) return 'verdict-concerns';
   if (t.startsWith('SKIPPED')) return 'verdict-skipped';
   if (t.startsWith('PENDING') || t.startsWith('IN PROGRESS')) return 'verdict-pending';
   if (t.startsWith('BLOCKED')) return 'verdict-blocked';
@@ -4629,7 +4629,7 @@ async function clearRun(id, label, awaitingSignoff) {
       `or Cancel to leave it in place.`);
     if (!override) return;   // cancelled or empty reason -> do nothing
   } else {
-    if (!confirm(`Clear "${label}"? It is archived (recoverable) and drops off this list.`)) return;
+    if (!confirm(`Clear "${label}"? It is archived (recoverable) and drops off this list. This only dismisses it -- it does NOT accept the work.`)) return;
   }
   const res = await fetch('/api/runs/' + id + '/clear', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -4638,6 +4638,17 @@ async function clearRun(id, label, awaitingSignoff) {
     let msg = await res.text();
     try { msg = JSON.parse(msg).error || msg; } catch (e) {}
     alert('Could not clear: ' + msg);
+  }
+  refreshRuns();
+}
+// Accept = deliberate review (accept-bundle + resolve + mark done), unlike clearRun which only dismisses.
+async function acceptRun(id, label) {
+  if (!confirm(`Accept "${label}"? This records your review as accepted (accept-bundle, resolve, mark done) and clears the card.`)) return;
+  const res = await fetch('/api/runs/' + id + '/accept', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  if (!res.ok) {
+    let msg = await res.text();
+    try { msg = JSON.parse(msg).error || msg; } catch (e) {}
+    alert('Could not accept: ' + msg);
   }
   refreshRuns();
 }
@@ -4730,6 +4741,14 @@ function renderRunRow(r, handled, isChild) {
     actionCell.appendChild(btn);
   }
   // a row owned by a LIVE auto run is not clearable (clearing would orphan the run)
+  if (!r.auto_run_live && !handled && (r.needs_review || r.status === 'failed' || String(r.raw_verdict || '').toUpperCase().startsWith('FAIL'))) {
+    const acceptBtn = document.createElement('button');
+    acceptBtn.textContent = 'accept';
+    acceptBtn.className = 'iconbtn';
+    acceptBtn.title = 'Deliberate review: accept-bundle + resolve + mark done (clear only dismisses)';
+    acceptBtn.onclick = () => acceptRun(r.id, r.label);
+    actionCell.appendChild(acceptBtn);
+  }
   if (!r.auto_run_live) {
     const clearBtn = document.createElement('button');
     clearBtn.textContent = 'clear';
@@ -5785,6 +5804,8 @@ def _completed_summary(r):
         "terminal_reason": r.get("terminal_reason"),
         "failure_class": r.get("failure_class"),
         "failure_detail": r.get("failure_detail"),
+        "needs_review": bool(r.get("needs_review")),
+        "needs_review_gates": r.get("needs_review_gates") or [],
     }
 
 
@@ -6732,6 +6753,15 @@ def _annotate_run_groups(rows, live_labels=None, auto_runs=None, acted=None):
             r["raw_verdict"] = "BLOCKED"
             r["verdict"] = f"BLOCKED -- {blocked}"
             continue
+        # SOFT-GATE-ONLY runner pass (fn_scope/literals): neither failed nor good to go.
+        # Stays in needs_eyes with an amber "needs review" label + the gate names; only
+        # an explicit Accept (POST /api/runs/<id>/accept) settles it, Clear just hides it.
+        if r.get("needs_review"):
+            r["soft_gates"] = list(r.get("needs_review_gates") or [])
+            r["group"], r["handled_reason"] = "needs_eyes", ""
+            r["raw_verdict"] = "NEEDS-REVIEW"
+            r["verdict"] = "NEEDS-REVIEW -- soft: " + (", ".join(r["soft_gates"]) or "?")
+            continue
         # A non-gated run (research / diagnosis) carries no code-review verdict -- its
         # output is a report to READ once, not a gate verdict to sign off. A FRESH one
         # still needs eyes, so only fold it once it's had a day to be consumed; this
@@ -6796,6 +6826,7 @@ _EYES_LABELS = {
     "good": ("good to go", "ok"),
     "signoff": ("awaiting sign-off", "ok"),
     "review": ("needs review", "warn"),
+    "softgate": ("needs review (soft gates)", "warn"),
     "blocked": ("blocked -- did not run", "bad"),
 }
 
@@ -6809,6 +6840,8 @@ def _eyes_flavor(row):
     """
     if row.get("group") == "good_to_go":
         return "good"
+    if row.get("needs_review"):
+        return "softgate"
     if row.get("awaiting_signoff"):
         return "signoff"
     if row.get("blocked_reason"):
@@ -7278,6 +7311,40 @@ def _archive_run(job_id, override=None, how=None):
                                 override=override if block else None)
     return {"ok": True, "id": job_id, "moved": moved,
             "signoff_overridden": bool(block and override), "handoff_acted": ledger}
+
+
+_QCTL_MOD = None
+
+
+def _qctl():
+    """qctl (no .py suffix) loaded once, so Accept reuses its close_* functions verbatim."""
+    global _QCTL_MOD
+    if _QCTL_MOD is None:
+        from importlib.machinery import SourceFileLoader
+        p = str(Path(__file__).resolve().parent / "qctl")
+        if not os.path.exists(p):
+            p = os.path.expanduser("~/bin/qctl")
+        ld = SourceFileLoader("qctl_api_accept", p)
+        _QCTL_MOD = importlib.util.module_from_spec(importlib.util.spec_from_loader("qctl_api_accept", ld))
+        ld.exec_module(_QCTL_MOD)
+    return _QCTL_MOD
+
+
+def _accept_run(job_id, qm=None, archive=None):
+    """Accept = deliberate review, the chain of `qctl close --accept`: accept-bundle <bundle> --job <id>,
+    resolve <id> (mark done), then archive the card. Returns {ok, ...} or {ok: False, code, error}.
+    qm / archive are injectable for tests. Clear (_archive_run alone) never calls this."""
+    qm = qm or _qctl()
+    archive = archive or _archive_run
+    try:
+        bundle, _label = qm.close_lookup(job_id)
+        qm.close_accept(bundle, job_id)
+        qm.close_resolve(job_id)
+    except Exception as e:
+        return {"ok": False, "code": 409, "error": f"accept refused: {e}"}
+    res = archive(job_id, how="accepted from dashboard")
+    return {"ok": True, "id": job_id, "bundle": bundle, "accepted": True,
+            "cleared": bool(res.get("ok")), "clear_error": None if res.get("ok") else res.get("error")}
 
 
 def _web_search_usage():
@@ -8599,6 +8666,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = re.match(r"^/api/runs/([^/]+)/clear$", self.path)
             if m:
                 return self._clear_run(m.group(1))
+            m = re.match(r"^/api/runs/([^/]+)/accept$", self.path)
+            if m:
+                return self._accept_run(m.group(1))
             elif self.path == "/api/handoff/acted":
                 return self._mark_handoff_as_acted()
             self._text("not found", 404)
@@ -8876,6 +8946,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not result.get("ok"):
             return self._json(result, status=result.get("code", 400))
         self._json(result)
+
+    def _accept_run(self, job_id):
+        """Accept action: the deliberate-review chain `qctl close --accept` runs
+        (accept-bundle --job, resolve, mark done), then the card is archived. Clear stays
+        dismiss-only; only this endpoint accepts."""
+        res = _accept_run(job_id)
+        self._json(res, status=res.get("code", 200) if not res.get("ok") else 200)
 
     def _mark_handoff_as_acted(self):
         """Handle marking a handoff job as acted upon."""
