@@ -1892,6 +1892,7 @@ FRONTEND_HTML = r"""<!doctype html>
 <header class="top">
   <h1>Ollama Queue</h1>
   <a href="/chat">Chat &rarr;</a>
+  <a href="/docsum/">Docs &rarr;</a>
   <span class="spacer"></span>
   <span class="upd" id="updated">loading&hellip;</span>
   <button class="btn" id="clearFinished" title="Remove every done/failed row from the queue state">Clear finished</button>
@@ -8081,6 +8082,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._text("plex bypass unavailable: %s" % type(e).__name__, 503)
         return plex_bypass_http.handle(self)
 
+    def _docsum(self):
+        """Route /docsum[/...] to the private doc-summary UI via docsum_proxy.proxy(self)."""
+        try:
+            import docsum_proxy
+        except Exception as e:  # noqa: BLE001
+            return self._text("docsum unavailable: %s" % type(e).__name__, 503)
+        return docsum_proxy.proxy(self)
+
     def _invalidate_for_write(self):
         """Drop the response cache on a state-changing request -- EXCEPT the Unraid runner's
         /api/cpu/* claim / heartbeat / result calls. Those arrive every few seconds around the
@@ -8119,6 +8128,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return _annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_rows, state), state))
 
     def do_GET(self):
+        if _is_docsum_path(self.path):
+            return self._docsum()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("GET")
         if self.path == "/api/cpu-lane":
@@ -8277,6 +8288,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         })
 
     def do_POST(self):
+        if _is_docsum_path(self.path):
+            return self._docsum()
         if self.path.startswith("/api/bypass/"):
             return self._plex_bypass()
         # Any state change must be visible on the very next poll.
@@ -8669,7 +8682,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text(f"error: {e}", 500)
 
     def log_message(self, fmt, *args):
+        if (getattr(self, "path", "") or "").startswith("/docsum"):
+            return  # pairing URL carries a token: never log /docsum requests
         sys.stderr.write(f"[queue-api] {self.address_string()} {fmt % args}\n")
+
+
+def _is_docsum_path(p):
+    return p == "/docsum" or p.startswith("/docsum/")
 
 
 class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):

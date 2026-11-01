@@ -162,7 +162,8 @@ def branch(txt, route):
 def _strip_hooks(t):
     # Additive routes (plex bypass hook, bundle run-now) sit in do_POST near these windows;
     # they are not the routes under guard, so ignore them in the comparison.
-    for h in ('        if self.path.startswith("/api/bypass/"):\n            return self._plex_bypass()\n',
+    for h in ('        if _is_docsum_path(self.path):\n            return self._docsum()\n',
+              '        if self.path.startswith("/api/bypass/"):\n            return self._plex_bypass()\n',
               '            m = re.match(r"^/api/jobs/([^/]+)/run-now$", self.path)\n            if m:\n                return self._run_now(m.group(1))\n'):
         t = t.replace(h, "")
     return t
