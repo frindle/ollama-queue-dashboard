@@ -1,5 +1,5 @@
 """Reverse proxy of /docsum/* on the queue API to the private doc-summary UI (127.0.0.1:7690). Stdlib only.
-Never logs or prints a path, query, header, filename or body; documents only pass through memory in 64 KiB chunks."""
+Never logs or prints a path, query, header, filename or body; a document body is held in memory only for the one request."""
 import http.client
 import json
 from urllib.parse import urlsplit
@@ -34,6 +34,79 @@ def upstream_headers(headers):
 
 
 def proxy(h, conn_factory=http.client.HTTPConnection):
-    h.send_response(501)
-    h.send_header("Content-Length", "0")
-    h.end_headers()
+    h.close_connection = True
+    # Strip the /docsum prefix to get the path for upstream
+    p = h.path
+    qmark = p.find("?")
+    if qmark == -1:
+        path_no_prefix = p[len(PREFIX):]
+    else:
+        path_no_prefix = p[len(PREFIX):qmark] + p[qmark:]
+    # Exact /docsum redirect (308) - only when path before ? is exactly /docsum
+    path_before_q = p.split("?")[0]
+    if path_before_q == PREFIX:
+        h.send_response(308)
+        h.send_header("Location", "/docsum/")
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+        return
+    # POST origin check
+    if h.command == "POST":
+        if not origin_ok(h.headers):
+            body = json.dumps({"error": "E_CROSS_ORIGIN"}).encode()
+            h.send_response(403)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            h.wfile.write(body)
+            return
+        cl_raw = h.headers.get("Content-Length")
+        if cl_raw is None:
+            body_len = 0
+        elif not cl_raw.isdigit():
+            body = json.dumps({"error": "E_TOO_BIG"}).encode()
+            h.send_response(413)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            h.wfile.write(body)
+            return
+        else:
+            body_len = int(cl_raw)
+        if body_len > MAX_BODY:
+            body = json.dumps({"error": "E_TOO_BIG"}).encode()
+            h.send_response(413)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            h.wfile.write(body)
+            return
+        if body_len > 0:
+            raw_body = h.rfile.read(body_len)
+        else:
+            raw_body = None
+    else:
+        raw_body = None
+    try:
+        conn = conn_factory(*UPSTREAM, timeout=60)
+        conn.request(h.command, path_no_prefix, body=raw_body, headers=upstream_headers(h.headers))
+        resp = conn.getresponse()
+        status = resp.status
+        allowed = ("Content-Type", "Content-Disposition", "Cache-Control", "Set-Cookie",
+                   "Location", "Content-Security-Policy", "X-Content-Type-Options", "Referrer-Policy")
+        resp_body = resp.read()
+        h.send_response(status)
+        for k in allowed:
+            v = resp.getheader(k)
+            if v is not None:
+                h.send_header(k, v)
+        h.send_header("Content-Length", str(len(resp_body)))
+        h.end_headers()
+        h.wfile.write(resp_body)
+    except Exception:
+        body = json.dumps({"error": "E_DOCSUM_DOWN"}).encode()
+        h.send_response(502)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
