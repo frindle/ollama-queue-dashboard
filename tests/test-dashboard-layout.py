@@ -51,11 +51,11 @@ BEFORE_HOOKS = {
     "data-promote-group", "data-remove", "data-resume", "data-top", "data-up"}
 BEFORE_ENDPOINTS = {
     "/api/bundle-history?days=", "/api/bundle-views", "/api/hosts", "/api/jobs", "/api/jobs/",
-    "/api/jobs/move", "/api/jobs/move-group", "/api/runs/", "/api/runs/tree",
+    "/api/jobs/move", "/api/jobs/move-group", "/api/runs/",
     "/api/settings/hosts", "/api/web-search-usage"}
 BEFORE_IDS = {"addHostRow", "clearFinished", "closeLivelog", "hostSettings", "hostSettingsBody",
               "hosts", "hostsCfgPath", "hostsMsg", "jobs", "livelogBackdrop", "livelogContent",
-              "livelogModal", "livelogTitle", "runStatus", "saveHosts", "webSearchUsage",
+              "livelogModal", "livelogTitle", "saveHosts", "webSearchUsage",
               "webSearchUsageBody"}
 
 

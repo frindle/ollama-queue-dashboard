@@ -14,7 +14,7 @@ joined by job id / parent job / label / plan key (_bundle_verdict_index).
      handoff list are identical -- the only change is the added view; endpoints/routes
      for /api/runs, /api/runs/tree, /api/runs/<id>/clear, /api/handoff are textually unchanged
   D. FRONTEND (node, fake DOM): inline verdict shows reason + issues button; a sign-off row
-     gets NO clear button; bundle badge shows worst + eyes count; Run Status is collapsed
+     gets NO clear button; bundle badge shows worst + eyes count; the Run Status panel is gone
 
 --revert-check is not provided: the join is pure and pinned by A/B. API_SRC overrides the file."""
 import importlib.util, json, os, re, subprocess, sys, tempfile
@@ -214,9 +214,10 @@ else:
     check("bundle without verdicts renders no badge", o["none"] == "")
     check("a verdict row carries its inline widget", o["row"] == 1)
     check("worstOf picks FAIL", o["worstOf"] == "FAIL")
-check("Run Status panel is a <details> collapsed by default (no open attr) and labelled",
-      re.search(r'<details class="fin" id="runStatusDetails">', page) is not None and "verdicts now live with their bundles" in page)
-check("Run Status table + /api/runs consumers kept", 'id="runStatus"' in page and "fetch('/api/runs/tree')" in page)
+check("Run Status panel markup is gone",
+      'id="runStatusDetails"' not in page and 'id="runStatus"' not in page and 'id="runPanel"' not in page)
+check("Run Status renderer/poll is gone; shared clearRun and /api/runs/ clear path kept",
+      "refreshRuns" not in page and "async function clearRun(" in page and "'/api/runs/' + id + '/clear'" in page)
 check("Unattached group exists in the bundle view", 'id="unattachedPanel"' in page and "renderUnattachedVerdicts();" in page)
 
 print("--- %d failed ---" % len(FAILS))

@@ -1850,19 +1850,10 @@ FRONTEND_HTML = r"""<!doctype html>
   .wrap table:not(.q) th, .wrap table:not(.q) td { text-align: left; padding: .35rem .5rem;
     border-bottom: 1px solid var(--line); font-size: .82rem; }
   .wrap table:not(.q) th { color: var(--muted); font-weight: 600; font-size: .74rem; text-transform: uppercase; letter-spacing: .05em; }
-  #runStatus td:last-child { white-space: nowrap; }
   .iconbtn { font-size: .78rem !important; padding: 1px 7px !important; margin: 0 1px; }
   details.legend { font-size: .8rem; color: var(--muted); }
   details.legend > summary { cursor: pointer; }
   details.legend .legend-body { line-height: 1.6; padding: 6px 0 0 14px; }
-  /* Run Status parent/child rows (same visual language as before, on theme tokens) */
-  tr.run-parent { cursor: pointer; background: var(--tint); }
-  tr.run-parent:hover, tr.run-project:hover { background: var(--surface-2); }
-  tr.run-parent .proj-summary, tr.run-project .proj-summary, tr.run-subplan .proj-summary { color: var(--muted); font-size: .8rem; }
-  tr.run-subplan { cursor: default; }
-  tr.run-subplan td { font-size: .8rem; }
-  tr.run-project { cursor: pointer; background: var(--surface-2); }
-  tr.run-project .proj-name { font-weight: 700; }
   .vinline { font-size: .78rem; margin-top: .1rem; }
   .vinline .vchip { font-weight: 600; } .vinline .vwhy { color: var(--muted); }
   .vinline.vgrp-handled { opacity: .65; } .vinline .vbtns { margin-left: .4rem; }
@@ -1873,7 +1864,6 @@ FRONTEND_HTML = r"""<!doctype html>
   .eyes-badge.eyes-ok { color: var(--run); } .eyes-badge.eyes-warn { color: var(--warn); }
   .eyes-badge.eyes-bad { color: var(--bad); }
   .blocked-why { color: var(--muted); font-size: .78rem; }
-  tr.run-child td:nth-child(2) { padding-left: 1.8rem; border-left: 3px solid var(--line); }
   #livelogModal { background: var(--surface) !important; color: var(--fg) !important; border-color: var(--line) !important;
     color-scheme: inherit !important; border-radius: 10px; overflow: hidden; }
   #livelogModal > div { background: var(--surface) !important; border-color: var(--line) !important; }
@@ -1894,19 +1884,7 @@ FRONTEND_HTML = r"""<!doctype html>
     .m-chip { display: inline-block; }
     .bar { width: 72px; }
     tr.queue-child td:nth-child(2), tr.slice-line td:nth-child(2) { padding-left: .8rem; }
-    #runStatus, #runStatus tbody { display: block; width: 100%; }
-    #runStatus thead { display: none; }
-    #runStatus tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .45rem;
-      padding: .45rem .1rem; border-bottom: 1px solid var(--line); }
-    #runStatus td { display: block; border: none; padding: 0; font-size: .78rem; min-width: 0;
-      overflow-wrap: anywhere; word-break: break-word; }
-    #runStatus td:nth-child(2) { flex: 1 1 calc(100% - 5rem); font-weight: 600; }
-    #runStatus td:last-child { flex: 1 1 100%; white-space: normal; margin-top: .15rem; }
-    #runStatus td:empty { display: none; }
-    #runStatus td:nth-child(n+4):nth-child(-n+6) { display: none; }
     td button { white-space: nowrap; word-break: keep-all; overflow-wrap: normal; }
-    tr.run-child { border-left: 3px solid var(--line); padding-left: .6rem; }
-    tr.run-child td:nth-child(2) { padding-left: 0; border-left: 0; }
   }
 </style></head>
 <body>
@@ -1965,29 +1943,6 @@ FRONTEND_HTML = r"""<!doctype html>
     <div class="empty" style="padding:.4rem .8rem;color:var(--muted)">Finished jobs with a gate verdict that could not be tied to any bundle or parent job (e.g. an old escalation review). Same fields and same clear path as Run Status.</div>
     <table class="q" id="unattachedTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
   </details></div>
-</section>
-
-<!-- UNIFIED run-status list (2026-09-17, the user: "complete jobs and handoff should
-     essentially be the same one list when qwen is done that shows the run status
-     that we can clear once it's handled"). ONE surface replacing the old split
-     between the never-pruned "Completed Jobs" durable-verdict table and the
-     handoff "Complete -- awaiting action" panel. A dispatch lands here the moment
-     qwen finishes (durable <id>.done.json/.gate.json sidecars), showing its final
-     gate verdict + run status. "clear" ARCHIVES the row (moves its sidecars to
-     LOG_DIR/archive/, recoverable) so it drops off for good once handled; a job
-     still AWAITING SIGN-OFF refuses a plain clear and asks for an override reason.
-     Backed by /api/runs; /api/jobs/completed and /api/handoff still exist for other
-     consumers but the dashboard no longer renders their two separate tables. -->
-<section class="panel" id="runPanel">
-<details class="fin" id="runStatusDetails">
-<summary id="runStatusSummary"><b>Run Status</b> <span class="count">flat list of every verdict -- verdicts now live with their bundles above (inline on each job, roll-up on the bundle header); open this for the full cross-bundle list</span></summary>
-<div class="panel-head"><span class="count">qwen finished: verdict + run status; clear once handled</span></div>
-<div class="list tablewrap">
-<table id="runStatus"><thead><tr>
-  <th>verdict</th><th>label</th><th>model</th><th>host</th><th>files</th><th>when</th><th>flags</th><th></th>
-</tr></thead><tbody></tbody></table>
-</div>
-</details>
 </section>
 
 <section class="panel" id="cpuLanePanel">
@@ -4611,11 +4566,6 @@ lrEl('lrPins').addEventListener('click', ev => {
 lrEl('logRetention').addEventListener('toggle', () => { if (lrEl('logRetention').open) refreshLogRetention(); });
 setInterval(() => { if (lrEl('logRetention').open) refreshLogRetention(); }, 60000);
 
-// Unified run-status table: backed by /api/runs (see ollama-queue-api.py's
-// _run_status_jobs), which reads the NEVER-PRUNED gate sidecars minus anything
-// cleared/archived. A row lands here when qwen finishes and stays until it is
-// cleared; "clear" archives its sidecars so it never comes back.
-const runTbody = document.querySelector('#runStatus tbody');
 function verdictClass(tag) {
   const t = (tag || '').toUpperCase();
   if (t.startsWith('PASS')) return 'verdict-pass';
@@ -4625,11 +4575,6 @@ function verdictClass(tag) {
   if (t.startsWith('PENDING') || t.startsWith('IN PROGRESS')) return 'verdict-pending';
   if (t.startsWith('BLOCKED')) return 'verdict-blocked';
   return 'verdict-unknown';
-}
-function fmtWhen(ts) {
-  if (!ts) return '';
-  const d = new Date(ts);
-  return isNaN(d) ? ts : d.toLocaleString();
 }
 async function clearRun(id, label, awaitingSignoff) {
   let override = null;
@@ -4651,18 +4596,6 @@ async function clearRun(id, label, awaitingSignoff) {
     try { msg = JSON.parse(msg).error || msg; } catch (e) {}
     alert('Could not clear: ' + msg);
   }
-  refreshRuns();
-}
-// Accept = deliberate review (accept-bundle + resolve + mark done), unlike clearRun which only dismisses.
-async function acceptRun(id, label) {
-  if (!confirm(`Accept "${label}"? This records your review as accepted (accept-bundle, resolve, mark done) and clears the card.`)) return;
-  const res = await fetch('/api/runs/' + id + '/accept', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
-  if (!res.ok) {
-    let msg = await res.text();
-    try { msg = JSON.parse(msg).error || msg; } catch (e) {}
-    alert('Could not accept: ' + msg);
-  }
-  refreshRuns();
 }
 
 // Persist the collapsed/expanded state of the auto-handled group across polls so a
@@ -4708,316 +4641,12 @@ function loadExpandState() {
   } catch (e) { /* unreadable/corrupt -- defaults are correct, never block the render */ }
 }
 loadExpandState();
-// Run Status starts COLLAPSED (verdicts live with their bundles); a hand toggle is remembered.
-(() => {
-  const rd = document.getElementById('runStatusDetails');
-  if (!rd) return;
-  rd.open = !!planExpanded['__runStatusOpen'];
-  rd.addEventListener('toggle', () => { planExpanded['__runStatusOpen'] = rd.open; saveExpandState(); });
-})();
 // Finished bundles start collapsed; an open/close by hand is remembered.
 (() => {
   const fd = document.getElementById('finishedDetails');
   fd.open = !!planExpanded['__finishedOpen'];
   fd.addEventListener('toggle', () => { planExpanded['__finishedOpen'] = fd.open; saveExpandState(); });
 })();
-function renderRunRow(r, handled, isChild) {
-  const tr = document.createElement('tr');
-  if (isChild) tr.classList.add('run-child');
-  const filesTxt = (r.changed_file_count === null || r.changed_file_count === undefined) ? '-' : r.changed_file_count;
-  // For a handled row the "flags" column carries WHY it's handled -- so nothing is
-  // hidden: the reason it needed no eyes is right there next to it. For a live row
-  // it says WHICH kind of attention it wants, at the right volume: "awaiting
-  // sign-off" (please OK this -- green) reads nothing like "needs review" (amber)
-  // or "blocked -- did not run" (red). Server-computed: see _annotate_eyes_labels.
-  const flags = handled
-    ? `<span style="color:#888">${r.handled_reason || 'auto-handled'}</span>`
-    : `<span class="eyes-badge eyes-${r.eyes_severity || 'warn'}">${r.eyes_label || 'needs review'}</span>` +
-      (r.blocked_reason ? `<span class="blocked-why"> ${r.blocked_reason}</span>` : '');
-  if (handled) tr.style.opacity = '.6';
-  tr.innerHTML = `
-    <td class="${verdictClass(r.raw_verdict)}">${r.verdict}</td>
-    <td${r.display_label ? ` title="${escapeHtml(r.label)}"` : ''}>${r.display_label ? escapeHtml(r.display_label) : r.label}</td>
-    <td>${r.model || ''}</td>
-    <td>${r.host || ''}</td>
-    <td>${filesTxt}</td>
-    <td>${fmtWhen(r.timestamp)}</td>
-    <td>${flags}</td>
-    <td></td>`;
-  const actionCell = tr.lastElementChild;
-  if (r.has_gate) {
-    const btn = document.createElement('button');
-    btn.textContent = 'issues';
-    btn.className = 'iconbtn';
-    btn.onclick = () => openGateDetail(r.id, r.label);
-    actionCell.appendChild(btn);
-  }
-  // a row owned by a LIVE auto run is not clearable (clearing would orphan the run)
-  if (!r.auto_run_live && !handled && (r.needs_review || r.status === 'failed' || String(r.raw_verdict || '').toUpperCase().startsWith('FAIL'))) {
-    const acceptBtn = document.createElement('button');
-    acceptBtn.textContent = 'accept';
-    acceptBtn.className = 'iconbtn';
-    acceptBtn.title = 'Deliberate review: accept-bundle + resolve + mark done (clear only dismisses)';
-    acceptBtn.onclick = () => acceptRun(r.id, r.label);
-    actionCell.appendChild(acceptBtn);
-  }
-  if (!r.auto_run_live) {
-    const clearBtn = document.createElement('button');
-    clearBtn.textContent = 'clear';
-    clearBtn.className = 'iconbtn';
-    clearBtn.title = 'Handled -- archive this row out of the list (recoverable)';
-    clearBtn.onclick = () => clearRun(r.id, r.label, r.awaiting_signoff);
-    actionCell.appendChild(clearBtn);
-  }
-  return tr;
-}
-
-// --- Run Status is a THREE-level tree (2026-09-18, the user: all the bg-* runs and
-// slices should collapse under ONE "broker-guard" header, each slice a sub-group
-// inside it):
-//     project (bg / broker-guard)
-//       > feature-slice (bg-health-s1-status)
-//           > individual runs (author / refine rounds)
-// The nesting AND the worst-of rollup are computed server-side (_build_run_tree /
-// _summarize_rows in ollama-queue-api.py) so both header levels can never disagree
-// with their children and the whole thing is unit-testable without a browser. This
-// file only renders what /api/runs/tree hands it. Each header carries the same
-// per-column rollup a standalone row shows -- verdict (worst-of: any FAIL makes the
-// whole project FAIL, then BLOCKED, then CONCERNS, all-PASS is green), model/host
-// (the agreed value or "N models"), files (summed) and when (latest child).
-
-// What a header says about the attention its children want, at the right volume.
-// An all-PASS group reads "all good to go" -- never "N needs eyes", which made a
-// clean project look broken.
-function rollupBadges(s) {
-  const b = [];
-  if (s.blocked) b.push(`<span class="eyes-badge eyes-bad">${s.blocked} blocked</span>`);
-  if (s.review) b.push(`<span class="eyes-badge eyes-warn">${s.review} need${s.review === 1 ? 's' : ''} review</span>`);
-  if (s.signoff) b.push(`<span class="eyes-badge eyes-ok">${s.signoff} awaiting sign-off</span>`);
-  if (!b.length && s.good) {
-    // A passing child in a bundle that still owes slices is NOT "good to go" -- say so
-    // in amber, don't paint the whole bundle green (the user 2026-09-18: cc-waitlist read
-    // "all good to go (1)" while 5 of 6 slices had not started).
-    if (s.incomplete) b.push(`<span class="eyes-badge eyes-warn">${s.good} passed &middot; slices still owed</span>`);
-    else b.push(`<span class="eyes-badge eyes-ok">all good to go (${s.good} runs)</span>`);
-  }
-  // NOT a contradiction with "N/M slices done": these badges count RUN ROWS still
-  // wanting something from you, and a slice that passed and was auto-handled/archived
-  // leaves none (the user 2026-09-18: "its also showing 1/2 with nothing passing").
-  if (!b.length) b.push('<span style="color:#888" title="Every run under this bundle is auto-handled -- nothing here is waiting on you. The slices-done fraction counts PLAN SLICES; these badges count run rows that still want a decision.">auto-handled runs</span>');
-  return b.join(' &middot; ');
-}
-
-// One collapsible header row (project OR feature-slice). cls/indent are what make
-// the two levels visually distinct; everything else is identical, because a header
-// is a header.
-function headerRow(opts) {
-  const s = opts.summary;
-  const hdr = document.createElement('tr');
-  hdr.className = opts.cls;
-  hdr.innerHTML =
-    `<td style="padding-left:${opts.indent}rem">${opts.expanded ? '▾' : '▸'}</td>` +
-    `<td style="padding-left:${opts.indent}rem"><span class="proj-name">${opts.name}</span> ` +
-    `<span class="${verdictClass(s.rawVerdict)}">${s.verdict}</span> ` +
-    `<span class="proj-summary">${opts.summary_text}</span></td>` +
-    `<td>${s.model}</td>` +
-    `<td>${s.host}</td>` +
-    `<td>${s.files}</td>` +
-    `<td>${fmtWhen(s.when)}</td>` +
-    `<td>${rollupBadges(s)}</td>` +
-    `<td></td>`;
-  hdr.onclick = (e) => {
-    if (e.target.tagName === 'BUTTON') return;
-    opts.toggle();
-    saveExpandState();
-    rerenderRuns();
-  };
-  return hdr;
-}
-
-// Bulk-clear button for a header: archives every already-handled descendant in one
-// click (skips anything still awaiting sign-off -- those still refuse a plain clear).
-function attachBulkClear(hdr, rows, what) {
-  const clearable = rows.filter(r => r.group === 'handled' && !r.awaiting_signoff && !r.auto_run_live);
-  if (!clearable.length) return;
-  const cbtn = document.createElement('button');
-  cbtn.textContent = `clear ${clearable.length} handled`;
-  cbtn.className = 'iconbtn';
-  cbtn.title = 'Archive every auto-handled run under this group (recoverable)';
-  cbtn.onclick = async (e) => {
-    e.stopPropagation();
-    if (!confirm(`Clear ${clearable.length} handled run(s) of ${what}?`)) return;
-    for (const r of clearable) {
-      await fetch('/api/runs/' + r.id + '/clear', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
-    }
-    refreshRuns();
-  };
-  hdr.lastElementChild.appendChild(cbtn);
-}
-
-// One feature/slice group (the EXISTING parent rollup) + its runs when expanded.
-function renderParentGroup(g, forceCollapsedDefault, indent) {
-  const s = g.summary;
-  const key = g.project;
-  // A card carrying SIGNAL defaults OPEN -- needs_eyes (something wants a decision)
-  // and good_to_go (a real PASS) alike; only 'handled' starts folded.
-  const dflt = !forceCollapsedDefault && g.section !== 'handled';
-  const expanded = (key in parentExpanded) ? parentExpanded[key] : dflt;
-  // "N/M slices done" is the plan's OWN recursive count (server-side
-  // _plan_progress_recursive, stamped as parent_done/parent_slices) -- the exact same
-  // number the queue panel's bundle fraction shows. Spelled "done" so it never reads
-  // as a contradiction next to the flag badges, which count RUNS, not slices.
-  const summary_text = `${s.slicesDone}/${s.total} slices done` +
-    (s.runs > s.slicesDone ? ` &middot; ${s.runs} runs` : '') +
-    (s.breakdown ? ` &middot; ${s.breakdown}` : '');
-  const hdr = headerRow({summary: s, name: g.project, cls: 'run-parent',
-    indent: indent || 0, expanded, summary_text,
-    toggle: () => { parentExpanded[key] = !expanded; }});
-  attachBulkClear(hdr, g.allRows || g.rows, g.project);
-  runTbody.appendChild(hdr);
-  if (!expanded) return;
-  // ONE CLICK REVEALS EVERYTHING (the user 2026-09-19): the bundle's own runs, then every
-  // sub-plan's runs inline, to any depth. A sub-plan gets a LABEL row, never a second
-  // collapse toggle -- a PASS two splits down must not need a second click to find.
-  for (const r of g.rows) runTbody.appendChild(renderRunRow(r, r.group === 'handled', true));
-  renderSubPlanRuns(g, (indent || 0) + 1);
-}
-
-// The sub-plan divider: a non-interactive sub-heading over the runs that follow it.
-// Carries the sub-plan's own X/Y and verdict so the grouping still tells you which
-// slice these runs belong to and how far it got -- it just cannot hide them.
-function renderSubPlanDivider(g, indent) {
-  const s = g.summary;
-  const tr = document.createElement('tr');
-  tr.className = 'run-subplan';
-  tr.innerHTML =
-    `<td style="padding-left:${indent}rem"></td>` +
-    `<td style="padding-left:${indent}rem"><span class="proj-name">&#8627; ${g.slice_id}</span> ` +
-    `<span class="${verdictClass(s.rawVerdict)}">${s.verdict}</span> ` +
-    `<span class="proj-summary">${s.slicesDone}/${s.total} slices done &middot; ` +
-    `${s.runs} run${s.runs === 1 ? '' : 's'}` +
-    `${s.breakdown ? ' &middot; ' + s.breakdown : ''} &middot; ${g.project}</span></td>` +
-    `<td colspan="6"></td>`;
-  runTbody.appendChild(tr);
-  return tr;
-}
-
-// Depth-first: every descendant sub-plan's runs, inline, under its own label.
-function renderSubPlanRuns(g, indent) {
-  for (const c of (g.children || [])) {
-    renderSubPlanDivider(c, indent);
-    for (const r of c.rows) runTbody.appendChild(renderRunRow(r, r.group === 'handled', true));
-    renderSubPlanRuns(c, indent + 1);
-  }
-}
-
-// One PROJECT group: the new top level. Its children are feature/slice groups and
-// any standalone runs of the same project.
-function renderProjectGroup(p, forceCollapsedDefault) {
-  const s = p.summary;
-  // Same rule as a bundle: only a fully auto-handled project starts folded.
-  const expanded = (p.key in projectExpanded) ? projectExpanded[p.key]
-    : (!forceCollapsedDefault && p.section !== 'handled');
-  const nSlices = p.entries.filter(e => e.kind === 'parent').length;
-  const summary_text = (nSlices ? `${nSlices} slice group${nSlices === 1 ? '' : 's'} &middot; ` : '') +
-    `${s.runs} run${s.runs === 1 ? '' : 's'}` +
-    (s.breakdown ? ` &middot; ${s.breakdown}` : '');
-  const hdr = headerRow({summary: s, name: p.name, cls: 'run-project',
-    indent: 0, expanded, summary_text,
-    toggle: () => { projectExpanded[p.key] = !expanded; }});
-  attachBulkClear(hdr, p.rows, p.name);
-  runTbody.appendChild(hdr);
-  if (!expanded) return;
-  for (const e of p.entries) {
-    // ...and, like a nested sub-plan, each bundle decides from its OWN section.
-    if (e.kind === 'parent') renderParentGroup(e, false, 1);
-    else runTbody.appendChild(renderRunRow(e.row, e.row.group === 'handled', true));
-  }
-}
-
-function renderEntry(e, inFoldedSection) {
-  if (e.kind === 'project') renderProjectGroup(e, inFoldedSection);
-  else if (e.kind === 'parent') renderParentGroup(e, inFoldedSection, 0);
-  else runTbody.appendChild(renderRunRow(e.row, e.row.group === 'handled'));
-}
-
-// A collapsible section divider -- NOT a hide. Every row under it still shows its
-// verdict and WHY it is there when expanded, and 'clear' still archives it.
-function sectionHeader(text, expanded, toggle, bg, color) {
-  const hdr = document.createElement('tr');
-  hdr.style.cursor = 'pointer';
-  hdr.style.background = bg;
-  hdr.innerHTML = `<td colspan="8" style="font-size:.8rem;color:${color}">` +
-    `${expanded ? '▾' : '▸'} ${text}</td>`;
-  hdr.onclick = () => { toggle(); saveExpandState(); rerenderRuns(); };
-  runTbody.appendChild(hdr);
-  return hdr;
-}
-
-// The last tree the server gave us. An expand/collapse is a pure VIEW change, so it
-// re-renders from this instead of re-fetching: /api/runs/tree takes 0.5-0.9s (measured
-// in-browser 2026-09-19, it stats every job sidecar), which made a click look like it
-// did nothing and then have the table rearrange itself a beat later, out of sync with
-// the user (the user: a nested PASS "disappears" on the next tick). Data still refreshes on
-// the 5s poll; only the render is now instant.
-let lastRunTree = null;
-
-async function refreshRuns() {
-  const res = await fetch('/api/runs/tree');
-  if (!res.ok) return;
-  lastRunTree = await res.json();
-  renderRunTree(lastRunTree);
-}
-
-// Re-render the CURRENT data with the current expand state, with no network round
-// trip. Falls back to a fetch only if we have never had a tree.
-function rerenderRuns() {
-  if (lastRunTree) renderRunTree(lastRunTree);
-  else refreshRuns();
-}
-
-function renderRunTree(tree) {
-  const _scrollY = window.scrollY;
-  runTbody.innerHTML = '';
-  if (!tree.length) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="8"><em>nothing finished and awaiting a look -- cleared jobs are archived</em></td>';
-    runTbody.appendChild(tr);
-    return;
-  }
-  const countRuns = list => list.reduce((n, e) => n + (e.kind === 'row' ? 1 : e.rows.length), 0);
-  const needsEyes = tree.filter(e => e.section === 'needs_eyes');
-  const goodToGo = tree.filter(e => e.section === 'good_to_go');
-  const handled = tree.filter(e => e.section === 'handled');
-  if (!needsEyes.length) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="8"><em>nothing needs your eyes -- everything finished either passed or is auto-handled below</em></td>';
-    runTbody.appendChild(tr);
-  }
-  for (const e of needsEyes) renderEntry(e, false);
-  // GOOD TO GO: a PASS is a PASS. Sign-off on a passing dispatch is the
-  // coordinator's job, not the user's, so these are NOT in "needs your eyes" -- they get
-  // their own green section that says so plainly. Expanded by default: passing work
-  // should be visible, not folded away like something that did not matter.
-  if (goodToGo.length) {
-    sectionHeader(`Good to go -- passed, nothing owed (${countRuns(goodToGo)})`,
-      goodExpanded, () => { goodExpanded = !goodExpanded; },
-      'rgba(30,132,73,.12)', '#1e8449');
-    // ...which is why these render UNFOLDED (was `true`, which contradicted the
-    // comment above and buried the passes two clicks deep -- the user 2026-09-19).
-    if (goodExpanded) for (const e of goodToGo) renderEntry(e, false);
-  }
-  if (handled.length) {
-    sectionHeader(`Auto-handled -- no eyes needed (${countRuns(handled)}: superseded ` +
-      `authoring/refine stages, eval arms, read research/diagnosis)`,
-      handledExpanded, () => { handledExpanded = !handledExpanded; },
-      'rgba(128,128,128,.10)', '#666');
-    if (handledExpanded) for (const e of handled) renderEntry(e, true);
-  }
-  if (window.scrollY !== _scrollY) window.scrollTo(0, _scrollY);
-}
-
 async function openGateDetail(id, label) {
   document.getElementById('livelogTitle').textContent = `${label} -- gate detail`;
   document.getElementById('livelogBackdrop').style.display = 'block';
@@ -5099,13 +4728,11 @@ refresh();
 refreshWaitBanner();
 refreshHosts();
 refreshHostSettings();
-refreshRuns();
 refreshCpuLane();
 setInterval(refreshCpuLane, 5000);
 setInterval(refresh, 4000);
 setInterval(refreshWaitBanner, 4000);
 setInterval(refreshHosts, 4000);
-setInterval(refreshRuns, 5000);
 
 // Fetch and display web search usage data
 async function refreshWebSearchUsage() {
@@ -5157,7 +4784,7 @@ setInterval(refreshWebSearchUsage, 5000);
 
 // The old refreshHandoff()/markJobAsActed() pair drove the removed handoff panel
 // (Complete -- awaiting action + Pending) against /api/handoff and /api/handoff/acted.
-// The unified Run Status table (refreshRuns / clearRun, above) replaces both, so
+// The unified run ledger (clearRun, above, and the inline bundle verdicts) replaced both, so
 // this JS is gone. /api/handoff itself still exists for any other consumer.
 
 // Add a global mouseup handler to ensure drag state is cleared even if drop handlers don't fire properly
@@ -10329,41 +9956,8 @@ console.log(JSON.stringify({
         check("only a failed/escalated slice opens by default, a running one stays one row",
               (_s.get("openEsc"), _s.get("openRun")), (True, False))
 
-    # --- run-status panel: a signal-carrying card must not hide (the user 2026-09-19) ----
-    # A nested sub-plan is where the real PASS rows live once a slice was re-split, so
-    # the batch auto-opening is pointless if the child does not. Three properties, all
-    # checked as SOURCE invariants (there is no JS runtime here; the behaviour itself
-    # was verified in-browser via Playwright against the live daemon):
-    check("only a fully auto-handled bundle starts folded (good_to_go opens too)",
-          "const dflt = !forceCollapsedDefault && g.section !== 'handled';"
-          in FRONTEND_HTML, True)
-    # the user's design call, 2026-09-19: ONE click on the bundle reveals every run under
-    # it, sub-plans included. A sub-plan is a label, never a second collapse toggle.
-    check("a sub-plan's runs are rendered inline, not behind their own card",
-          ("function renderSubPlanRuns(g, indent)" in FRONTEND_HTML
-           and "renderSubPlanRuns(g, (indent || 0) + 1);" in FRONTEND_HTML), True)
-    check("...recursively, so a split of a split is still one click away",
-          "renderSubPlanRuns(c, indent + 1);" in FRONTEND_HTML, True)
-    check("a sub-plan NEVER renders as another collapsible parent card",
-          "renderParentGroup(c," in FRONTEND_HTML, False)
-    check("the sub-plan divider has no click handler and no pointer cursor",
-          ("onclick" not in FRONTEND_HTML.split("function renderSubPlanDivider")[1]
-                                         .split("function renderSubPlanRuns")[0]
-           and "tr.run-subplan { cursor: default; }" in FRONTEND_HTML), True)
-    check("the divider still names the slice and its own X/Y (grouping, not hiding)",
-          ("&#8627; ${g.slice_id}" in FRONTEND_HTML
-           and "${s.slicesDone}/${s.total} slices done" in FRONTEND_HTML), True)
-    check("the 'Good to go' section renders its entries UNFOLDED",
-          "if (goodExpanded) for (const e of goodToGo) renderEntry(e, false);"
-          in FRONTEND_HTML, True)
-    check("no render path still forces a bundle collapsed by its section",
-          "renderParentGroup(e, forceCollapsedDefault" in FRONTEND_HTML, False)
-    # Expand/collapse is a VIEW change: instant re-render off the cached tree (the
-    # fetch measured 0.5-0.9s in-browser), and the state survives a page reload.
-    check("a toggle re-renders from the cached tree instead of re-fetching",
-          ("function rerenderRuns()" in FRONTEND_HTML
-           and "opts.toggle();\n    saveExpandState();\n    rerenderRuns();" in FRONTEND_HTML),
-          True)
+    # The Run Status panel (its tree renderer) was removed from the UI; only the shared
+    # expand-state persistence below remains.
     check("every expand/collapse dict is persisted, none forgotten",
         all(k in FRONTEND_HTML.split("function saveExpandState()")[1].split("}")[0]
             for k in ("parentExpanded", "projectExpanded", "planExpanded",
