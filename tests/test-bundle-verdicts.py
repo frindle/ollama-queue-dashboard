@@ -156,7 +156,16 @@ src_now, src_head = SRC.read_text(), subprocess.run(["git", "-C", str(HERE.paren
 def branch(txt, route):
     i = txt.index(route)
     j = txt.find("\n        elif ", i + 10)
-    return txt[i:j if j > 0 else i + 600]
+    return _strip_hooks(txt[i:j if j > 0 else i + 600])
+
+
+def _strip_hooks(t):
+    # Additive routes (plex bypass hook, bundle run-now) sit in do_POST near these windows;
+    # they are not the routes under guard, so ignore them in the comparison.
+    for h in ('        if self.path.startswith("/api/bypass/"):\n            return self._plex_bypass()\n',
+              '            m = re.match(r"^/api/jobs/([^/]+)/run-now$", self.path)\n            if m:\n                return self._run_now(m.group(1))\n'):
+        t = t.replace(h, "")
+    return t
 
 
 for route in ('elif self.path == "/api/runs":', 'elif self.path == "/api/runs/tree":', 'elif self.path == "/api/handoff":',

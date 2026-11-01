@@ -3867,6 +3867,7 @@ async function refresh() {
     let pprimary = '';
     const pitems = [];
     if (pending.length) pitems.push(`<button class="mi" data-plan-promote title="Run this bundle FIRST (send &quot;${g.key}&quot;'s ${pending.length} pending slices to the front of the queue, keeping slice order)">&uarr;&uarr; Run this bundle next</button>`);
+    if (pending.length && !running.length) pitems.push(`<button class="mi" data-plan-run-now title="Run this bundle NOW: gracefully pause the running bundle's job (state saved, resumable) and start &quot;${g.key}&quot; immediately; the paused bundle resumes on its own when this one is done">&#9654; Run this bundle now</button>`);
     if (mpos > 0) pitems.push(`<button class="mi" data-plan-up title="Run this bundle one place EARLIER (before &quot;${movablePlans[mpos - 1].key}&quot;) -- slice order inside the bundle is untouched">&uarr; Move earlier</button>`);
     if (mpos >= 0 && mpos < movablePlans.length - 1) pitems.push(`<button class="mi" data-plan-down title="Run this bundle one place LATER (after &quot;${movablePlans[mpos + 1].key}&quot;) -- slice order inside the bundle is untouched">&darr; Move later</button>`);
     if (mpos >= 0 && mpos < movablePlans.length - 1) pitems.push(`<button class="mi" data-plan-last title="Run this bundle LAST (send it to the end of the queue)">&darr;&darr; Move to end</button>`);
@@ -4012,6 +4013,17 @@ async function refresh() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({take_focus: true})});
       if (!res.ok) alert('promote plan failed: ' + (await res.text()));
+      else showTruth(await truthOf(res));
+      refresh();
+    });
+    const runNowBtn = ptr.querySelector('[data-plan-run-now]');
+    if (runNowBtn) runNowBtn.addEventListener('click', async () => {
+      // Run now (the user 2026-10-30): /run-now = promote-group + a graceful pause of the
+      // running bundle's job (even a committed one's) + human focus. The paused job and
+      // its bundle resume on their own once this bundle is done.
+      if (!confirm(`Run "${g.key}" now? The running job is paused gracefully (work saved) and resumes automatically when this bundle is done.`)) return;
+      const res = await fetch('/api/jobs/' + pending[0].id + '/run-now', {method: 'POST'});
+      if (!res.ok) alert('run now failed: ' + (await res.text()));
       else showTruth(await truthOf(res));
       refresh();
     });
@@ -8434,6 +8446,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._text("cpu lane unavailable: %s" % type(e).__name__, 503)
         return cpu_lane.handle(self, method)
 
+    def _plex_bypass(self):
+        """Route for Unraid plex-automation bypass. Delegates to plex_bypass_http.handle(self)."""
+        try:
+            import plex_bypass_http
+        except Exception as e:  # noqa: BLE001
+            return self._text("plex bypass unavailable: %s" % type(e).__name__, 503)
+        return plex_bypass_http.handle(self)
+
     def _invalidate_for_write(self):
         """Drop the response cache on a state-changing request -- EXCEPT the Unraid runner's
         /api/cpu/* claim / heartbeat / result calls. Those arrive every few seconds around the
@@ -8630,6 +8650,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         })
 
     def do_POST(self):
+        if self.path.startswith("/api/bypass/"):
+            return self._plex_bypass()
         # Any state change must be visible on the very next poll.
         self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
@@ -8655,6 +8677,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = re.match(r"^/api/jobs/([^/]+)/promote-group$", self.path)
             if m:
                 return self._promote_group(m.group(1))
+            m = re.match(r"^/api/jobs/([^/]+)/run-now$", self.path)
+            if m:
+                return self._run_now(m.group(1))
             m = re.match(r"^/api/jobs/([^/]+)/hold$", self.path)
             if m:
                 return self._hold(m.group(1))
@@ -8887,6 +8912,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self._read_json_body()
             self._json(q.promote_group_for_job(job_id, preempt=bool(body.get("preempt")),
                                                take_focus=bool(body.get("take_focus"))))
+        except q.QueueActionError as e:
+            self._text(str(e), 400)
+        except Exception as e:
+            self._text(f"error: {e}", 500)
+
+    def _run_now(self, job_id):
+        # Bundle "Run now" (Penn 2026-10-30): delegates to promote_group_for_job(run_now=True)
+        # -- the bundle goes to the front, the running bundle's job is gracefully paused
+        # (even a committed one's) and both resume on their own once this bundle is done.
+        try:
+            self._json(q.promote_group_for_job(job_id, run_now=True))
         except q.QueueActionError as e:
             self._text(str(e), 400)
         except Exception as e:
