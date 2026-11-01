@@ -63,7 +63,7 @@ def proxy(h, conn_factory=http.client.HTTPConnection):
         cl_raw = h.headers.get("Content-Length")
         if cl_raw is None:
             body_len = 0
-        elif not cl_raw.isdigit():
+        elif not (cl_raw.isascii() and cl_raw.isdigit()):
             body = json.dumps({"error": "E_TOO_BIG"}).encode()
             h.send_response(413)
             h.send_header("Content-Type", "application/json")
@@ -87,26 +87,29 @@ def proxy(h, conn_factory=http.client.HTTPConnection):
             raw_body = None
     else:
         raw_body = None
+    allowed = ("Content-Type", "Content-Disposition", "Cache-Control", "Set-Cookie",
+               "Location", "Content-Security-Policy", "X-Content-Type-Options", "Referrer-Policy")
+    conn = None
     try:
         conn = conn_factory(*UPSTREAM, timeout=60)
         conn.request(h.command, path_no_prefix, body=raw_body, headers=upstream_headers(h.headers))
         resp = conn.getresponse()
         status = resp.status
-        allowed = ("Content-Type", "Content-Disposition", "Cache-Control", "Set-Cookie",
-                   "Location", "Content-Security-Policy", "X-Content-Type-Options", "Referrer-Policy")
         resp_body = resp.read()
-        h.send_response(status)
-        for k in allowed:
-            v = resp.getheader(k)
-            if v is not None:
-                h.send_header(k, v)
-        h.send_header("Content-Length", str(len(resp_body)))
-        h.end_headers()
-        h.wfile.write(resp_body)
+        resp_headers = [(k, resp.getheader(k)) for k in allowed]
     except Exception:
-        body = json.dumps({"error": "E_DOCSUM_DOWN"}).encode()
-        h.send_response(502)
-        h.send_header("Content-Type", "application/json")
-        h.send_header("Content-Length", str(len(body)))
-        h.end_headers()
-        h.wfile.write(body)
+        status, resp_body = 502, json.dumps({"error": "E_DOCSUM_DOWN"}).encode()
+        resp_headers = [("Content-Type", "application/json")]
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    h.send_response(status)
+    for k, v in resp_headers:
+        if v is not None:
+            h.send_header(k, v)
+    h.send_header("Content-Length", str(len(resp_body)))
+    h.end_headers()
+    h.wfile.write(resp_body)
